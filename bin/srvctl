@@ -49,6 +49,7 @@ case "${1:-help}" in
     monitor)    _load_and_run monitor cmd_monitor "${@:2}" ;;
     notify)     _load_and_run notify cmd_notify "${@:2}" ;;
     cloudflare|cf) _load_and_run cloudflare cmd_cloudflare "${@:2}" ;;
+    self-update) _load_and_run selfupdate cmd_selfupdate "${@:2}" ;;
     ip)         _load_and_run ip cmd_ip "${@:2}" ;;
     trusted)    _load_and_run trusted cmd_trusted "${@:2}" ;;
     user)       _load_and_run user cmd_user "${@:2}" ;;

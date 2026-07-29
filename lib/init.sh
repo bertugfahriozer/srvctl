@@ -245,6 +245,7 @@ events {
 
 http {
     # ─── Temel ───
+    server_names_hash_bucket_size 128;
     sendfile on;
     tcp_nopush on;
     tcp_nodelay on;
@@ -329,7 +330,7 @@ _install_php() {
     fi
 
     # PHP versiyonlarını kur
-    for ver in 8.2 8.3; do
+    for ver in 8.2 8.3 8.4; do
         if ! php_version_exists "$ver"; then
             apt-get install -y -qq \
                 "php${ver}-fpm" "php${ver}-cli" "php${ver}-mysql" "php${ver}-redis" \

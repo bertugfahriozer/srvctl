@@ -3,7 +3,7 @@ server {
     server_name {{DOMAIN}} www.{{DOMAIN}};
 
     root {{WEB_ROOT}}/{{DOMAIN}}/public_html;
-    index index.php;
+    index index.php index.html index.htm;
 
     access_log {{WEB_ROOT}}/{{DOMAIN}}/logs/access.log security;
     error_log  {{WEB_ROOT}}/{{DOMAIN}}/logs/error.log warn;
