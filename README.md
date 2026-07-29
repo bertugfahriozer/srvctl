@@ -83,7 +83,7 @@ sudo srvctl security harden-fpm <d>   # FPM unit modelini ÖNİZLE | --apply | -
 
 ### Domain — Temel
 ```bash
-sudo srvctl domain add example.com [--php=8.3]
+sudo srvctl domain add example.com --php=8.3
 sudo srvctl domain list
 sudo srvctl domain info example.com
 sudo srvctl domain remove example.com        # öncesinde otomatik yedek
@@ -136,6 +136,11 @@ Günlük otomatik yedek (04:00), 30 günden eski yedekler silinir.
 ```bash
 sudo srvctl ssl renew
 sudo srvctl ssl status
+```
+
+Sonradan ssl eklemek isternirse:
+```bash
+sudo certbot --nginx -d example.com -d www.example.com
 ```
 
 ### İzleme & Alarm

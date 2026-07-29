@@ -19,6 +19,7 @@ cmd_domain() {
         staging)   _domain_staging "${@:2}" ;;
         migrate)    _domain_migrate "${@:2}" ;;
         rate-limit) _domain_rate_limit "${@:2}" ;;
+        repair)    _domain_repair "${@:2}" ;;
         *)
             echo ""
             echo "  Kullanım: srvctl domain <komut>"
@@ -38,10 +39,92 @@ cmd_domain() {
             echo "    staging <domain>                Staging ortamı oluştur"
             echo "    migrate <domain> <user@host>    Sunucular arası taşı"
             echo "    rate-limit <domain> <profil>    Rate-limit profilini değiştir/göster"
+            echo "    repair <domain>|--all           Eksik chroot kütüphanelerini onarır"
             echo ""
             ;;
     esac
 }
+
+_apply_chroot_php_deps() {
+    local base="$1" php_ver="$2"
+    
+    # 1. PHP-FPM ana kütüphaneleri
+    local fpm_bin="/usr/sbin/php-fpm${php_ver}"
+    if [[ -x "$fpm_bin" ]]; then
+        local lib dir loader
+        while IFS= read -r lib; do
+            [[ -z "$lib" ]] && continue
+            dir=$(dirname "$lib")
+            mkdir -p "${base}${dir}"
+            cp -u "$lib" "${base}${lib}" 2>/dev/null || true
+        done < <(ldd "$fpm_bin" 2>/dev/null | awk '{print $3}' | grep -v '^$')
+
+        loader=$(ldd "$fpm_bin" 2>/dev/null | grep 'ld-linux' | awk '{print $1}')
+        if [[ -n "$loader" && -f "$loader" ]]; then
+            mkdir -p "${base}$(dirname "$loader")"
+            cp -u "$loader" "${base}${loader}" 2>/dev/null || true
+        fi
+    fi
+
+    # 2. PHP Eklentileri (Extensions) ve bağımlılıkları
+    local ext_dir
+    ext_dir=$(php"${php_ver}" -i 2>/dev/null | grep "^extension_dir" | awk '{print $3}')
+    if [[ -n "$ext_dir" && -d "$ext_dir" ]]; then
+        mkdir -p "${base}${ext_dir}"
+        for ext in "${ext_dir}"/*.so; do
+            [[ -f "$ext" ]] || continue
+            cp -u "$ext" "${base}${ext}" 2>/dev/null || true
+            while IFS= read -r lib; do
+                [[ -z "$lib" ]] && continue
+                local libdir
+                libdir=$(dirname "$lib")
+                mkdir -p "${base}${libdir}"
+                cp -u "$lib" "${base}${lib}" 2>/dev/null || true
+            done < <(ldd "$ext" 2>/dev/null | awk '{print $3}' | grep "^/")
+        done
+    fi
+
+    # 3. NSS ve Resolv (DNS/Kullanıcı çözümleme)
+    mkdir -p "${base}/lib/x86_64-linux-gnu"
+    cp -u /lib/x86_64-linux-gnu/libnss_* "${base}/lib/x86_64-linux-gnu/" 2>/dev/null || true
+    cp -u /lib/x86_64-linux-gnu/libresolv* "${base}/lib/x86_64-linux-gnu/" 2>/dev/null || true
+}
+
+_domain_repair() {
+    local target="$1"
+    [[ -z "$target" ]] && error "Kullanım: srvctl domain repair <domain> | --all"
+
+    if [[ "$target" == "--all" ]]; then
+        header "Tüm Domainler Onarılıyor..."
+        for dir in "${WEB_ROOT}"/*/; do
+            [[ ! -d "$dir" ]] && continue
+            local domain
+            domain=$(basename "$dir")
+            read_credentials "$domain"
+            local php_ver="${PHP_VERSION:-${DEFAULT_PHP_VERSION}}"
+            info "${domain} onarılıyor (PHP ${php_ver})..."
+            _apply_chroot_php_deps "${dir%/}" "${php_ver}"
+            systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+        done
+        success "Tüm domainler onarıldı."
+        return
+    fi
+
+    domain_exists "$target" || error "Domain bulunamadı: ${target}"
+    read_credentials "$target"
+    local base="${WEB_ROOT}/${target}"
+    local php_ver="${PHP_VERSION:-${DEFAULT_PHP_VERSION}}"
+    
+    header "Domain Onarılıyor: ${target}"
+    step "1/2" "Chroot kütüphaneleri güncelleniyor (PHP ${php_ver})..."
+    _apply_chroot_php_deps "${base}" "${php_ver}"
+    
+    step "2/2" "PHP-FPM yeniden başlatılıyor..."
+    systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+    
+    success "Domain onarıldı: ${target}"
+}
+
 
 # Bir domain için HEDEF dosya-sahiplik/izin modelini (uygulamadan) yazar.
 # Çıktı: "<path>|<owner>|<mode>" satırları. Saf fonksiyon — chown/chmod YOK.
@@ -403,25 +486,8 @@ _domain_add() {
     cp /etc/ssl/certs/ca-certificates.crt "${base}/etc/ssl/certs/" 2>/dev/null || true
     cp -r /usr/share/zoneinfo "${base}/usr/share/" 2>/dev/null || true
 
-    # Shared libraries (PHP-FPM için)
-    local php_fpm_bin="/usr/sbin/php-fpm${php_version}"
-    if [[ -x "$php_fpm_bin" ]]; then
-        while IFS= read -r lib; do
-            [[ -z "$lib" ]] && continue
-            local dir
-            dir=$(dirname "$lib")
-            mkdir -p "${base}${dir}"
-            cp -n "$lib" "${base}${lib}" 2>/dev/null || true
-        done < <(ldd "$php_fpm_bin" 2>/dev/null | awk '{print $3}' | grep -v '^$')
-
-        # ld-linux loader
-        local loader
-        loader=$(ldd "$php_fpm_bin" 2>/dev/null | grep 'ld-linux' | awk '{print $1}')
-        if [[ -n "$loader" && -f "$loader" ]]; then
-            mkdir -p "${base}$(dirname "$loader")"
-            cp -n "$loader" "${base}${loader}" 2>/dev/null || true
-        fi
-    fi
+    # PHP-FPM, Eklentiler (Extensions) ve Shared Libraries
+    _apply_chroot_php_deps "${base}" "${php_version}"
 
     success "Chroot ortamı hazır"
 
@@ -1043,16 +1109,8 @@ _domain_php_switch() {
     header "PHP Sürüm Değişimi: ${old_ver} → ${new_ver} (${domain})"
 
     step "1/5" "Chroot kütüphaneleri (php${new_ver}-fpm)..."
-    local fpm_bin="/usr/sbin/php-fpm${new_ver}"
-    if [[ -x "$fpm_bin" ]]; then
-        local lib dir loader
-        while IFS= read -r lib; do
-            [[ -z "$lib" ]] && continue
-            dir=$(dirname "$lib"); mkdir -p "${base}${dir}"; cp -n "$lib" "${base}${lib}" 2>/dev/null || true
-        done < <(ldd "$fpm_bin" 2>/dev/null | awk '{print $3}' | grep -v '^$')
-        loader=$(ldd "$fpm_bin" 2>/dev/null | grep 'ld-linux' | awk '{print $1}')
-        [[ -n "$loader" && -f "$loader" ]] && { mkdir -p "${base}$(dirname "$loader")"; cp -n "$loader" "${base}${loader}" 2>/dev/null || true; }
-    fi
+    # PHP-FPM, Eklentiler (Extensions) ve Shared Libraries
+    _apply_chroot_php_deps "${base}" "${new_ver}"
     success "Chroot kütüphaneleri güncellendi"
 
     step "2/5" "PHP-FPM pool taşınıyor..."
