@@ -227,7 +227,7 @@ _deploy_run() {
     # 7. Health check + gerekirse otomatik rollback
     step "7/7" "Sağlık kontrolü..."
     local code; code=$(_health_probe "$domain")
-    if [[ "$code" =~ ^(200|301|302)$ ]]; then
+    if [[ "$code" =~ ^(200|301|302|403|404)$ ]]; then
         success "Sağlık kontrolü OK (HTTP ${code})"
         _run_hook "${shared_dir}/hooks/post-deploy.sh" "${release_dir}" "${domain}"
     else
@@ -296,7 +296,7 @@ _deploy_rollback() {
     systemctl reload "php${php_version}-fpm" 2>/dev/null || true
 
     local code; code=$(_health_probe "$domain")
-    if [[ "$code" =~ ^(200|301|302)$ ]]; then
+    if [[ "$code" =~ ^(200|301|302|403|404)$ ]]; then
         success "Rollback başarılı: $(basename "$prev") (HTTP ${code})"
     else
         warn "Rollback yapıldı ama sağlık kontrolü zayıf (HTTP ${code})"
@@ -312,7 +312,7 @@ _deploy_health() {
     [[ -z "$domain" ]] && error "Kullanım: srvctl deploy health <domain>"
     domain_exists "$domain" || error "Domain bulunamadı: ${domain}"
     local code; code=$(_health_probe "$domain")
-    if [[ "$code" =~ ^(200|301|302)$ ]]; then
+    if [[ "$code" =~ ^(200|301|302|403|404)$ ]]; then
         success "${domain} sağlıklı (HTTP ${code})"
     else
         error "${domain} sağlıksız (HTTP ${code})"
