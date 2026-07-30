@@ -170,7 +170,7 @@ _deploy_run() {
     step "4/7" "Shared dosyalar bağlanıyor..."
     mkdir -p "${shared_dir}"
     if [[ -e "${shared_dir}/.env" ]] && _deploy_assert_safe_shared "${shared_dir}/.env"; then
-        ln -sf "${shared_dir}/.env" "${release_dir}/.env"
+        ln -sf "../../shared/.env" "${release_dir}/.env"
         success ".env bağlandı"
     elif [[ -L "${shared_dir}/.env" ]]; then
         warn "shared/.env bir symlink — güvenlik nedeniyle atlandı"
@@ -181,11 +181,11 @@ _deploy_run() {
         _deploy_assert_safe_shared "${shared_dir}/writable" \
             || error "shared/writable bir symlink — deploy reddedildi (chown -R yetki-yükseltme riski)"
         rm -rf "${release_dir}/writable"
-        ln -sf "${shared_dir}/writable" "${release_dir}/writable"
+        ln -sf "../../shared/writable" "${release_dir}/writable"
     elif [[ -d "${release_dir}/writable" ]]; then
         cp -r "${release_dir}/writable" "${shared_dir}/writable"
         rm -rf "${release_dir}/writable"
-        ln -sf "${shared_dir}/writable" "${release_dir}/writable"
+        ln -sf "../../shared/writable" "${release_dir}/writable"
     fi
 
     # 5. İzinler
@@ -216,9 +216,9 @@ _deploy_run() {
         mv "$public_dir" "${base}/public_html.bak.$(date +%s)" 2>/dev/null || true
     fi
     if [[ -d "${release_dir}/public" ]]; then
-        ln -sfn "${release_dir}/public" "$public_dir"
+        ln -sfn "releases/${release_id}/public" "$public_dir"
     else
-        ln -sfn "${release_dir}" "$public_dir"
+        ln -sfn "releases/${release_id}" "$public_dir"
     fi
     systemctl reload "php${php_version}-fpm" 2>/dev/null || true
     success "Atomic switch tamamlandı"
@@ -290,7 +290,8 @@ _deploy_rollback() {
 
     header "Rollback: ${domain} → $(basename "$prev")"
     rm -rf "$public_dir"
-    if [[ -d "${prev}/public" ]]; then ln -sfn "${prev}/public" "$public_dir"; else ln -sfn "${prev}" "$public_dir"; fi
+    local prev_name; prev_name=$(basename "$prev")
+    if [[ -d "${prev}/public" ]]; then ln -sfn "releases/${prev_name}/public" "$public_dir"; else ln -sfn "releases/${prev_name}" "$public_dir"; fi
     systemctl reload "php${php_version}-fpm" 2>/dev/null || true
 
     local code; code=$(_health_probe "$domain")
