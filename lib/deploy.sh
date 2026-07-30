@@ -215,10 +215,11 @@ _deploy_run() {
     if [[ -d "$public_dir" && ! -L "$public_dir" ]]; then
         mv "$public_dir" "${base}/public_html.bak.$(date +%s)" 2>/dev/null || true
     fi
+    local rel_id; rel_id=$(basename "${release_dir}")
     if [[ -d "${release_dir}/public" ]]; then
-        ln -sfn "releases/${release_id}/public" "$public_dir"
+        ln -sfn "releases/${rel_id}/public" "$public_dir"
     else
-        ln -sfn "releases/${release_id}" "$public_dir"
+        ln -sfn "releases/${rel_id}" "$public_dir"
     fi
     systemctl reload "php${php_version}-fpm" 2>/dev/null || true
     success "Atomic switch tamamlandı"
