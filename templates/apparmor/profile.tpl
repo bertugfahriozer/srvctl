@@ -28,6 +28,8 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   {{WEB_ROOT}}/{{DOMAIN}}/private/writable/logs/** rw,
   {{WEB_ROOT}}/{{DOMAIN}}/private/writable/session/** rw,
   {{WEB_ROOT}}/{{DOMAIN}}/private/writable/uploads/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/writable/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/writable/** rw,
 
   # Log dizini (yazma)
   {{WEB_ROOT}}/{{DOMAIN}}/logs/** rw,

@@ -100,11 +100,7 @@ _domain_repair() {
             [[ ! -d "$dir" ]] && continue
             local domain
             domain=$(basename "$dir")
-            read_credentials "$domain"
-            local php_ver="${PHP_VERSION:-${DEFAULT_PHP_VERSION}}"
-            info "${domain} onarılıyor (PHP ${php_ver})..."
-            _apply_chroot_php_deps "${dir%/}" "${php_ver}"
-            systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+            _domain_repair "$domain"
         done
         success "Tüm domainler onarıldı."
         return
@@ -114,12 +110,46 @@ _domain_repair() {
     read_credentials "$target"
     local base="${WEB_ROOT}/${target}"
     local php_ver="${PHP_VERSION:-${DEFAULT_PHP_VERSION}}"
+    local sname="${SAFE_NAME}"
+    local web_user="${WEB_USER}"
+    local db_name="${DB_NAME}"
+    local db_user="${DB_USER}"
+    local db_pass="${DB_PASS}"
     
     header "Domain Onarılıyor: ${target}"
-    step "1/2" "Chroot kütüphaneleri güncelleniyor (PHP ${php_ver})..."
+    step "1/4" "Chroot kütüphaneleri güncelleniyor (PHP ${php_ver})..."
     _apply_chroot_php_deps "${base}" "${php_ver}"
     
-    step "2/2" "PHP-FPM yeniden başlatılıyor..."
+    step "2/4" "PHP-FPM Pool ve AppArmor yapılandırmaları yenileniyor..."
+    render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
+        "SAFE_NAME=${sname}" \
+        "DOMAIN=${target}" \
+        "WEB_USER=${web_user}" \
+        "WEB_ROOT=${WEB_ROOT}" \
+        "PHP_VERSION=${php_ver}" \
+        > "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf"
+
+    render_template "${SRVCTL_TEMPLATES}/apparmor/profile.tpl" \
+        "SAFE_NAME=${sname}" \
+        "DOMAIN=${target}" \
+        "WEB_USER=${web_user}" \
+        "WEB_ROOT=${WEB_ROOT}" \
+        "PHP_VERSION=${php_ver}" \
+        > "/etc/apparmor.d/srvctl-${sname}"
+    apparmor_parser -r "/etc/apparmor.d/srvctl-${sname}" 2>/dev/null || true
+    aa-enforce "/etc/apparmor.d/srvctl-${sname}" 2>/dev/null || true
+
+    step "3/4" "Veritabanı yetkileri (127.0.0.1) yenileniyor..."
+    if [[ -n "$db_name" && -n "$db_user" && -n "$db_pass" ]]; then
+        mysql --force << SQL
+CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
+GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost';
+GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+    fi
+
+    step "4/4" "PHP-FPM yeniden başlatılıyor..."
     systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
     
     success "Domain onarıldı: ${target}"
@@ -571,8 +601,9 @@ _domain_add() {
     mysql --force << SQL
 CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
-REVOKE ALL PRIVILEGES ON *.* FROM '${db_user}'@'localhost';
-GRANT SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,INDEX,DROP,CREATE TEMPORARY TABLES,LOCK TABLES,REFERENCES,TRIGGER ON \`${db_name}\`.* TO '${db_user}'@'localhost';
+CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';
+GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost';
+GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1';
 FLUSH PRIVILEGES;
 SQL
 

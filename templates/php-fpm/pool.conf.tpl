@@ -28,14 +28,14 @@ chroot = {{WEB_ROOT}}/{{DOMAIN}}
 chdir = /public_html
 
 ; ─── open_basedir (chroot içindeki göreceli yollar) ───
-php_admin_value[open_basedir] = /public_html/:/private/:/tmp/:/sessions/
+php_admin_value[open_basedir] = /public_html/:/private/:/tmp/:/sessions/:/releases/:/shared/
 php_admin_value[upload_tmp_dir] = /tmp/
 php_admin_value[session.save_path] = /sessions/
 php_admin_value[sys_temp_dir] = /tmp/
 php_admin_value[error_log] = /logs/php-error.log
 
 ; ─── Tehlikeli Fonksiyonları Devre Dışı Bırak ───
-php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,putenv,show_source,highlight_file
+php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,show_source,highlight_file
 
 ; ─── Güvenlik Ayarları ───
 php_admin_value[allow_url_fopen] = Off
