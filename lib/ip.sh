@@ -12,9 +12,10 @@ cmd_ip() {
         blacklist) _ip_blacklist "${@:2}" ;;
         list)      _ip_list ;;
         geoblock)  _ip_geoblock "${@:2}" ;;
+        reapply)   _ip_reapply_all ;;
         *)
             echo ""
-            echo "  Kullanım: srvctl ip <ban|unban|whitelist|blacklist|list|geoblock>"
+            echo "  Kullanım: srvctl ip <ban|unban|whitelist|blacklist|list|geoblock|reapply>"
             echo ""
             echo "    ban <ip> [süre]           IP'yi engelle (varsayılan: 24h)"
             echo "    unban <ip>                IP engelini kaldır"
@@ -26,6 +27,9 @@ cmd_ip() {
             echo "    geoblock add <ülke_kodu>  Ülkeyi engelle (TR, RU, CN...)"
             echo "    geoblock remove <ülke>    Ülke engelini kaldır"
             echo "    geoblock list             Engelli ülkeleri listele"
+            echo "    reapply                   Kayıtlı ban/whitelist/geoblock kurallarını"
+            echo "                              ufw+fail2ban+nginx'e yeniden uygula"
+            echo "                              (ör. 'srvctl init --force' sonrası)"
             echo ""
             ;;
     esac
@@ -55,9 +59,16 @@ _ip_ban() {
         info "Otomatik kaldırılacak: ${duration} saniye sonra"
     fi
 
-    # Bildirim
-    source "${SRVCTL_ROOT}/lib/notify.sh" 2>/dev/null
-    send_notification "🚫 IP Engellendi" "IP: ${ip} (süre: ${duration}s)" "warning" 2>/dev/null || true
+    # Bildirim (modül YOKSA sessizce atla — 'source ... || true' EKSİKTİ,
+    # 'set -e' altında dosya bulunamazsa TÜM komutu düşürebilirdi).
+    # shellcheck disable=SC1091
+    source "${SRVCTL_ROOT}/lib/notify.sh" 2>/dev/null || true
+    # DALGA 6 / madde-5: send_notification artık PREDİKAT (0/1/2) —
+    # başarısızlık ana işlemi düşürmemeli ('||') ama artık görünür (warn).
+    if declare -F send_notification >/dev/null 2>&1; then
+        send_notification "🚫 IP Engellendi" "IP: ${ip} (süre: ${duration}s)" "warning" \
+            || warn "Bildirim gönderilemedi (IP ban: ${ip})"
+    fi
 
     log_action "IP BAN: ${ip} (duration=${duration})"
 }
@@ -89,9 +100,12 @@ _ip_whitelist() {
             sort -u -o "$whitelist_file" "$whitelist_file"
 
             # Fail2Ban'a ignoreip olarak ekle
-            if ! grep -q "$ip" /etc/fail2ban/jail.local 2>/dev/null; then
-                sed -i "s|^ignoreip = |ignoreip = ${ip} |" /etc/fail2ban/jail.local
-                systemctl reload fail2ban 2>/dev/null || true
+            if [[ -f /etc/fail2ban/jail.local ]] && ! grep -q "$ip" /etc/fail2ban/jail.local 2>/dev/null; then
+                if _sed_inplace /etc/fail2ban/jail.local -e "s|^ignoreip = |ignoreip = ${ip} |"; then
+                    systemctl reload fail2ban 2>/dev/null || true
+                else
+                    warn "fail2ban ignoreip güncellenemedi (jail.local) — beyaz liste fail2ban'a YANSITILMADI: ${ip}"
+                fi
             fi
 
             # Nginx'e güvenilir IP olarak ekle
@@ -102,7 +116,11 @@ _ip_whitelist() {
             ;;
         remove)
             [[ -z "$ip" ]] && error "IP belirtilmedi."
-            sed -i "/^${ip}$/d" "$whitelist_file" 2>/dev/null
+            if [[ -f "$whitelist_file" ]]; then
+                _sed_inplace "$whitelist_file" -e "/^${ip}$/d" \
+                    || warn "Beyaz liste dosyası güncellenemedi: ${whitelist_file}"
+            fi
+            _update_nginx_whitelist
             success "Beyaz listeden çıkarıldı: ${ip}"
             log_action "IP WHITELIST REMOVE: ${ip}"
             ;;
@@ -135,7 +153,10 @@ _ip_blacklist() {
             ;;
         remove)
             [[ -z "$ip" ]] && error "IP belirtilmedi."
-            sed -i "/^${ip}$/d" "$blacklist_file" 2>/dev/null
+            if [[ -f "$blacklist_file" ]]; then
+                _sed_inplace "$blacklist_file" -e "/^${ip}$/d" \
+                    || warn "Kara liste dosyası güncellenemedi: ${blacklist_file}"
+            fi
             ufw delete deny from "$ip" to any 2>/dev/null
 
             _update_nginx_blacklist
@@ -212,27 +233,41 @@ _ip_geoblock() {
             echo "$country" >> "$geoblock_file"
             sort -u -o "$geoblock_file" "$geoblock_file"
 
-            _update_nginx_geoblock
-            success "Ülke engellendi: ${country}"
+            if _update_nginx_geoblock; then
+                success "Ülke engellendi: ${country} (nginx haritası güncellendi)"
+                info "Devreye almak için ilgili vhost'a şunu ekleyin: if (\$blocked_country) { return 403; }"
+            else
+                warn "Ülke listeye eklendi ama nginx haritası uygulanamadı: ${country} (GeoIP modülü/veritabanı kurulu mu? 'srvctl init' kontrol edin)"
+            fi
             log_action "GEOBLOCK ADD: ${country}"
             ;;
         remove)
             [[ -z "$country" ]] && error "Ülke kodu belirtilmedi."
             country=$(echo "$country" | tr '[:lower:]' '[:upper:]')
-            sed -i "/^${country}$/d" "$geoblock_file" 2>/dev/null
+            if [[ -f "$geoblock_file" ]]; then
+                _sed_inplace "$geoblock_file" -e "/^${country}$/d" \
+                    || warn "GeoIP liste dosyası güncellenemedi: ${geoblock_file}"
+            fi
 
-            _update_nginx_geoblock
-            success "Ülke engeli kaldırıldı: ${country}"
+            if _update_nginx_geoblock; then
+                success "Ülke engeli kaldırıldı: ${country}"
+            else
+                warn "Ülke listeden çıkarıldı ama nginx haritası güncellenirken sorun oluştu: ${country}"
+            fi
             log_action "GEOBLOCK REMOVE: ${country}"
             ;;
         list)
-            if [[ -f "$geoblock_file" ]]; then
+            if [[ -f "$geoblock_file" && -s "$geoblock_file" ]]; then
                 echo ""
                 echo -e "  ${BOLD}Engelli Ülkeler${NC}"
                 divider
                 while IFS= read -r c; do
                     echo "  🌍 ${c}"
                 done < "$geoblock_file"
+                echo ""
+                echo "  NOT: nginx haritası ('\$blocked_country') hazır ama devreye almak için"
+                echo "       ilgili vhost'a manuel olarak eklenmesi gerekir:"
+                echo "       if (\$blocked_country) { return 403; }"
                 echo ""
             else
                 info "GeoIP engeli tanımlanmamış"
@@ -242,6 +277,60 @@ _ip_geoblock() {
             error "Kullanım: srvctl ip geoblock <add|remove|list> [ülke_kodu]"
             ;;
     esac
+}
+
+# ─── init --force sonrası ban/whitelist/geoblock kurallarını yeniden uygula ───
+# 'srvctl init --force' 'ufw --force reset' ile UFW'yi SIFIRLAR (bkz.
+# lib/init.sh) ama /etc/srvctl/ip-whitelist.conf ve ip-blacklist.conf DİSKTE
+# KALIR — operatör firewall'un sıfırlandığını fark etmeyebilir, ban/whitelist
+# kaybolmuş görünmeden devam eder (DALGA 6 bulgusu). Bu fonksiyon MEVCUT conf
+# dosyalarından ufw/fail2ban/nginx durumunu YENİDEN üretir; idempotenttir,
+# ne zaman çağrılırsa çağrılsın güvenlidir.
+# DEVREDİLEN İŞ: lib/init.sh'ın '--force' akışının SONUNDA
+#   source "${SRVCTL_ROOT}/lib/ip.sh" 2>/dev/null && _ip_reapply_all
+# çağrısını (guard'lı) eklemesi gerekir — lib/init.sh bu dosyanın SAHİBİ
+# OLMADIĞIMIZ bir modül olduğundan buradan eklenemiyor.
+_ip_reapply_all() {
+    local bl_count=0 wl_count=0 ip
+
+    # Kara liste → UFW kalıcı deny kuralları
+    if [[ -f /etc/srvctl/ip-blacklist.conf ]]; then
+        while IFS= read -r ip; do
+            [[ -z "$ip" ]] && continue
+            if _ip_value_gate "$ip"; then
+                ufw insert 1 deny from "$ip" to any comment "srvctl-blacklist" > /dev/null 2>&1
+                bl_count=$((bl_count + 1))
+            else
+                warn "Kara listede geçersiz IP/CIDR atlandı: ${ip}"
+            fi
+        done < /etc/srvctl/ip-blacklist.conf
+    fi
+
+    # Beyaz liste → fail2ban ignoreip (jail.local varsa)
+    if [[ -f /etc/srvctl/ip-whitelist.conf ]]; then
+        while IFS= read -r ip; do
+            [[ -z "$ip" ]] && continue
+            if ! _ip_value_gate "$ip"; then
+                warn "Beyaz listede geçersiz IP/CIDR atlandı: ${ip}"
+                continue
+            fi
+            wl_count=$((wl_count + 1))
+            if [[ -f /etc/fail2ban/jail.local ]] && ! grep -q "$ip" /etc/fail2ban/jail.local 2>/dev/null; then
+                _sed_inplace /etc/fail2ban/jail.local -e "s|^ignoreip = |ignoreip = ${ip} |" \
+                    || warn "fail2ban ignoreip güncellenemedi: ${ip}"
+            fi
+        done < /etc/srvctl/ip-whitelist.conf
+        systemctl reload fail2ban 2>/dev/null || true
+    fi
+
+    # Nginx snippet'lerini (whitelist/blacklist/geoblock) yeniden üret —
+    # idempotent, mevcut conf dosyalarından yeniden yazar.
+    _update_nginx_whitelist
+    _update_nginx_blacklist
+    _update_nginx_geoblock || warn "GeoIP haritası yeniden uygulanırken sorun oluştu (yukarıdaki uyarıya bakın)"
+
+    success "IP kuralları yeniden uygulandı (kara liste: ${bl_count} IP, beyaz liste: ${wl_count} IP)"
+    log_action "IP REAPPLY: blacklist=${bl_count} whitelist=${wl_count}"
 }
 
 _update_nginx_whitelist() {
@@ -266,32 +355,60 @@ _update_nginx_blacklist() {
     nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
 }
 
+# ─── DALGA 6 O13/madde-4 düzeltmesi ───
+# ESKİ HALİ FİİLEN NO-OP'TU: 'geo $blocked_country { default 0; # TR ... }'
+# — (a) 'geo' yönergesi CLIENT IP ARALIĞINA göre eşleme yapar, ülke koduna
+# göre DEĞİL (yanlış yönerge); (b) gövde yalnız YORUM SATIRLARI ekliyordu,
+# hiçbir zaman '$blocked_country'yi 1 yapan gerçek bir satır ÜRETMİYORDU.
+# 'nginx -t' bunu her zaman GEÇERLİ (boş/yorum-only blok) sayıp "başarı"
+# bildiriyordu — sessiz no-op. Doğru yönerge init.sh'ın kurduğu
+# 'geoip_country' modülünün ürettiği '$geoip_country' değişkenini haritalayan
+# 'map'tir. NOT (devredilen kapsam dışı iş): bu harita yalnız
+# '$blocked_country' değişkenini ÜRETİR; onu gerçekten TÜKETİP isteği
+# reddeden 'if ($blocked_country) { return 403; }' satırı vhost server
+# bloklarına elle (ya da domain/template sahibinin vhost template'ine
+# eklemesiyle) girmelidir — bu dosya (lib/ip.sh) vhost template'lerine
+# DOKUNMUYOR (kapsam dışı, bkz. rapor).
 _update_nginx_geoblock() {
     local conf="/etc/nginx/conf.d/srvctl-geoblock.conf"
     local geoblock_file="/etc/srvctl/geoblock.conf"
 
     if [[ ! -f "$geoblock_file" || ! -s "$geoblock_file" ]]; then
-        rm -f "$conf"
+        rm -f -- "$conf"
         nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
-        return
+        return 0
     fi
 
     cat > "$conf" << 'GEOHEAD'
 # srvctl GeoIP blocking — otomatik oluşturuldu
 # GeoIP modülü gerektirir: apt install libnginx-mod-http-geoip geoip-database
-geo $blocked_country {
+# (bkz. srvctl init — 'geoip_country' yönergesini nginx.conf http bloğuna ekler)
+# $blocked_country: 1 ise istek engellenecek ülkeden, 0 ise değil.
+map $geoip_country $blocked_country {
     default 0;
 GEOHEAD
 
-    # GeoIP veritabanından ülke CIDR'lerini dahil et
+    # Her ülke kodu için GERÇEK bir eşleme satırı üret (yorum DEĞİL).
     while IFS= read -r country; do
-        echo "    # ${country} — bloklanacak" >> "$conf"
+        [[ -z "$country" ]] && continue
+        # 'add' aşamasında zaten validate_country ile doğrulandı; dosya elle
+        # düzenlenmiş olabileceğinden burada ikinci bir savunma katmanı.
+        validate_country "$country" || { warn "geoblock.conf içinde geçersiz ülke kodu atlandı: ${country}"; continue; }
+        echo "    ${country} 1;" >> "$conf"
     done < "$geoblock_file"
 
     echo "}" >> "$conf"
-    echo "" >> "$conf"
-    echo "# Kullanım: server bloğuna ekleyin:" >> "$conf"
-    echo "#   if (\$blocked_country) { return 444; }" >> "$conf"
+    cat >> "$conf" << 'GEOFOOT'
 
-    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+# ETKİNLEŞTİRME GEREKİR (henüz OTOMATİK değil): bu harita TEK BAŞINA hiçbir
+# isteği engellemez. İlgili domain'in vhost server bloğuna şu satırı ekleyin:
+#   if ($blocked_country) { return 403; }
+GEOFOOT
+
+    if ! nginx -t 2>/dev/null; then
+        warn "GeoIP haritası nginx -t testinden geçemedi — GeoIP modülü/veritabanı kurulu olmayabilir ('srvctl init' ile kurun)"
+        return 1
+    fi
+    systemctl reload nginx 2>/dev/null || true
+    return 0
 }

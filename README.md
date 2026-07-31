@@ -1,7 +1,7 @@
 # srvctl — CLI-Only Ultra-Güvenli Sunucu Yönetimi
 
 > Sıfır GUI · Sıfır Docker · Sıfır Panel · Çok Katmanlı Güvenlik
-> Ubuntu 22.04 LTS · PHP-FPM · Nginx · MariaDB · Redis
+> Ubuntu 22.04 / 24.04 LTS · PHP-FPM · Nginx · MariaDB · Redis
 
 ---
 
@@ -21,7 +21,7 @@
 | 6 | open_basedir | PHP erişim dizinlerini kısıtlar |
 | 7 | disable_functions | `exec`, `system`, `shell_exec` vb. kapalı |
 | 8 | MariaDB GRANT izolasyonu | Domain yalnız kendi DB'sine erişir |
-| 9 | Redis ACL | Domain yalnız kendi key prefix'ine erişir |
+| 9 | Redis ACL | Domain yalnız kendi key/pub-sub prefix'ine erişir (scripting Redis sürümüne bağlı) |
 | 10 | Nginx güvenlik header'ları | HSTS, CSP, X-Frame-Options, rate limit |
 | 11 | Fail2Ban | Brute-force engelleme |
 | 12 | auditd | Dosya değişiklik denetimi |
@@ -36,6 +36,16 @@
 | AIDE | Dosya bütünlük kontrolü (günlük) |
 | ClamAV | Upload antivirüs taraması (günlük) |
 | GeoIP | Ülke bazlı engelleme |
+
+---
+
+## Redis Scripting (Lua) Durumu
+
+Domain'de `REDIS_SCRIPTING=enabled` belirtilirse:
+- **Redis 7.0+:** Lua script'ler ACL-farkında (tüm komutlar denetlenir) — supportlu
+- **Redis 6.x:** Lua script'ler denetim dışında kalır — **yapılandırılmamıştır**. 
+  Laravel queue gibi script-kullanan kütüphaneler çalışmaz; `QUEUE_CONNECTION=database` 
+  vb. alternatif kullanın
 
 ---
 
@@ -58,16 +68,20 @@ sudo srvctl domain add example.com --php=8.3
 ```bash
 sudo srvctl init        # Tek seferlik kurulum (12 + gelişmiş katman)
 sudo srvctl status      # Durum özeti
-sudo srvctl security audit            # Güvenlik denetimi (skor/100)
-sudo srvctl security harden-fs <d>    # Dosya-sahiplik modelini ÖNİZLE (dry-run)
-sudo srvctl security harden-fs <d> --apply   # uygula | --revert geri al | --all tümü
-sudo srvctl security harden-fpm <d>   # FPM unit modelini ÖNİZLE | --apply | --all
+sudo srvctl security audit                    # Güvenlik denetimi (skor/100)
+sudo srvctl security harden-fs <domain>       # Dosya-sahiplik modelini ÖNİZLE (dry-run)
+sudo srvctl security harden-fs <domain> --apply  # Uygula | --revert geri al | --all tümü
+sudo srvctl security harden-fpm <domain>      # Per-domain FPM unit'ini ÖNİZLE (dry-run)
+sudo srvctl security harden-fpm <domain> --apply --all  # Uygula | tüm domain'ler
 ```
 
-> **Fail-closed audit (Faz 2/T7b):** `security audit` artık AppArmor/seccomp/cgroups'u
-> **gerçek enforce durumuyla** kontrol eder (yalnız servis/profil-adı varlığıyla değil):
-> bir domain'in FPM unit'i gerçekten enforce değilse ilgili kontrol **FAIL** verir.
-> modsec /admin XSS koruması yalnız 941160 (zengin-metin yanlış-pozitifi) hariç aktiftir.
+> **Fail-closed audit (Faz 2/T7b) — ÖNEMLİ UYARISI:** `security audit` artık 
+> AppArmor/seccomp/cgroups'u **gerçek enforce durumuyla** kontrol eder 
+> (yalnız servis/profil-adı varlığıyla değil). Mevcut kurulumlar: varsayılan 
+> `domain add` yolu paylaşılan FPM havuzunu kullandığından domain başına 3 
+> FAIL (AppArmor/seccomp/cgroups attach) alacak ve skor düşecek. Bu beklenen; 
+> çözüm per-domain FPM unit'i devreye almak: `srvctl security harden-fpm <domain> --apply`.
+> ModSecurity /admin XSS koruması yalnız 941160 (zengin-metin yanlış-pozitifi) hariç aktiftir.
 
 > **Per-domain FPM unit (Faz 2/T7a):** Her domain kendi `srvctl-fpm-<sname>.service`'inde
 > çalışır; AppArmor profili (`AppArmorProfile=`) ve cgroups slice (`Slice=`) systemd üzerinden
@@ -83,9 +97,11 @@ sudo srvctl security harden-fpm <d>   # FPM unit modelini ÖNİZLE | --apply | -
 
 ### Domain — Temel
 ```bash
-sudo srvctl domain add example.com --php=8.3
+sudo srvctl domain add example.com [--php=8.3] [--framework=ci4|laravel|symfony]
+                                   # Framework belirlerse `shared/` iskelesi,
+                                   # `.env` şablonu, nginx denied yolları otomatik konfigüre edilir
 sudo srvctl domain list
-sudo srvctl domain info example.com
+sudo srvctl domain info example.com [--show-secrets]  # Varsayılan parolalar gizli
 sudo srvctl domain remove example.com        # öncesinde otomatik yedek
 ```
 
@@ -99,6 +115,12 @@ sudo srvctl domain resources example.com --memory=512M --cpu=50% --io=100
 sudo srvctl domain resources example.com --show
 sudo srvctl domain staging example.com               # staging.example.com klonu
 sudo srvctl domain migrate example.com user@host [--auto]
+sudo srvctl domain worker <domain> <start|stop|status|enable|disable> [instance]
+                         # Laravel queue / CI4 queue worker yönet
+sudo srvctl domain scheduler <domain> <start|stop|status|enable|disable>
+                         # Laravel schedule / Symfony messenger yönet
+sudo srvctl domain rate-limit <domain> [profil]     # Rate-limit profilini değiştir/göster
+sudo srvctl domain repair <domain>|--all             # Eksik chroot kütüphanelerini tamir et
 ```
 
 ### Deploy (zero-downtime)
@@ -109,28 +131,36 @@ sudo srvctl deploy rollback example.com      # önceki sürüme dön
 sudo srvctl rollback example.com             # (kısayol — aynısı)
 sudo srvctl deploy health example.com        # sağlık kontrolü
 sudo srvctl deploy list example.com          # release geçmişi
+sudo srvctl deploy prune <domain>|--all [--keep=N] [--apply] [--include-bak]
+                         # Eski release'leri temizle (varsayılan: dry-run, 5'ten eski siler)
 ```
 **Akış:** git clone → composer → `pre-deploy.sh` hook → shared bağla → izinler → atomic symlink switch → health check (başarısızsa **otomatik rollback**) → `post-deploy.sh` hook → eski release temizliği (son 5).
 Hook'lar: `shared/hooks/pre-deploy.sh` ve `shared/hooks/post-deploy.sh` (varsa çalışır; `RELEASE_DIR`, `DOMAIN` env'leri verilir).
 
-> **Güvenlik (Faz 2/T3):** Deploy hook'ları ve `composer install` per-domain web
-> kullanıcısı olarak (`runuser`, root **değil**) çalışır — kötü niyetli composer
-> lifecycle script'i ya da hook'u root'a ulaşamaz. `shared/.env`/`shared/writable`
-> bir symlink ise reddedilir (`chown -R` ile jail dışına çıkış engellenir).
+> **Güvenlik (Faz 2/T3):** Deploy hook'ları, composer, framework build adımları
+> (migrations, npm build vb.) per-domain web kullanıcısı olarak (`runuser`, 
+> root **değil**) çalışır — kötü niyetli composer/npm lifecycle script'i ya da 
+> hook'u root'a ulaşamaz. `shared/.env`/`shared/writable` bir symlink ise 
+> reddedilir (`chown -R` ile jail dışına çıkış engellenir).
 
 ### Yedekleme
 ```bash
 sudo srvctl backup run [domain]
 sudo srvctl backup list
-sudo srvctl backup restore 20250618_040000
+sudo srvctl backup restore <yedek_dizini> [domain] [--dry-run]
+                           # Tek domain filtresi ve dry-run (önizleme) desteklenir
 ```
 Günlük otomatik yedek (04:00), 30 günden eski yedekler silinir.
 
-> **Güvenlik notu (Faz 1):** Yedek paketleri `.credentials` ve `.srvctl-meta`
-> dosyalarını **içermez** (parolaların world-readable yedeğe sızmaması için).
-> Geri yüklemede DB/Redis parolaları yeniden üretilir veya `.credentials`
-> güvenli (band-dışı) bir kopyadan elle yerleştirilir. Yedek şifrelemesi
-> ileride eklenecektir.
+> **Güvenlik notu (Faz 1 → Faz 2/DALGA 6 güncellenmesi):** Dosya yedekleri
+> `.credentials`, `.srvctl-meta`, `.deploy-repo` içermez. Konfigürasyon yedekleri
+> (`configs.tar.gz`) ise iki moda ayırıldı:
+> - **Varsayılan (güvenli):** `/etc/redis/users.acl` ve `conf/srvctl.conf` 
+>   **hariç tutuluyor** (bare-metal restore sonrası Redis ACL parolaları ve
+>   Cloudflare token'ı elle girilmelidir).
+> - **Opt-in şifreli:** `BACKUP_GPG_RECIPIENT` yapılandırılıp `gpg` kuruluysa
+>   sırlar dahil edilir ama doğrudan plaintext diske düşmeden GPG ile
+>   şifrelenir (`configs.tar.gz.gpg`).
 
 ### SSL
 ```bash
@@ -142,6 +172,18 @@ Sonradan ssl eklemek isternirse:
 ```bash
 sudo certbot --nginx -d example.com -d www.example.com
 ```
+
+### Self-Update (Pinned-Commit Modeli)
+```bash
+sudo srvctl self-update check          # Yeni sürüm hash'ini okuyup PİNLE (zorunlu)
+sudo srvctl self-update run            # Pinlenmiş hash'i kur
+sudo srvctl self-update rollback [ad]  # Son (veya belirtilen) yedeğe geri dön
+```
+
+> **Güvenlik modeli:** `run`, ÖNCE `check` çalıştırılmasını zorunlu kılar. Sistem
+> klon her zaman `check` anında görülen tam commit hash'ine sabitlenir (HEAD değişse 
+> bile çalıştırmıştır). Operatör kontrolü gözarı edilemez; tedarik zinciri saldırısı 
+> karşı kalkan.
 
 ### İzleme & Alarm
 ```bash
@@ -166,7 +208,11 @@ sudo srvctl ip whitelist add 1.2.3.4
 sudo srvctl ip blacklist add 1.2.3.4
 sudo srvctl ip geoblock add CN
 sudo srvctl ip list
+sudo srvctl ip reapply          # Ban/whitelist/geoblock kurallarını yeniden uygula
 ```
+
+> **Geoblock notu:** Ülke engelleme kuralları varsayılan uygulama yapılandırmasında 
+> yer almaz; etkinleştirilmek için vhost template'ine elle ek yapılması gerekir.
 
 ### Cloudflare
 ```bash
@@ -253,15 +299,39 @@ sudo srvctl changelog search DEPLOY
 
 ## Yapılandırma — `/usr/local/srvctl/conf/srvctl.conf`
 ```bash
-DEFAULT_PHP_VERSION=8.3
-SSH_PORT=2222
-WEB_ROOT=/var/www
-BACKUP_DIR=/backups
-BACKUP_RETENTION_DAYS=30
-DEPLOYER_USER=deployer
-# REDIS_ADMIN_PASS=        (init doldurur)
-# CF_API_TOKEN=            (cloudflare setup doldurur)
-# NOTIFY_TELEGRAM_TOKEN=   (notify setup doldurur)
+# ─── Temel ───
+DEFAULT_PHP_VERSION=8.3          # Varsayılan PHP sürümü
+SSH_PORT=2222                    # SSH portu (srvctl denetleği değil, referans)
+WEB_ROOT=/var/www                # Domain kökü
+DEPLOYER_USER=deployer           # Deploy-çalıştırma kullanıcısı
+
+# ─── Yedekleme ───
+BACKUP_DIR=/backups              # Yedek kökü
+BACKUP_RETENTION_DAYS=30         # Otomatik silme günü
+BACKUP_MIN_FREE_MB=500           # Yedek sonrası disk serbest alanı (MB, uyarı)
+BACKUP_GPG_RECIPIENT=            # (Opsiyonel) GPG anahtar ID → sırlarla şifreli yedek
+
+# ─── Deploy ───
+DEPLOY_KEEP_RELEASES=5           # Tutulacak release sayısı (taban 2)
+DEPLOY_PRUNE_BAK_DAYS=7          # public_html.bak.* silinecek yaş (gün)
+DEPLOY_RUN_MIGRATIONS=false      # DB migration otomatik çalıştır (per-domain override'ı var)
+DEPLOY_NPM_BUILD=false           # npm ci && npm run build çalıştır
+DEPLOY_HEALTH_RETRIES=5          # Deploy sonrası sağlık probe retry sayısı
+DEPLOY_HEALTH_INTERVAL=2         # Probe interval (saniye)
+DEPLOY_HEALTH_OK_CODES="200 301 302"  # Kabul edilen HTTP kodları
+
+# ─── Güvenilir edge-IP senkronu ───
+TRUSTED_SYNC_ENABLED=true        # Cloudflare/UptimeRobot IP senkronizasyonu
+TRUSTED_SOURCES="cloudflare uptimerobot"  # Kaynaklar
+TRUSTED_STATE_DIR=/etc/srvctl/trusted     # State dizini
+
+# ─── Self-Update ───
+SELFUPDATE_KEEP_BACKUPS=3        # Kaç son yedek tutulacak
+
+# ─── Bildirim Entegrasyonu (setup tarafından doldurulur) ───
+# REDIS_ADMIN_PASS=              (init doldurur)
+# CF_API_TOKEN=                  (cloudflare setup doldurur)
+# NOTIFY_TELEGRAM_TOKEN=         (notify setup doldurur)
 ```
 
 ---

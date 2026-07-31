@@ -1,3 +1,17 @@
+# TOKENS: DOMAIN SAFE_NAME WEB_ROOT PHP_VERSION RL_REQ_ZONE RL_REQ_BURST
+#         RL_LOGIN_ZONE RL_LOGIN_BURST RL_CONN RL_SENSITIVE_PATHS DENY_DIRS
+# Besleyen: lib/domain.sh — _domain_write_vhost (satır ~489). RL_* değerleri
+# rate_profile_load (core.sh) tarafından global değişken olarak set edilir;
+# RL_SENSITIVE_PATHS/DENY_DIRS önce assert_regex_safe ile doğrulanır.
+#
+# NOT (DALGA 6): aşağıdaki 'include .../webhook.d/{{SAFE_NAME}}/*.conf' satırı
+# SAFE_NAME'i YENİDEN kullanır — YENİ bir token DEĞİL. Webhook OPT-IN'dir,
+# bkz. o satırın yanındaki yorum.
+#
+# NOT (DALGA 7): 'include /etc/nginx/geoblock.d/*.conf;' satırı da YENİ bir
+# token GEREKTİRMEZ (literal/sabit yol, tüm domainlerde AYNI — geoblock
+# per-domain değil server-çapında bir karardır). Detay ve besleme durumu
+# için templates/nginx/geoblock-enforce.conf.tpl'e bakın.
 server {
     listen 80;
     server_name {{DOMAIN}} www.{{DOMAIN}};
@@ -7,6 +21,18 @@ server {
 
     access_log {{WEB_ROOT}}/{{DOMAIN}}/logs/access.log security;
     error_log  {{WEB_ROOT}}/{{DOMAIN}}/logs/error.log warn;
+
+    # ─── GeoIP Engelleme (OPT-IN, global — DALGA 7) ───
+    # 'srvctl ip geoblock add <ülke>' hiç ÇAĞRILMADIYSA (ya da GeoIP modülü
+    # kurulu değilse) bu satır HİÇBİR ŞEY yapmaz: /etc/nginx/geoblock.d/
+    # dizini/dosyası yoksa nginx'te glob include sıfır eşleşmeyi hatasız
+    # kabul eder (webhook.d İLE AYNI desen — bkz.
+    # templates/nginx/webhook-location.conf.tpl). Diğer tüm güvenlik
+    # kontrollerinden (rate limit, hassas dosya/dizin engelleri) ÖNCE
+    # yerleştirilmiştir — engellenen bir ülkeden gelen istek mümkün olduğunca
+    # erken reddedilsin, limit_req sayaçları/CPU boşuna tüketilmesin diye.
+    # İçerik ve besleme durumu için templates/nginx/geoblock-enforce.conf.tpl.
+    include /etc/nginx/geoblock.d/*.conf;
 
     # ─── Güvenlik ───
     disable_symlinks if_not_owner from=$document_root;
@@ -35,8 +61,23 @@ server {
         return 404;
     }
 
-    # CI4 uygulama dizinleri (public_html dışında kalmalı)
-    location ~ ^/(app|system|vendor|modules|writable|private|tests|node_modules|\.composer|storage|bootstrap|config|database|routes|resources|var)/ {
+    # Bağımlılık manifest dosyaları (isim-bazlı, KÖR '.json$' DEĞİL):
+    # composer.json versiyon kısıtlarını sızdırır (composer.lock zaten .lock$
+    # ile engelli); package.json/package-lock.json npm bağımlılık ağacını
+    # sızdırır. Genel '.json' uzantı engeli Laravel'in public/manifest.json,
+    # public/build/manifest.json (Vite) gibi MEŞRU dosyalarını kırar — bu
+    # yüzden yalnız bilinen hassas dosya adları engellenir.
+    location ~ ^/(composer\.json|package\.json|package-lock\.json)$ {
+        deny all;
+        return 404;
+    }
+
+    # Uygulama dizinleri (docroot içinde kalmamalı) — framework/layout'a göre
+    # değişir: CI4 legacy'de (docroot=repo kökü) bu dizinler docroot İÇİNDE ve
+    # gerçekten tehlikelidir; public/ tabanlı layout'ta (Laravel/Symfony/modern
+    # CI4) 'storage' ve 'vendor' MEŞRU public alt dizinleridir (storage:link,
+    # vendor:publish) — {{DENY_DIRS}} değeri framework beyanına göre seçilir.
+    location ~ ^/({{DENY_DIRS}})/ {
         deny all;
         return 404;
     }
@@ -103,4 +144,14 @@ server {
         log_not_found off;
         access_log off;
     }
+
+    # ─── Webhook auto-deploy (OPT-IN, DALGA 6) ───
+    # 'srvctl webhook setup {{DOMAIN}}' ÇAĞRILMADIĞI sürece bu satır
+    # HİÇBİR ŞEY yapmaz: /etc/nginx/webhook.d/{{SAFE_NAME}}/ dizini/dosyası
+    # yoksa nginx'te glob include sıfır eşleşmeyi hatasız kabul eder (bkz.
+    # /etc/nginx/conf.d/*.conf deseni, lib/init.sh) — yani her domain'e
+    # otomatik bir webhook uç noktası AÇILMAZ, saldırı yüzeyi yalnız
+    # webhook AÇIKÇA kurulmuş domain'lerde büyür. İçerik ve gerekçe için
+    # templates/nginx/webhook-location.conf.tpl'e bakın.
+    include /etc/nginx/webhook.d/{{SAFE_NAME}}/*.conf;
 }

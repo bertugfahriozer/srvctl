@@ -3,7 +3,8 @@
 #  user.sh — RBAC Kullanıcı Yönetimi + 2FA
 # ═══════════════════════════════════════════════
 
-SRVCTL_USERS_DIR="/etc/srvctl/users"
+# Test için override edilebilir (SITES_AVAILABLE / SRVCTL_FPM_DIR ile aynı desen)
+SRVCTL_USERS_DIR="${SRVCTL_USERS_DIR:-/etc/srvctl/users}"
 
 cmd_user() {
     require_root
@@ -85,8 +86,8 @@ ROLE=${role}
 DOMAINS=
 CREATED=$(date +%s)
 LAST_LOGIN=
-2FA_ENABLED=false
-2FA_SECRET=
+TWOFA_ENABLED=false
+TWOFA_SECRET=
 USERCONF
     chmod 600 "${SRVCTL_USERS_DIR}/${username}.conf"
 
@@ -119,6 +120,36 @@ _user_remove() {
     log_action "USER REMOVE: ${username}"
 }
 
+# Kullanıcı conf'unu OKU (asla source etme) + eski anahtar adlarını göç ettir.
+# Eski dosyalar '2FA_ENABLED=' yazıyordu; bu geçerli bir bash değişken adı
+# DEĞİL — 'source' ederken "command not found", '${2FA_ENABLED}' ise
+# "bad substitution" veriyordu, yani user list/info tamamen çalışmıyordu.
+_user_read_conf() {
+    local conf="$1"
+    [[ -f "$conf" ]] || return 0
+
+    # Tek seferlik göç: 2FA_* → TWOFA_*.
+    # H5 DÜZELTMESİ (denetim DALGA 4): _sed_inplace (core.sh) ATOMİK yazar VE
+    # başarı/başarısızlığı DÖNÜŞ DEĞERİYLE bildirir — eski 'sed -i.bak ... &&
+    # rm -f .bak' zincirinin sonucu HİÇ kontrol edilmiyordu: salt-okunur/
+    # immutable bir dosyada sed başarısız olsa bile "güncellendi" deniyor,
+    # '.bak' (2FA secret'ini İÇEREN) kalıcı bir kopya olarak kalıyordu VE
+    # sonraki read_kv_file eski 'TWOFA_*' adlarını bulamadığından tüm alanlar
+    # sessizce boş kalıyordu ('user list' 2FA'yı kapalı gösterirdi). Ayrıca
+    # '_sed_inplace' '.bak' TÜRÜ bir kopya HİÇ bırakmaz (sır sızıntısı riski
+    # azalır — KARAR 2 gerekçesi).
+    if grep -q '^2FA_' "$conf" 2>/dev/null; then
+        if _sed_inplace "$conf" -e 's|^2FA_ENABLED=|TWOFA_ENABLED=|' -e 's|^2FA_SECRET=|TWOFA_SECRET=|'; then
+            info "Kullanıcı conf'u güncellendi (2FA_* → TWOFA_*): $(basename "$conf")"
+        else
+            warn "Kullanıcı conf'u göç ettirilemedi (2FA_* → TWOFA_*): $(basename "$conf") — dosya salt-okunur/immutable olabilir; 2FA alanları eski adlarla kalmış olabilir"
+        fi
+    fi
+
+    ROLE=""; DOMAINS=""; CREATED=""; LAST_LOGIN=""; TWOFA_ENABLED=""; TWOFA_SECRET=""
+    read_kv_file "$conf" ROLE DOMAINS CREATED LAST_LOGIN TWOFA_ENABLED TWOFA_SECRET
+}
+
 _user_list() {
     header "srvctl Kullanıcıları"
 
@@ -130,13 +161,12 @@ _user_list() {
         local username
         username=$(basename "$conf" .conf)
 
-        # shellcheck disable=SC1090
-        source "$conf"
+        _user_read_conf "$conf"
 
         local twofa_icon="❌"
-        [[ "${2FA_ENABLED:-false}" == "true" ]] && twofa_icon="✅"
+        [[ "${TWOFA_ENABLED:-false}" == "true" ]] && twofa_icon="✅"
 
-        printf "  %-15s %-12s %-30s %-6s\n" "$username" "${ROLE}" "${DOMAINS:-tümü}" "$twofa_icon"
+        printf "  %-15s %-12s %-30s %-6s\n" "$username" "${ROLE:-?}" "${DOMAINS:-tümü}" "$twofa_icon"
     done
 
     echo ""
@@ -147,16 +177,15 @@ _user_info() {
     [[ -z "$username" ]] && error "Kullanıcı adı belirtilmedi."
     [[ ! -f "${SRVCTL_USERS_DIR}/${username}.conf" ]] && error "Kullanıcı bulunamadı."
 
-    # shellcheck disable=SC1090
-    source "${SRVCTL_USERS_DIR}/${username}.conf"
+    _user_read_conf "${SRVCTL_USERS_DIR}/${username}.conf"
 
     header "Kullanıcı: ${username}"
 
-    echo "  Rol:            ${ROLE}"
+    echo "  Rol:            ${ROLE:-bilinmiyor}"
     echo "  Domain'ler:     ${DOMAINS:-tümü (admin)}"
-    echo "  Oluşturulma:    $(date -d "@${CREATED}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "${CREATED}")"
+    echo "  Oluşturulma:    $(date -d "@${CREATED:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "${CREATED:-bilinmiyor}")"
     echo "  Son giriş:      ${LAST_LOGIN:-bilinmiyor}"
-    echo "  2FA:            ${2FA_ENABLED:-false}"
+    echo "  2FA:            ${TWOFA_ENABLED:-false}"
 
     divider
 
@@ -182,15 +211,23 @@ _user_info() {
 _user_grant() {
     local username="$1" domain="$2"
     [[ -z "$domain" ]] && error "Kullanım: srvctl user grant <username> <domain>"
+    # B5 sertleştirmesi (denetim DALGA 4): domain_exists'e eklenen validate_domain
+    # kapısının birebir user tarafı — username daha sonra dosya yollarına
+    # (ör. /home/${username}/...) akan başka komutlarda kullanılabileceğinden
+    # burada da erken doğrulanır (defense-in-depth; conf dosyası varlık
+    # kontrolü zaten aşağıda var ama tek başına yeterli garanti değil).
+    validate_username "$username" || error "Geçersiz kullanıcı adı: ${username}"
     [[ ! -f "${SRVCTL_USERS_DIR}/${username}.conf" ]] && error "Kullanıcı bulunamadı."
 
     local current_domains
     current_domains=$(grep "^DOMAINS=" "${SRVCTL_USERS_DIR}/${username}.conf" | cut -d= -f2)
 
+    # KARAR 2: atomik/portable _sed_inplace (bkz. core.sh) — çıplak GNU-only
+    # 'sed -i' yerine.
     if [[ -z "$current_domains" ]]; then
-        sed -i "s|^DOMAINS=|DOMAINS=${domain}|" "${SRVCTL_USERS_DIR}/${username}.conf"
+        _sed_inplace "${SRVCTL_USERS_DIR}/${username}.conf" "s|^DOMAINS=|DOMAINS=${domain}|"
     else
-        sed -i "s|^DOMAINS=.*|DOMAINS=${current_domains},${domain}|" "${SRVCTL_USERS_DIR}/${username}.conf"
+        _sed_inplace "${SRVCTL_USERS_DIR}/${username}.conf" "s|^DOMAINS=.*|DOMAINS=${current_domains},${domain}|"
     fi
 
     # Domain'in web grubuna ekle
@@ -205,6 +242,8 @@ _user_grant() {
 _user_revoke() {
     local username="$1" domain="$2"
     [[ -z "$domain" ]] && error "Kullanım: srvctl user revoke <username> <domain>"
+    # B5 sertleştirmesi — bkz. _user_grant üzerindeki gerekçe.
+    validate_username "$username" || error "Geçersiz kullanıcı adı: ${username}"
     [[ ! -f "${SRVCTL_USERS_DIR}/${username}.conf" ]] && error "Kullanıcı bulunamadı."
 
     # Domain'i listeden kaldır
@@ -212,7 +251,8 @@ _user_revoke() {
     current=$(grep "^DOMAINS=" "${SRVCTL_USERS_DIR}/${username}.conf" | cut -d= -f2)
     local new_domains
     new_domains=$(echo "$current" | tr ',' '\n' | grep -v "^${domain}$" | tr '\n' ',' | sed 's/,$//')
-    sed -i "s|^DOMAINS=.*|DOMAINS=${new_domains}|" "${SRVCTL_USERS_DIR}/${username}.conf"
+    # KARAR 2: atomik/portable _sed_inplace (bkz. core.sh).
+    _sed_inplace "${SRVCTL_USERS_DIR}/${username}.conf" "s|^DOMAINS=.*|DOMAINS=${new_domains}|"
 
     # Gruptan çıkar
     local sname
@@ -224,7 +264,19 @@ _user_revoke() {
 }
 
 _user_key() {
-    local action="$1" username="$2" pubkey="$3"
+    # set -u altında 'user key remove <name>' 3. argümansız çağrılıyordu
+    # → "$3: unbound variable" ile komut düşüyordu.
+    local action="${1:-}" username="${2:-}" pubkey="${3:-}"
+    [[ -z "$username" ]] && error "Kullanım: srvctl user key <add|remove> <username> [pubkey]"
+    # ─── B5 DÜZELTMESİ (denetim DALGA 4) ───
+    # 'remove' dalında NE validate_username NE DE kullanıcı conf'unun varlık
+    # kontrolü vardı (add dalında ikisi de vardı). 'srvctl user key remove
+    # ../../root' → '/home/../../root/.ssh/authorized_keys' == GERÇEKTEN
+    # '/root/.ssh/authorized_keys' — sessizce (2>/dev/null) SIFIRLANIYORDU ve
+    # "Tüm SSH key'ler kaldırıldı" başarı mesajı basılıyordu. Kapı artık HER
+    # İKİ dal için de ortak/erken uygulanır (domain_exists'teki validate_domain
+    # kapısıyla birebir aynı desen).
+    validate_username "$username" || error "Geçersiz kullanıcı adı: ${username}"
 
     case "$action" in
         add)
@@ -248,8 +300,9 @@ _user_key() {
             log_action "USER KEY ADD: ${username}"
             ;;
         remove)
-            [[ -z "$username" ]] && error "Kullanıcı adı belirtilmedi."
-            > "/home/${username}/.ssh/authorized_keys" 2>/dev/null
+            [[ ! -f "${SRVCTL_USERS_DIR}/${username}.conf" ]] && error "Kullanıcı bulunamadı."
+            # shellcheck disable=SC2188  # kasıtlı: dosyayı sıfırlamak için no-op komut
+            : > "/home/${username}/.ssh/authorized_keys" 2>/dev/null || true
             success "Tüm SSH key'ler kaldırıldı: ${username}"
             log_action "USER KEY REMOVE: ${username}"
             ;;
@@ -262,6 +315,8 @@ _user_key() {
 _user_2fa() {
     local action="$1" username="$2"
     [[ -z "$username" ]] && error "Kullanıcı adı belirtilmedi."
+    # B5 sertleştirmesi — bkz. _user_grant üzerindeki gerekçe.
+    validate_username "$username" || error "Geçersiz kullanıcı adı: ${username}"
     [[ ! -f "${SRVCTL_USERS_DIR}/${username}.conf" ]] && error "Kullanıcı bulunamadı."
 
     case "$action" in
@@ -277,8 +332,11 @@ _user_2fa() {
             local secret
             secret=$(head -c 20 /dev/urandom | base32 | head -c 16)
 
-            sed -i "s|^2FA_ENABLED=.*|2FA_ENABLED=true|" "${SRVCTL_USERS_DIR}/${username}.conf"
-            sed -i "s|^2FA_SECRET=.*|2FA_SECRET=${secret}|" "${SRVCTL_USERS_DIR}/${username}.conf"
+            _user_read_conf "${SRVCTL_USERS_DIR}/${username}.conf"   # eski anahtarları göç ettir
+            # KARAR 2: atomik/portable _sed_inplace (bkz. core.sh) — bu dosya
+            # TWOFA_SECRET (sır) içerir, atomik yazım önemlidir.
+            _sed_inplace "${SRVCTL_USERS_DIR}/${username}.conf" "s|^TWOFA_ENABLED=.*|TWOFA_ENABLED=true|"
+            _sed_inplace "${SRVCTL_USERS_DIR}/${username}.conf" "s|^TWOFA_SECRET=.*|TWOFA_SECRET=${secret}|"
 
             # google-authenticator dosyasını oluştur
             su - "$username" -c "google-authenticator -t -d -f -r 3 -R 30 -W -s /home/${username}/.google_authenticator" 2>/dev/null || {
@@ -294,7 +352,10 @@ _user_2fa() {
             # PAM yapılandır
             if ! grep -q "pam_google_authenticator" /etc/pam.d/sshd 2>/dev/null; then
                 echo "auth required pam_google_authenticator.so" >> /etc/pam.d/sshd
-                sed -i 's/^ChallengeResponseAuthentication no/ChallengeResponseAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null
+                # KARAR 2: atomik/portable _sed_inplace (bkz. core.sh) —
+                # sshd_config eşzamanlı okunan sistem-geneli bir dosyadır.
+                _sed_inplace /etc/ssh/sshd_config \
+                    's/^ChallengeResponseAuthentication no/ChallengeResponseAuthentication yes/' 2>/dev/null || true
                 systemctl restart sshd 2>/dev/null || true
             fi
 
@@ -311,7 +372,8 @@ _user_2fa() {
             log_action "USER 2FA SETUP: ${username}"
             ;;
         disable)
-            sed -i "s|^2FA_ENABLED=.*|2FA_ENABLED=false|" "${SRVCTL_USERS_DIR}/${username}.conf"
+            _user_read_conf "${SRVCTL_USERS_DIR}/${username}.conf"   # eski anahtarları göç ettir
+            _sed_inplace "${SRVCTL_USERS_DIR}/${username}.conf" "s|^TWOFA_ENABLED=.*|TWOFA_ENABLED=false|"
             rm -f "/home/${username}/.google_authenticator"
             success "2FA devre dışı bırakıldı: ${username}"
             log_action "USER 2FA DISABLE: ${username}"

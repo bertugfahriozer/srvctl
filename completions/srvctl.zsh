@@ -51,10 +51,22 @@ _srvctl() {
                         'resources:Kaynak limitleri (cgroups)'
                         'staging:Staging ortamı oluştur'
                         'migrate:Sunucular arası taşı'
+                        'rate-limit:Rate-limit profili değiştir'
+                        'repair:Chroot kütüphaneleri tamir et'
+                        'worker:Kuyruk worker yönetimi'
+                        'scheduler:Zamanlanmış görev yönetimi'
                     )
                     _describe 'domain işlemi' domain_cmds
                     ;;
                 deploy)
+                    local -a deploy_cmds
+                    deploy_cmds=(
+                        'rollback:Bir önceki sürüme dön'
+                        'health:Sağlık kontrolü çalıştır'
+                        'list:Release’leri listele'
+                        'prune:Eski release’leri temizle (varsayılan dry-run)'
+                    )
+                    _describe 'deploy işlemi' deploy_cmds
                     _srvctl_domains
                     ;;
                 backup)
@@ -68,7 +80,13 @@ _srvctl() {
                     _describe 'ssl işlemi' ssl_cmds
                     ;;
                 security)
-                    _describe 'güvenlik işlemi' '(audit:Tam güvenlik denetimi harden-fs:Dosya-sahiplik modelini uygula/önizle)'
+                    local -a security_cmds
+                    security_cmds=(
+                        'audit:Tam güvenlik denetimi'
+                        'harden-fs:Dosya-sahiplik modelini uygula/önizle'
+                        'harden-fpm:Per-domain FPM unit oluştur/uygula'
+                    )
+                    _describe 'güvenlik işlemi' security_cmds
                     ;;
                 monitor)
                     local -a mon_cmds
@@ -82,7 +100,7 @@ _srvctl() {
                     ;;
                 ip)
                     local -a ip_cmds
-                    ip_cmds=('ban:IP engelle' 'unban:Engel kaldır' 'whitelist:Beyaz liste' 'blacklist:Kara liste' 'list:Listele' 'geoblock:Ülke engeli')
+                    ip_cmds=('ban:IP engelle' 'unban:Engel kaldır' 'whitelist:Beyaz liste' 'blacklist:Kara liste' 'list:Listele' 'geoblock:Ülke engeli' 'reapply:Kuralları yeniden uygula')
                     _describe 'ip işlemi' ip_cmds
                     ;;
                 trusted)

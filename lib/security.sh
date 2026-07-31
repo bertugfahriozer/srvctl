@@ -29,6 +29,47 @@ _audit_in_slice() {
     [[ "$1" == *"$2"* ]]
 }
 
+# /proc/<pid>/attr/current İLK SATIRI TAM OLARAK '<profile> (enforce)' mi?
+# (0=evet). Format: 'srvctl-example_com (enforce)\n' (complain modunda
+# '(complain)', hiç attach değilse 'unconfined\n'). _audit_aa_enforced (aa-status
+# GENEL listesini parse eder — "sistemde BİR YERDE bu profil enforce" sorusuna
+# cevap verir) ile TAMAMLAYICIDIR: BU fonksiyon kernel'in SPESİFİK bir PID için
+# raporladığı GERÇEK attach'ı doğrular — paylaşılan/per-domain-olmayan bir FPM
+# master'da profil aa-status'te enforce görünse bile BU PID ona hiç BAĞLI
+# olmayabilir ('unconfined' döner). _security_audit bu fonksiyonu gerçek FPM
+# master PID'i üzerinden çağırır (bkz. _audit_domain_fpm_pid).
+_audit_aa_attr_enforced() {
+    local text="$1" profile="$2"
+    local first_line
+    first_line="$(printf '%s' "$text" | head -n1)"
+    [[ "$first_line" == "${profile} (enforce)" ]]
+}
+
+# ─── Domain'in GERÇEK FPM master PID'ini tespit eder (fail-closed) ───
+# PREDİKAT DEĞİL: stdout'a PID basar (0), bulunamazsa stdout boş + 1 döner.
+# Per-domain unit (harden-fpm --apply sonrası, T7a) varsa ONU tercih eder —
+# gerçek AppArmor/seccomp/cgroups attach'ı bu sürece aittir. Yoksa paylaşılan
+# php<ver>-fpm master'ına düşer; bu durumda AppArmor per-domain profiline
+# BAĞLI DEĞİLDİR ve _security_audit bunu BİLEREK FAIL eder (bkz. o
+# fonksiyonun yorumu — "davranış değişikliği" notu).
+_audit_domain_fpm_pid() {
+    local sname="$1" php_ver="$2"
+    local unit="srvctl-fpm-${sname}.service" pid
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null)"
+        if [[ -n "$pid" && "$pid" != "0" ]]; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    pid="$(systemctl show -p MainPID --value "php${php_ver}-fpm.service" 2>/dev/null)"
+    if [[ -n "$pid" && "$pid" != "0" ]]; then
+        echo "$pid"
+        return 0
+    fi
+    return 1
+}
+
 # ───────────────────────────────────────────────────────────────
 #  Eval'siz kontrol çalıştırıcı (saf, test edilebilir).
 #  Kullanım: _security_run_check <on_ok_fn> <on_bad_fn> <label> <cmd...>
@@ -42,6 +83,116 @@ _security_run_check() {
     else
         "$on_bad" "$label"
     fi
+}
+
+# ───────────────────────────────────────────────────────────────
+#  Cross-module yükleyici: harden-fs/harden-fpm domain.sh'taki
+#  _domain_fs_plan / _domain_apply_fs_ownership / _fs_record_before /
+#  _fs_revert / _domain_render_fpm_unit / _domain_activate_fpm_unit
+#  fonksiyonlarına muhtaç. bin/srvctl `_load_and_run` YALNIZ tek modülü
+#  source ettiğinden bu fonksiyonlar runtime'da tanımsızdı (command not
+#  found → 127). Testler her iki modülü de source ettiği için bunu
+#  göremiyordu. PREDİKAT: 0=yüklendi, 1=yüklenemedi (çağıran error eder).
+# ───────────────────────────────────────────────────────────────
+_security_load_domain_lib() {
+    declare -F _domain_fs_plan >/dev/null 2>&1 \
+        && declare -F _domain_render_fpm_unit >/dev/null 2>&1 \
+        && return 0
+    local lib="${SRVCTL_ROOT}/lib/domain.sh"
+    [[ -f "$lib" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$lib" || return 1
+    declare -F _domain_fs_plan >/dev/null 2>&1 \
+        && declare -F _domain_render_fpm_unit >/dev/null 2>&1
+}
+
+# ─── .srvctl-meta beyaz liste (O1 TAM kapanışı — denetim DALGA 5) ───
+# GEREKÇE: read_kv_file artık satır başına sabit anchor kullanıyor ('^KEY=')
+# ve assert_safe_ident kapısı var (bkz. core.sh) — ama bu yalnız OKUMAYI
+# süzer. Dosyanın İÇERİĞİ hardened-öncesi bir domainde saldırgan tarafından
+# kirletilebilir (ör. baştaki boşlukla ' FRAMEWORK=laravel' ya da
+# '#FRAMEWORK=...') ve 'harden-fs --apply' dosyayı root:root 644 yapsa bile
+# bu satır write_meta'nın anchor'lı 'grep -v "^KEY="'i ile ASLA silinemediği
+# için KALICI olarak dosyada kalıyordu (artık okunmuyor ama ölü/kirli satır
+# olarak duruyor). Aşağıdaki fonksiyonlar dosyayı SIFIRDAN, yalnız bilinen
+# anahtarların GEÇERLİ değerlerini yazarak yeniden üretir.
+#
+# TEK doğruluk kaynağı: srvctl'in '.srvctl-meta'ya YAZDIĞI TÜM anahtarlar
+# burada olmalı (bkz. lib/domain.sh write_meta çağrıları: RATE_PROFILE/
+# SENSITIVE_PATHS/FRAMEWORK/REDIS_SCRIPTING; lib/deploy.sh: RUN_MIGRATIONS/
+# KEEP_GIT). Yeni bir 'write_meta domain KEY value' eklerken KEY buraya da
+# eklenmelidir — aksi halde harden-fs --apply o anahtarı SESSİZCE atar.
+_meta_known_keys() {
+    echo "RATE_PROFILE SENSITIVE_PATHS FRAMEWORK RUN_MIGRATIONS KEEP_GIT REDIS_SCRIPTING"
+}
+
+# Anahtar bilinen listede mi? (PREDİKAT: 0=evet)
+_meta_key_known() {
+    local key="$1" k
+    for k in $(_meta_known_keys); do
+        [[ "$key" == "$k" ]] && return 0
+    done
+    return 1
+}
+
+# Bilinen bir anahtarın DEĞERİNİ KENDİ doğrulayıcısından geçirir (PREDİKAT:
+# 0=geçerli). Doğrulayıcılar: RATE_PROFILE → rate_profile_line (core.sh,
+# conf/rate-profiles.conf'ta tanımlı mı), SENSITIVE_PATHS → assert_regex_safe
+# (core.sh, nginx regex charset'i — _domain_write_vhost'un sink-doğrulamasıyla
+# AYNI), FRAMEWORK → ci4|laravel|symfony whitelist (_domain_read_framework ile
+# AYNI liste), RUN_MIGRATIONS/KEEP_GIT → validate_bool (core.sh, lib/deploy.sh
+# okuma yeriyle AYNI), REDIS_SCRIPTING → enabled|disabled|unknown ('unknown'
+# _domain_redis_scripting_mode'un kendisinin ürettiği MEŞRU bir değerdir).
+_meta_validate_value() {
+    local key="$1" value="$2"
+    case "$key" in
+        RATE_PROFILE)    [[ -n "$(rate_profile_line "$value")" ]] ;;
+        SENSITIVE_PATHS) assert_regex_safe "$value" ;;
+        FRAMEWORK)       [[ "$value" == "ci4" || "$value" == "laravel" || "$value" == "symfony" ]] ;;
+        RUN_MIGRATIONS)  validate_bool "$value" ;;
+        KEEP_GIT)        validate_bool "$value" ;;
+        REDIS_SCRIPTING) [[ "$value" == "enabled" || "$value" == "disabled" || "$value" == "unknown" ]] ;;
+        *)               return 1 ;;
+    esac
+}
+
+# '.srvctl-meta' dosyasını BEYAZ LİSTE ile yeniden yazar — yalnız bilinen VE
+# geçerli anahtar=değer satırları hayatta kalır; tanınmayan anahtar, geçersiz
+# değer, yorum satırı, boş satır ya da 'KEY=' öncesi boşluk/karakter içeren
+# HER satır atılır. Saf-a-yakın yardımcı: yalnız TEK dosya üzerinde çalışır,
+# çağıranın chown/chmod'una karışmaz (dosya zaten root:root olmalı — apply
+# akışında _domain_apply_fs_ownership bunu ÖNCEDEN garanti eder).
+# Çıktı: "<korunan satır sayısı> <atılan satır sayısı>" (tek satır, 'read' ile
+# parse edilir — operatöre raporlamak çağıranın işidir).
+_meta_rewrite_whitelist() {
+    local meta_file="$1"
+    [[ -f "$meta_file" ]] || { echo "0 0"; return 0; }
+
+    local kept=0 dropped=0
+    local -a kept_lines=()
+    local key value line
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" != *=* ]]; then
+            dropped=$((dropped + 1)); continue
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        if assert_safe_ident "$key" && _meta_key_known "$key" && _meta_validate_value "$key" "$value"; then
+            kept_lines+=("${key}=${value}")
+            kept=$((kept + 1))
+        else
+            dropped=$((dropped + 1))
+        fi
+    done < "$meta_file"
+
+    : > "$meta_file"
+    local kl
+    for kl in "${kept_lines[@]:-}"; do
+        [[ -n "$kl" ]] && printf '%s\n' "$kl" >> "$meta_file"
+    done
+    echo "${kept} ${dropped}"
 }
 
 cmd_security() {
@@ -178,10 +329,17 @@ _security_audit() {
     echo -e "  ${CYAN}── Domain İzolasyonu ──${NC}"
     local domain_count=0
 
-    for dir in "${WEB_ROOT}"/*/; do
-        [[ ! -d "$dir" ]] && continue
-        local domain sname php_ver PHP_VERSION
-        domain=$(basename "$dir")
+    # HOST BULGUSU: eskiden '${WEB_ROOT}/*/' ham taranıyordu; nginx'in kurduğu
+    # '/var/www/html' domain sanılıp sahte FAIL üretiyordu. list_all_domains
+    # artık '.credentials' kapısıyla yalnız gerçek srvctl domainlerini döndürür.
+    local _domain_list
+    mapfile -t _domain_list < <(list_all_domains)
+    local domain
+    for domain in "${_domain_list[@]}"; do
+        [[ -n "$domain" ]] || continue
+        local dir="${WEB_ROOT}/${domain}/"
+        [[ -d "$dir" ]] || continue
+        local sname php_ver PHP_VERSION
         sname=$(safe_name "$domain")
         php_ver="${DEFAULT_PHP_VERSION}"
 
@@ -194,21 +352,79 @@ _security_audit() {
             fi
         fi
 
-        # Chroot kontrol (php_ver assert_php_version'dan geçti, sname safe_name türevi)
+        # Chroot kontrol — HOST BULGUSU: yalnız PAYLAŞILAN havuz yoluna
+        # bakılıyordu. 'security harden-fpm --apply' domaini per-domain unit'e
+        # taşıdığında config '/etc/srvctl/fpm/<sname>.conf'a geçer ve eski yol
+        # SİLİNİR → sertleştirilmiş domain "chroot aktif DEĞİL" diye FAIL
+        # alıyordu (sertleştirmenin cezalandırılması). İki yolu da kabul et.
         _check "${domain}: chroot aktif" \
-            grep -q chroot "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf"
+            bash -c "grep -q chroot '/etc/srvctl/fpm/${sname}.conf' 2>/dev/null || grep -q chroot '/etc/php/${php_ver}/fpm/pool.d/${sname}.conf' 2>/dev/null"
 
-        # AppArmor kontrol
-        _warn_check "${domain}: AppArmor enforce" \
-            bash -c "aa-status 2>/dev/null | grep -q 'srvctl-${sname}'"
+        # ─── AppArmor/seccomp/cgroups — GERÇEK enforcement (T7b, denetim
+        #     DALGA 5 — K1/Y4 kapanışı) ───
+        # ÖNCEDEN: yalnız 'aa-status | grep' (VARLIK testi — bu profil
+        # sistemde BİR YERDE yüklü mü — attach'a da, enforce/complain moduna
+        # da bakmıyordu) ve _warn_check (yani WARN, FAIL DEĞİL). README bunun
+        # AKSİNİ iddia ediyordu ("audit artık AppArmor/seccomp/cgroups'u
+        # gerçek enforce durumuyla kontrol eder... enforce değilse FAIL
+        # verir"). Aşağıdaki blok, dosya başında yazılmış+testli (bkz.
+        # tests/test_audit_parsers.sh) ama eskiden HİÇ ÇAĞRILMAYAN saf
+        # parser'ları (_audit_aa_attr_enforced/_audit_seccomp_filtered/
+        # _audit_in_slice) domain'in GERÇEK FPM master PID'i üzerinden
+        # bağlar — fail-closed: PID bulunamazsa (servis çalışmıyor) FAIL
+        # DEĞİL, açıkça "doğrulanamadı" (WARN); PID bulunup attach YOKSA
+        # FAIL (WARN DEĞİL).
+        #
+        # ⚠ DAVRANIŞ DEĞİŞİKLİĞİ: varsayılan 'domain add' yolu per-domain FPM
+        # unit KULLANMAZ (paylaşılan php<ver>-fpm master'ı) — bu durumda
+        # AppArmor/seccomp/cgroups slice bu domain'in sürecine HİÇ ATTACH
+        # DEĞİLDİR ve aşağıdaki üç kontrol FAIL verir. Bu DOĞRU bir sonuçtur
+        # (README'nin iddiasıyla tutarlı) ama SERT — mevcut kurulumların
+        # skorunu düşürür. Operatöre açıkça 'srvctl security harden-fpm
+        # <domain> --apply' önerilir (aşağıdaki FAIL mesajları bunu söyler).
+        local _fpm_pid=""
+        _fpm_pid=$(_audit_domain_fpm_pid "$sname" "$php_ver") || _fpm_pid=""
+
+        if [[ -z "$_fpm_pid" ]]; then
+            _warn_result "${domain}: FPM süreci bulunamadı — AppArmor/seccomp/cgroups enforcement DOĞRULANAMADI"
+        else
+            local _aa_attr _seccomp_status _cgroup_info
+            _aa_attr="$(cat "/proc/${_fpm_pid}/attr/current" 2>/dev/null || true)"
+            if [[ -n "$_aa_attr" ]] && _audit_aa_attr_enforced "$_aa_attr" "srvctl-${sname}"; then
+                _pass "${domain}: AppArmor enforce (PID ${_fpm_pid} doğrulandı)"
+            else
+                _fail "${domain}: AppArmor enforce DEĞİL (PID ${_fpm_pid}: '${_aa_attr:-okunamadı}') — 'srvctl security harden-fpm ${domain} --apply' çalıştırın"
+            fi
+
+            _seccomp_status="$(cat "/proc/${_fpm_pid}/status" 2>/dev/null || true)"
+            if [[ -n "$_seccomp_status" ]] && _audit_seccomp_filtered "$_seccomp_status"; then
+                _pass "${domain}: seccomp filter aktif (PID ${_fpm_pid} doğrulandı)"
+            else
+                _fail "${domain}: seccomp filter DEĞİL/doğrulanamadı (PID ${_fpm_pid})"
+            fi
+
+            _cgroup_info="$(cat "/proc/${_fpm_pid}/cgroup" 2>/dev/null || true)"
+            if [[ -n "$_cgroup_info" ]] && _audit_in_slice "$_cgroup_info" "srvctl-${sname}.slice"; then
+                _pass "${domain}: cgroups slice attach (PID ${_fpm_pid} doğrulandı)"
+            else
+                _fail "${domain}: cgroups slice attach DEĞİL (PID ${_fpm_pid})"
+            fi
+        fi
 
         # Dosya izinleri
         local perm
+        # HOST BULGUSU: audit 750 bekliyordu ama T1 dosya-sahiplik modeli base
+        # dizin için 751 tanımlıyor (_domain_fs_plan: "." → root|751;
+        # _domain_apply_fs_ownership: chmod 751 "$base"). 751'in 'o+x' biti
+        # KASITLIDIR — www-data'nın (domain grubunda DEĞİL) alt yollara
+        # traverse edebilmesi için gerekir; 'o+r' verilmediğinden dizin
+        # LİSTELENEMEZ. Yani audit kendi tasarımıyla çelişip her hardened
+        # domaine sahte FAIL veriyordu. Doğru beklenen değer 751.
         perm=$(stat -c %a "${dir}" 2>/dev/null)
-        if [[ "$perm" == "750" ]]; then
-            _pass "${domain}: dosya izinleri 750"
+        if [[ "$perm" == "751" ]]; then
+            _pass "${domain}: dosya izinleri 751 (T1 modeli)"
         else
-            _fail "${domain}: dosya izinleri ${perm} (750 olmalı)"
+            _fail "${domain}: dosya izinleri ${perm} (751 olmalı — 'srvctl security harden-fs ${domain} --apply')"
         fi
 
         # Socket izinleri
@@ -302,6 +518,8 @@ _security_audit() {
 # ─── Dosya-sahiplik sertleştirme (T1) ───
 # Kullanım: harden-fs <domain>|--all [--apply|--revert]  (varsayılan: dry-run)
 _security_harden_fs() {
+    _security_load_domain_lib \
+        || error "domain.sh yüklenemedi — harden-fs kullanılamaz (${SRVCTL_ROOT}/lib/domain.sh)"
     local domain="" mode="dry" all=false arg
     for arg in "$@"; do
         case "$arg" in
@@ -329,22 +547,114 @@ _security_harden_fs() {
 }
 
 # Dry-run: hedef modeli + mevcut durumu yaz, hiçbir şeye dokunma.
+# _domain_fs_plan'a framework (_domain_read_framework, domain.sh) 3. argüman
+# olarak geçirilir — aksi halde Laravel shared/storage, Symfony shared/var ve
+# shared/.env satırları plana hiç girmez, yani bu domainler için harden-fs
+# denetimi framework-özel yolları GÖRMEZ (sessizce eksik denetim).
 _harden_fs_dry() {
     local domain="$1" base="${WEB_ROOT}/${1}" web_user
     web_user="web_$(safe_name "$domain")"
-    domain_exists "$domain" || { warn "Domain yok: ${domain}" >&2; return 0; }
+    domain_exists "$domain" || { warn "Domain yok: ${domain}"; return 0; }
+    local framework; framework=$(_domain_read_framework "$domain")
     echo "  ── ${domain} (dry-run; uygulamak için --apply) ──"
     local path owner mode
     while IFS='|' read -r path owner mode; do
         [[ -e "$path" ]] || continue
         printf '    %s -> %s:%s %s  (mevcut: %s %s)\n' \
             "$path" "$owner" "$owner" "$mode" "$(_stat_owner "$path")" "$(_stat_mode "$path")"
-    done < <(_domain_fs_plan "$base" "$web_user")
+    done < <(_domain_fs_plan "$base" "$web_user" "$framework")
+}
+
+# Apply: hedef sahiplik modelini uygula. Önce mevcut durumu state dizinine
+# kaydeder (revert güvenlik ağı), sonra 'hardened' marker'ını yazar — marker
+# _require_owned_or_warn'ı warn'dan fail'e yükseltir, bu yüzden EN SON yazılır.
+_harden_fs_apply() {
+    local domain="$1" base="${WEB_ROOT}/${1}" web_user
+    web_user="web_$(safe_name "$domain")"
+    domain_exists "$domain" || { warn "Domain yok: ${domain}"; return 0; }
+
+    local state_dir="${SRVCTL_STATE_DIR}/${domain}"
+    secure_dir "$state_dir" 700
+    local rec="${state_dir}/fs-before"
+
+    # Mevcut kaydın üzerine YAZMA: ikinci kez --apply çalıştırmak ilk (gerçek)
+    # önceki durumu silip hardened durumu "önceki" diye kaydederdi → revert no-op.
+    if [[ -f "$rec" ]]; then
+        info "Mevcut geri-alma kaydı korunuyor: ${rec}"
+    else
+        _fs_record_before "$base" "$rec"
+        chmod 600 "$rec" 2>/dev/null || true
+    fi
+
+    # 1. Taban model (T1/RC1): base root:root 751 + chroot sistem dizinleri +
+    #    kontrol dosyaları + genel leaf'ler (public_html/private/logs/tmp/
+    #    sessions/private/writable).
+    _domain_apply_fs_ownership "$base" "$web_user"
+
+    # 2. Framework'e özgü shared/ satırları (Laravel storage/, Symfony var/,
+    #    CI4 writable/, .env). _domain_apply_fs_ownership bunları HARDCODED
+    #    adım listesinde İÇERMEZ (o fonksiyon yalnız T1 taban modelini
+    #    uygular) — _domain_fs_plan'daki TAM hedef model (framework-farkında)
+    #    burada satır satır uygulanır, aksi halde bu yollar dry-run'da
+    #    GÖRÜNÜR ama --apply hiçbir zaman KURMAZ (denetlenip uygulanmama
+    #    boşluğu). Var olmayan yol sessizce atlanır.
+    local framework; framework=$(_domain_read_framework "$domain")
+    local path owner mode
+    while IFS='|' read -r path owner mode; do
+        [[ -e "$path" ]] || continue
+        chown "${owner}:${owner}" "$path" 2>/dev/null || true
+        chmod "$mode" "$path" 2>/dev/null || true
+    done < <(_domain_fs_plan "$base" "$web_user" "$framework")
+
+    # 3. '.srvctl-meta' İÇERİĞİNİ beyaz liste ile yeniden yaz (O1 TAM kapanışı).
+    #    Yalnız sahiplik/izin (chown/chmod, yukarıdaki adım 1) DEĞİL, İÇERİK de
+    #    sertleştirilir — aksi halde hardened-öncesi bir tamper (ör. baştaki
+    #    boşluklu/'#' önekli satır) dosyada KALICI olarak dururdu (bkz.
+    #    _meta_rewrite_whitelist başlık yorumu). ': >' ile YERİNDE (in-place)
+    #    truncate edildiğinden dosyanın sahiplik/izni (yukarıda zaten root:root
+    #    644 yapıldı) KORUNUR — silinip yeniden oluşturulmaz.
+    local meta_file="${base}/.srvctl-meta"
+    if [[ -f "$meta_file" ]]; then
+        local _meta_stats _meta_kept _meta_dropped
+        _meta_stats=$(_meta_rewrite_whitelist "$meta_file")
+        read -r _meta_kept _meta_dropped <<< "$_meta_stats"
+        if [[ "${_meta_dropped:-0}" != "0" ]]; then
+            warn ".srvctl-meta temizlendi: ${_meta_dropped} tanınmayan/geçersiz satır ATILDI, ${_meta_kept} satır korundu (${domain}) — tamper şüphesi"
+        else
+            info ".srvctl-meta doğrulandı: ${_meta_kept} satır korundu, atılan yok (${domain})"
+        fi
+    fi
+
+    secure_file "${state_dir}/hardened" 600
+
+    success "harden-fs uygulandı: ${domain} (framework: ${framework})"
+    log_action "harden-fs apply: ${domain} (framework=${framework}, meta_kept=${_meta_kept:-0}, meta_dropped=${_meta_dropped:-0})"
+}
+
+# Revert: kaydedilmiş sahiplik/izinleri geri yükle ve marker'ı kaldır.
+_harden_fs_revert() {
+    local domain="$1"
+    domain_exists "$domain" || { warn "Domain yok: ${domain}"; return 0; }
+
+    local state_dir="${SRVCTL_STATE_DIR}/${domain}"
+    local rec="${state_dir}/fs-before"
+    [[ -f "$rec" ]] || { warn "Geri alma kaydı yok: ${rec} — revert atlandı"; return 0; }
+
+    # Marker'ı ÖNCE kaldır: _fs_revert yarıda kalırsa domain 'hardened' işaretli
+    # kalmamalı, aksi halde _require_owned_or_warn her komutu tamper sayar.
+    rm -f "${state_dir}/hardened"
+    _fs_revert "$rec"
+    rm -f "$rec"
+
+    success "harden-fs geri alındı: ${domain}"
+    log_action "harden-fs revert: ${domain}"
 }
 
 # ─── Shared-pool → per-domain FPM unit migrasyonu (T7a) ───
 # Kullanım: harden-fpm <domain>|--all [--apply]   (varsayılan: dry-run)
 _security_harden_fpm() {
+    _security_load_domain_lib \
+        || error "domain.sh yüklenemedi — harden-fpm kullanılamaz (${SRVCTL_ROOT}/lib/domain.sh)"
     local domain="" mode="dry" all=false arg
     for arg in "$@"; do
         case "$arg" in
@@ -357,8 +667,14 @@ _security_harden_fpm() {
     local targets=() d
     if $all; then mapfile -t targets < <(list_all_domains)
     else [[ -z "$domain" ]] && error "Kullanım: srvctl security harden-fpm <domain>|--all [--apply]"; targets=("$domain"); fi
+    # NOT: 'cond && apply || dry' YAZMA — bu yapı `set -e`'yi tüm çağrı zinciri
+    # boyunca devre dışı bırakır (apply içindeki her hata sessizce yutulur).
     for d in "${targets[@]}"; do
-        [[ "$mode" == "apply" ]] && _harden_fpm_apply "$d" || _harden_fpm_dry "$d"
+        if [[ "$mode" == "apply" ]]; then
+            _harden_fpm_apply "$d"
+        else
+            _harden_fpm_dry "$d"
+        fi
     done
 }
 
@@ -380,9 +696,65 @@ _harden_fpm_apply() {
     domain_exists "$domain" || { warn "Domain yok: ${domain}"; return 0; }
     php_ver=$(_derive_php "$domain" "${DEFAULT_PHP_VERSION}")
     _domain_render_fpm_unit "$domain" "$php_ver"
-    _domain_activate_fpm_unit "$domain"
-    rm -f "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf"
-    systemctl reload "php${php_ver}-fpm" 2>/dev/null || true
+
+    # ─── SOCKET DEVRİ (HOST BULGUSU, Ubuntu 24.04 gerçek VM) ───
+    # Eski sıra "önce yeni unit'i başlat, sonra eski pool'u sil" idi ve bu
+    # YAPISAL OLARAK İMKÂNSIZDI: paylaşılan php<ver>-fpm master'ı domainin
+    # havuzunu hâlâ ayakta tuttuğu için aynı unix socket'i dinliyordu:
+    #   ERROR: Another FPM instance seems to already listen on
+    #          /run/php/php8.3-fpm-<sname>.sock
+    #   status=78/CONFIG
+    # Yani harden-fpm HİÇBİR ZAMAN başarılı olamıyordu; fail-closed koruma
+    # her seferinde devreye girip "shared pool korundu" diyordu (site kurtuluyordu
+    # ama migration hiç gerçekleşmiyordu).
+    #
+    # Doğru sıra: pool'u ÖNCE kaldır + reload et (socket serbest kalsın),
+    # SONRA yeni unit'i başlat. Başarısızsa pool'u GERİ KOY ve reload et —
+    # fail-closed davranış korunur, domain 502'ye düşmez.
+    local pool_file="/etc/php/${php_ver}/fpm/pool.d/${sname}.conf"
+    local pool_bak=""
+    if [[ -f "$pool_file" ]]; then
+        pool_bak="$(mktemp "/etc/srvctl/fpm/${sname}.pool.bak.XXXXXX")" \
+            || { warn "Geçici yedek oluşturulamadı — harden-fpm iptal: ${domain}"; return 1; }
+        cat "$pool_file" > "$pool_bak"
+        rm -f "$pool_file"
+        systemctl reload "php${php_ver}-fpm" 2>/dev/null \
+            || systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+
+        # HOST BULGUSU: reload master'ın havuzu kapatmasını BEKLEMEZ ve
+        # php-fpm kapanan havuzun unix socket DOSYASINI silmez. Yeni unit o
+        # ölü dosyayı görüp "Another FPM instance seems to already listen"
+        # diyerek status=78 ile ölüyordu. Önce havuzun gerçekten kapanmasını
+        # bekle, sonra ARTIK DİNLENMEYEN socket dosyasını temizle.
+        local sock="/run/php/php${php_ver}-fpm-${sname}.sock" i
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            [[ -S "$sock" ]] || break
+            # Hâlâ dinleyen var mı? (ss yoksa bu adımı atla — sadece bekle)
+            if command -v ss >/dev/null 2>&1 && ! ss -lxH "src = ${sock}" 2>/dev/null | grep -q .; then
+                break
+            fi
+            sleep 1
+        done
+        if [[ -S "$sock" ]] && command -v ss >/dev/null 2>&1 \
+           && ! ss -lxH "src = ${sock}" 2>/dev/null | grep -q .; then
+            rm -f -- "$sock"   # ölü socket dosyası: dinleyen yok
+        fi
+    fi
+
+    if ! _domain_activate_fpm_unit "$domain"; then
+        # Geri al: pool'u restore et, paylaşılan master'ı tekrar yükle.
+        if [[ -n "$pool_bak" && -f "$pool_bak" ]]; then
+            cat "$pool_bak" > "$pool_file"
+            rm -f "$pool_bak"
+            systemctl reload "php${php_ver}-fpm" 2>/dev/null \
+                || systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+        fi
+        warn "Per-domain FPM unit başlatılamadı — eski shared pool GERİ YÜKLENDİ: ${domain}"
+        log_action "harden-fpm apply BAŞARISIZ (rollback: shared pool geri yüklendi): ${domain}"
+        return 1
+    fi
+
+    rm -f "$pool_bak" 2>/dev/null || true
     success "harden-fpm uygulandı: ${domain}"
     log_action "harden-fpm apply: ${domain}"
 }

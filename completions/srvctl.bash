@@ -21,7 +21,7 @@ _srvctl_completions() {
     # 2. seviye — alt komutlar
     case "${COMP_WORDS[1]}" in
         domain)
-            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources staging migrate"
+            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources staging migrate rate-limit repair worker scheduler"
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$domain_cmds" -- "$cur"))
             elif [[ ${COMP_CWORD} -eq 3 ]]; then
@@ -31,9 +31,19 @@ _srvctl_completions() {
             ;;
         deploy)
             if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "rollback health list prune" -- "$cur"))
                 _srvctl_complete_domains
             elif [[ ${COMP_CWORD} -eq 3 ]]; then
-                COMPREPLY=($(compgen -W "main staging develop" -- "$cur"))
+                case "${COMP_WORDS[2]}" in
+                    rollback|health|list) _srvctl_complete_domains ;;
+                    prune)
+                        COMPREPLY=($(compgen -W "--all" -- "$cur"))
+                        _srvctl_complete_domains
+                        ;;
+                    *) COMPREPLY=($(compgen -W "main staging develop --dry-run" -- "$cur")) ;;
+                esac
+            elif [[ "${COMP_WORDS[2]}" == "prune" ]]; then
+                COMPREPLY=($(compgen -W "--apply --include-bak --keep=" -- "$cur"))
             fi
             ;;
         backup)
@@ -48,7 +58,7 @@ _srvctl_completions() {
             COMPREPLY=($(compgen -W "renew status" -- "$cur"))
             ;;
         security)
-            COMPREPLY=($(compgen -W "audit harden-fs" -- "$cur"))
+            COMPREPLY=($(compgen -W "audit harden-fs harden-fpm" -- "$cur"))
             ;;
         monitor)
             COMPREPLY=($(compgen -W "live domains uptime check traffic" -- "$cur"))
@@ -72,7 +82,7 @@ _srvctl_completions() {
             fi
             ;;
         ip)
-            local ip_cmds="ban unban whitelist blacklist list geoblock"
+            local ip_cmds="ban unban whitelist blacklist list geoblock reapply"
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$ip_cmds" -- "$cur"))
             elif [[ ${COMP_CWORD} -eq 3 ]]; then

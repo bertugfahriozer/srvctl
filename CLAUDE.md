@@ -34,7 +34,9 @@ Each `lib/<module>.sh` follows the same shape:
 
 **Cross-module calls** are done by sourcing on demand, guarded so a missing module is non-fatal — e.g. modules that send alerts do `source "${SRVCTL_ROOT}/lib/notify.sh" 2>/dev/null || true` before calling `send_notification`. Follow this pattern instead of sourcing other modules at file top.
 
-**Templates** in `templates/` (nginx, php-fpm, apparmor, logrotate, cgroups, seccomp) use `{{TOKEN}}` placeholders rendered by `render_template <file> KEY=value ...`. Note `install.sh` currently only copies the `nginx php-fpm apparmor logrotate` template subdirs — `cgroups` and `seccomp` are in the repo but not in the install loop.
+**Templates** in `templates/` (nginx, php-fpm, apparmor, logrotate, systemd, cgroups) use `{{TOKEN}}` placeholders rendered by `render_template <file> KEY=value ...`. [install.sh](install.sh) copies all six subdirs. (Note: `templates/seccomp/` was deleted in Phase 2 — seccomp deny list is hardcoded in `_apply_seccomp_hardening` [lib/domain.sh](lib/domain.sh).)
+
+**Cross-module function calls need an explicit `source`.** `_load_and_run` sources only the dispatched module, so calling another module's `_`-prefixed helper fails at runtime with `command not found` (exit 127). `lib/security.sh` does this via `_security_load_domain_lib`. Unit tests that source several modules by hand cannot catch this class of bug — `tests/test_no_undefined_functions.sh` scans for it statically instead.
 
 ## Conventions to match when editing
 
@@ -46,4 +48,37 @@ Each `lib/<module>.sh` follows the same shape:
 
 ## Version note
 
-The live version string comes from `SRVCTL_VERSION` in [lib/core.sh](lib/core.sh) (currently `1.0.0`), which is what `srvctl version` prints. The header comment in [bin/srvctl](bin/srvctl) and the README say `2.0.0`. If bumping the version, update `core.sh` — that is the source of truth.
+The live version string comes from `SRVCTL_VERSION` in [lib/core.sh](lib/core.sh) (currently `2.0.0`), which is what `srvctl version` prints. If bumping the version, update `core.sh` — that is the source of truth.
+
+## New conventions (Phase 2)
+
+These emerged during this release cycle and should be matched in future work:
+
+- **stderr routing:** `warn()` now outputs to **stderr** (previously stdout). `info()` and `success()` remain on stdout by design — `_deploy_prune_one`'s output is deliberately collected by the caller. This allows tools to separately capture logs/warnings vs. data.
+
+- **Safe in-place sed:** Use `_sed_inplace()` (defined in core.sh) instead of bare `sed -i`. It is GNU/BSD-portable, atomic, preserves mode+ownership, leaves no `.bak`, and returns a testable status code.
+
+- **Template token inventory:** Every file in `templates/*/` begins with a `TOKENS: KEY1 KEY2 ...` comment. The render helpers call `_domain_assert_no_leftover_tokens` to error if any `{{` literal survives — a leftover indicates a missing placeholder substitution.
+
+- **Test-seams for macOS dev:** Code that runs on macOS uses env overrides like `${SRVCTL_SYSTEMD_DIR:-...}`, `${SITES_AVAILABLE:-...}`, `${SRVCTL_FPM_DIR:-...}`, `${SRVCTL_USERS_DIR:-...}`, `${SRVCTL_STATE_DIR:-...}`. New code should follow this pattern so tests can mock paths without touching `/etc`.
+
+- **Module boundary test:** `tests/test_no_undefined_functions.sh` now audits cross-module calls; it knows which modules source each other. A call to `_domain_foo()` from `lib/deploy.sh` must be guarded by `source ... || return 1` or the caller explicitly loads domain.sh.
+
+- **Cross-module calls example:** If `lib/security.sh` needs `_domain_fs_plan()` from `lib/domain.sh`, it sources it conditionally:
+  ```bash
+  _security_load_domain_lib() {
+      declare -F _domain_fs_plan >/dev/null 2>&1 && return 0
+      source "${SRVCTL_ROOT}/lib/domain.sh" || return 1
+  }
+  ```
+  Then call `_security_load_domain_lib || error "..."` before using domain functions. Similarly, `lib/deploy.sh` loads the deploy-read framework detector via `_deploy_read_framework`.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

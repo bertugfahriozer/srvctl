@@ -1,3 +1,5 @@
+# TOKENS: DOMAIN WEB_ROOT WEB_USER PHP_VERSION
+# Besleyen: lib/domain.sh — domain add akışı (satır ~1412).
 {{WEB_ROOT}}/{{DOMAIN}}/logs/*.log {
     daily
     missingok

@@ -24,7 +24,11 @@ source "${SRVCTL_ROOT}/lib/core.sh"
 if [[ -f "${SRVCTL_ROOT}/lib/plugin.sh" ]]; then
     # shellcheck disable=SC1091
     source "${SRVCTL_ROOT}/lib/plugin.sh"
-    load_plugins 2>/dev/null || true
+    # '2>/dev/null' KALDIRILDI: load_plugins artık root-owned olmayan bir
+    # plugin'i sahiplik kapısıyla REDDEDİYOR ve bunu warn ile bildiriyor —
+    # o uyarı yutulursa operatör plugin'inin neden yüklenmediğini göremez.
+    # '|| true' KALIYOR: tek bir bozuk plugin tüm CLI'yi düşürmemeli.
+    load_plugins || true
 fi
 
 # ─── Komut Yönlendirme ───
@@ -71,7 +75,8 @@ case "${1:-help}" in
         echo -e "    ${CYAN}status${NC}                            Sunucu durum özeti"
         echo ""
         echo -e "  ${BOLD}Domain${NC}"
-        echo -e "    ${CYAN}domain add${NC} <domain> [--php=8.3]   Yeni domain ekle"
+        echo -e "    ${CYAN}domain add${NC} <domain> [--php=8.3] [--framework=ci4|laravel|symfony]"
+        echo -e "                                     Yeni domain ekle (framework varsayılan: ci4)"
         echo -e "    ${CYAN}domain remove${NC} <domain>            Domain kaldır"
         echo -e "    ${CYAN}domain list${NC}                       Tüm domain'leri listele"
         echo -e "    ${CYAN}domain info${NC} <domain>              Domain detay bilgisi"
@@ -80,6 +85,8 @@ case "${1:-help}" in
         echo -e "    ${CYAN}domain unsuspend${NC} <domain>         Bakım modundan çıkar"
         echo -e "    ${CYAN}domain php-switch${NC} <domain> <ver>  PHP versiyonu değiştir"
         echo -e "    ${CYAN}domain resources${NC} <domain> [opts]  Kaynak limitleri (cgroups)"
+        echo -e "    ${CYAN}domain worker${NC} <domain> <eylem>    Kuyruk worker'ı yönet (start/stop/status/enable/disable)"
+        echo -e "    ${CYAN}domain scheduler${NC} <domain> <eylem> Zamanlanmış görev yönet (start/stop/status/enable/disable)"
         echo ""
         echo -e "  ${BOLD}Deploy${NC}"
         echo -e "    ${CYAN}deploy${NC} <domain> [branch]          Zero-downtime deploy"

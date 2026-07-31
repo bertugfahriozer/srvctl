@@ -1,3 +1,12 @@
+# TOKENS: DOMAIN SAFE_NAME WEB_ROOT PHP_VERSION RL_REQ_ZONE RL_REQ_BURST
+#         RL_LOGIN_ZONE RL_LOGIN_BURST RL_CONN RL_SENSITIVE_PATHS DENY_DIRS
+# Besleyen: lib/domain.sh — _domain_write_vhost (satır ~489, mode=ssl).
+# RL_* değerleri rate_profile_load (core.sh) tarafından set edilir;
+# RL_SENSITIVE_PATHS/DENY_DIRS önce assert_regex_safe ile doğrulanır.
+#
+# NOT (DALGA 6): aşağıdaki 'include .../webhook.d/{{SAFE_NAME}}/*.conf' satırı
+# SAFE_NAME'i YENİDEN kullanır — YENİ bir token DEĞİL. Webhook OPT-IN'dir,
+# bkz. o satırın yanındaki yorum (vhost.conf.tpl ile birebir aynı gerekçe).
 server {
     listen 80;
     server_name {{DOMAIN}} www.{{DOMAIN}};
@@ -50,7 +59,16 @@ server {
         return 404;
     }
 
-    location ~ ^/(app|system|vendor|modules|writable|private|tests|node_modules|\.composer|storage|bootstrap|config|database|routes|resources|var)/ {
+    # Bağımlılık manifest dosyaları (isim-bazlı, KÖR '.json$' DEĞİL) —
+    # gerekçe için vhost.conf.tpl'deki yorumu bkz.
+    location ~ ^/(composer\.json|package\.json|package-lock\.json)$ {
+        deny all;
+        return 404;
+    }
+
+    # Uygulama dizinleri — {{DENY_DIRS}} framework beyanına göre seçilir
+    # (bkz. vhost.conf.tpl yorumu).
+    location ~ ^/({{DENY_DIRS}})/ {
         deny all;
         return 404;
     }
@@ -103,4 +121,7 @@ server {
 
     location = /favicon.ico { log_not_found off; access_log off; }
     location = /robots.txt  { log_not_found off; access_log off; }
+
+    # ─── Webhook auto-deploy (OPT-IN, DALGA 6) — bkz. vhost.conf.tpl yorumu ───
+    include /etc/nginx/webhook.d/{{SAFE_NAME}}/*.conf;
 }

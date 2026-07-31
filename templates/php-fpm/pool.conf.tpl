@@ -1,3 +1,7 @@
+; TOKENS: SAFE_NAME DOMAIN WEB_USER WEB_ROOT PHP_VERSION
+; Besleyen: lib/domain.sh — _domain_render_fpm_unit (satır ~518),
+; _domain_repair (satır ~190) ve domain add akışının pool render'ı
+; (satır ~1227) — üçü de aynı 5 token'ı verir.
 [{{SAFE_NAME}}]
 ; ═══════════════════════════════════════════════
 ;  PHP-FPM Pool: {{DOMAIN}}
@@ -35,7 +39,17 @@ php_admin_value[sys_temp_dir] = /tmp/
 php_admin_value[error_log] = /logs/php-error.log
 
 ; ─── Tehlikeli Fonksiyonları Devre Dışı Bırak ───
-php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,show_source,highlight_file
+; NOT: bu liste lib/init.sh'daki global 99-srvctl-security.ini listesiyle
+; BİREBİR SENKRON olmalı — php_admin_value[disable_functions] EKLEMEZ,
+; php.ini'deki global değeri DEĞİŞTİRİR/EZER. 'putenv' burada eksikse
+; global listede kapatılmış olsa da bu pool'da yeniden AÇILIR (klasik
+; putenv("LD_PRELOAD=...")/mail() enjeksiyon bypass'ı geri döner).
+; Symfony Dotenv'in opt-in usePutenv() modu bundan etkilenir (varsayılan
+; KAPALI — Symfony 5.1+ varsayılanı $_ENV kullanır, putenv() çağırmaz);
+; disable edilince usePutenv(true) çağıran uygulamalarda putenv() sessizce
+; no-op olur (E_WARNING + false döner, fatal değil) — güvenlik kazancı bu
+; dar/opt-in kullanım kaybından ağır basar.
+php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,putenv,show_source,highlight_file
 
 ; ─── Güvenlik Ayarları ───
 php_admin_value[allow_url_fopen] = Off

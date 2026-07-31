@@ -227,8 +227,14 @@ _cf_ddos() {
 
     if [[ "$action" == "on" ]]; then
         warn "Under Attack modu AKTİF: ${domain}"
-        source "${SRVCTL_ROOT}/lib/notify.sh" 2>/dev/null
-        send_notification "🛡️ DDoS Koruması" "${domain} için Under Attack modu açıldı" "warning" 2>/dev/null || true
+        # shellcheck disable=SC1091
+        source "${SRVCTL_ROOT}/lib/notify.sh" 2>/dev/null || true
+        # DALGA 6 / madde-5: send_notification artık PREDİKAT (0/1/2) —
+        # başarısızlık ana işlemi düşürmemeli ('||') ama artık görünür (warn).
+        if declare -F send_notification >/dev/null 2>&1; then
+            send_notification "🛡️ DDoS Koruması" "${domain} için Under Attack modu açıldı" "warning" \
+                || warn "Bildirim gönderilemedi (DDoS Under Attack: ${domain})"
+        fi
     else
         success "Under Attack modu kapatıldı: ${domain}"
     fi
@@ -269,7 +275,8 @@ _update_conf() {
     local key="$1"
     local value="$2"
     if grep -q "^${key}=" "${SRVCTL_CONF}" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${value}|" "${SRVCTL_CONF}"
+        _sed_inplace "${SRVCTL_CONF}" -e "s|^${key}=.*|${key}=${value}|" \
+            || error "Config güncellenemedi: ${SRVCTL_CONF} (${key})"
     else
         echo "${key}=${value}" >> "${SRVCTL_CONF}"
     fi

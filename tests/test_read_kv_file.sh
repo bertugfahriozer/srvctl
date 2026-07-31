@@ -53,10 +53,21 @@ assert_contains "${EVIL:-}" 'touch' "EVIL ham metin (çalışmadı)"
 # ── KRİTİK: regex metacharacter'lar anahtar olarak (grep -F için test) ───
 # grep -E kullanılırsa, anahtar içindeki nokta "." (regex'de any char)
 # yanlış satırları eşleştirebilir. grep -F tam dize araması yaparak bunu önler.
+#
+# FIXTURE SIRASI KASITLI: 'DB_PASS_alt' satırı 'DB_PASS'tan ÖNCE gelir.
+# read_kv_file 'grep ... | head -1' ile İLK eşleşeni alır — anchor doğru
+# ('^KEY=', KEY'den hemen sonra '=' şartı) UYGULANMIYORSA (ör. birileri
+# ileride anchor'ı '^KEY' gibi '='SİZ bir düzenlemeyle zayıflatırsa),
+# 'DB_PASS_alt=...' de '^DB_PASS' önekine uyar ve dosyada ÖNCE geldiği için
+# head -1 tarafından SEÇİLİRDİ. Eski sıra (DB_PASS önce) böyle bir
+# regresyonu YAKALAYAMAZDI — dosyadaki ilk satır zaten doğru olan
+# 'DB_PASS=correct_value' olduğundan test HER İKİ durumda da (doğru/yanlış
+# anchor) PASS verirdi (yanlış güvence). 'DB_PASS_alt' önce gelince test
+# artık anchor'ın GERÇEKTEN '=' şartını uyguladığını kanıtlar.
 kvf_meta="${WEB_ROOT}/meta.kv"
 cat > "$kvf_meta" <<EOF
-DB_PASS=correct_value
 DB_PASS_alt=wrong_value_should_not_match
+DB_PASS=correct_value
 DBXPASS=wrong_value_no_underscore
 EOF
 

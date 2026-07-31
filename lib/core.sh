@@ -3,7 +3,7 @@
 #  core.sh — Ortak fonksiyonlar
 # ═══════════════════════════════════════════════
 
-SRVCTL_VERSION="1.0.0"
+SRVCTL_VERSION="2.0.0"
 SRVCTL_ROOT="/usr/local/srvctl"
 SRVCTL_CONF="${SRVCTL_ROOT}/conf/srvctl.conf"
 SRVCTL_LOG="${SRVCTL_ROOT}/logs/srvctl.log"
@@ -21,9 +21,14 @@ DIM='\033[2m'
 NC='\033[0m'
 
 # ─── Log Fonksiyonları ───
+# KARAR 1 (denetim DALGA 4): warn() STDERR'e taşındı. Önceden stdout'a
+# yazıyordu; 146 çağrı yerinden yalnız _deploy_prune'un çıktısı $( ) ile
+# yakalanıyordu ve o da zaten '2>&1' kullandığından davranışı DEĞİŞMEZ
+# (bkz. lib/deploy.sh). info()/success() BİLEREK stdout'ta kalır —
+# _deploy_prune_one'ın info çıktısı bilinçli olarak toplanıyor.
 info()    { echo -e "  ${BLUE}ℹ${NC}  $*"; }
 success() { echo -e "  ${GREEN}✓${NC}  $*"; }
-warn()    { echo -e "  ${YELLOW}⚠${NC}  $*"; }
+warn()    { echo -e "  ${YELLOW}⚠${NC}  $*" >&2; }
 error()   { echo -e "  ${RED}✗${NC}  $*" >&2; exit 1; }
 step()    { echo -e "  ${CYAN}[${1}]${NC} ${2}"; }
 
@@ -45,9 +50,41 @@ divider() {
     echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
 }
 
+# ─── OS Sürüm Tespiti (bkz. .claude/ubuntu-compat.md) ───
+# TEK doğruluk kaynağı burasıdır — modüller kendi /etc/os-release parse'ını
+# YAZMAZ, bu helper'ları kullanır. Kural: yetenek tespiti > çıplak sürüm
+# karşılaştırması. Bu helper'lar SADECE "hangi Ubuntu LTS'yiz" sorusuna
+# cevap verir (örn. install.sh'ın destek gate'i); davranış farkı olan her
+# yerde (paket adı, config yönergesi, log yolu vb.) önce 'command -v',
+# dosya varlığı, '--version' çıktısı gibi YETENEK kontrolü tercih edilir.
+# source DEĞİL: /etc/os-release'i katı grep+cut ile ayrıştırır (dosya
+# root'a ait olsa da source alışkanlığı edinmeyelim — beklenmedik
+# değişken/komut enjeksiyonuna karşı savunma).
+_os_version_id() {
+    [[ -r /etc/os-release ]] || { echo ""; return 0; }
+    grep -m1 '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"'
+}
+
+_os_id() {
+    [[ -r /etc/os-release ]] || { echo ""; return 0; }
+    grep -m1 '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"'
+}
+
+# srvctl'in test ettiği Ubuntu LTS'lerinden biri mi? (PREDIKAT: 0=destekli
+# 1=değil/Ubuntu değil — exit YOK). Yeni bir LTS çıktığında burası güncellenir.
+_os_is_supported_ubuntu() {
+    [[ "$(_os_id)" == "ubuntu" ]] || return 1
+    case "$(_os_version_id)" in
+        22.04|24.04) return 0 ;;
+        *)           return 1 ;;
+    esac
+}
+
 # ─── Girdi Doğrulayıcıları (PREDIKAT: 0=geçerli 1=geçersiz; çıktı YOK, exit YOK) ───
 # Çağıran taraf karar verir:  validate_x "$v" || error "..."
-# NOT: validate_uint, load_config'de kaynak-zamanı çağrısından ÖNCE tanımlanmalıdır.
+# NOT: validate_uint/validate_bool/validate_http_code/validate_gpg_recipient,
+# load_config'de kaynak-zamanı çağrısından ÖNCE tanımlanmalıdır (load_config
+# bunları kullanır).
 
 # İşaretsiz tamsayı; opsiyonel üst sınır
 validate_uint() {
@@ -57,6 +94,30 @@ validate_uint() {
         (( v <= max )) || return 1
     fi
     return 0
+}
+
+# Boole: yalnızca literal 'true'/'false' string'i (shell truthy DEĞİL)
+validate_bool() {
+    [[ "$1" == "true" || "$1" == "false" ]]
+}
+
+# HTTP durum kodu: tam 3 haneli, 100-599 aralığı (10# → sekizlik yorumlanmasın)
+validate_http_code() {
+    [[ "$1" =~ ^[0-9]{3}$ ]] || return 1
+    (( 10#$1 >= 100 && 10#$1 <= 599 ))
+}
+
+# GPG alıcı tanımlayıcısı (e-posta / key-ID / fingerprint). BACKUP_GPG_RECIPIENT
+# doğrudan 'gpg -r "$deger"' argümanı olarak geçtiğinden (bkz. lib/backup.sh)
+# boşluk ve baştaki '-' reddedilir (option-injection savunma-derinliği —
+# _deploy_validate_repo_url/validate_git_url ile aynı desen); yalnızca
+# e-posta/fingerprint'te geçerli karakterler ([A-Za-z0-9._%+=@-]) kabul edilir.
+validate_gpg_recipient() {
+    local v="$1"
+    [[ -n "$v" ]] || return 1
+    [[ "$v" == -* ]] && return 1
+    [[ "$v" =~ [[:space:]] ]] && return 1
+    [[ "$v" =~ ^[A-Za-z0-9._%+=@-]+$ ]]
 }
 
 # ─── Yapılandırma ───
@@ -73,6 +134,48 @@ load_config() {
     BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
     DEPLOYER_USER="${DEPLOYER_USER:-deployer}"
 
+    # ─── Deploy release saklama ───
+    # Rollback hedefi gerektiğinden taban 2'dir; altı zorlanır.
+    DEPLOY_KEEP_RELEASES="${DEPLOY_KEEP_RELEASES:-5}"
+    DEPLOY_PRUNE_BAK_DAYS="${DEPLOY_PRUNE_BAK_DAYS:-7}"
+
+    # ─── Deploy davranışı (lib/deploy.sh okur) ───
+    # Varsayılan KAPALI: migration rollback şemayı geri ALMAZ; otomatik migration
+    # + health-check tetiklemeli otomatik rollback birleşimi şema/veri arasında
+    # SESSİZ tutarsızlık üretebilir. Operatör kararı olmalı; per-domain
+    # '.srvctl-meta' üzerinden açılabilir (bkz. write_meta/read_meta).
+    DEPLOY_RUN_MIGRATIONS="${DEPLOY_RUN_MIGRATIONS:-false}"
+    # 'npm ci && npm run build' — varsayılan KAPALI (her sunucuda node
+    # kurulu/istenir olmayabilir; opt-in).
+    DEPLOY_NPM_BUILD="${DEPLOY_NPM_BUILD:-false}"
+    # Sağlık kontrolü retry: tek atışlık probe + 'pm = ondemand' soğuk worker
+    # kombinasyonu yanlış-negatif üretip gereksiz oto-rollback'e yol açabilir.
+    DEPLOY_HEALTH_RETRIES="${DEPLOY_HEALTH_RETRIES:-5}"
+    DEPLOY_HEALTH_INTERVAL="${DEPLOY_HEALTH_INTERVAL:-2}"
+    # Kabul edilen HTTP kodları. 404/403 KASITLI OLARAK yok: composer/vendor
+    # kurulmamış bir release nginx 404 dönebilir ve "sağlıklı" sayılıp canlıya
+    # alınabilirdi.
+    DEPLOY_HEALTH_OK_CODES="${DEPLOY_HEALTH_OK_CODES:-200 301 302}"
+
+    # ─── Yedekleme: sır şifreleme + disk eşiği (lib/backup.sh okur) ───
+    # DALGA 6'da '${VAR:-}' fallback'iyle okunmaya başlandı ama core.sh o
+    # zaman bu anahtarların sahibi değildi — kalıcı varsayılan/doğrulama
+    # EKLENMEMİŞTİ (bkz. lib/backup.sh:_backup_run yorumu). install.sh mevcut
+    # kurulumlarda conf/srvctl.conf'u KORUDUĞUNDAN eski kurulumlarda bu
+    # anahtarlar dosyada HİÇ olmayabilir — varsayılanlar burada ZORUNLUDUR.
+    # Boş = kapalı (configs.tar.gz şifrelenmez, düz metin üretilir).
+    BACKUP_GPG_RECIPIENT="${BACKUP_GPG_RECIPIENT:-}"
+    # Yedek öncesi asgari boş disk alanı (MB); yetersizse yedekleme
+    # BAŞLATILMADAN reddedilir.
+    BACKUP_MIN_FREE_MB="${BACKUP_MIN_FREE_MB:-500}"
+
+    # ─── Self-update yedek saklama (lib/selfupdate.sh okur) ───
+    # Son N kurulum yedeği tutulur. En az 1 ZORUNLUDUR — 0'a izin verilirse
+    # 'self-update run' BAŞARILI bir güncellemeden hemen SONRA kendi az önce
+    # oluşturduğu yedeği de siler ve manuel 'self-update rollback' için HİÇBİR
+    # hedef kalmaz (bkz. lib/selfupdate.sh:_selfupdate_prune_backups çağrı sırası).
+    SELFUPDATE_KEEP_BACKUPS="${SELFUPDATE_KEEP_BACKUPS:-3}"
+
     # ─── Güvenilir edge-IP senkronu (Cloudflare + UptimeRobot) ───
     TRUSTED_SYNC_ENABLED="${TRUSTED_SYNC_ENABLED:-true}"
     TRUSTED_SOURCES="${TRUSTED_SOURCES:-cloudflare uptimerobot}"
@@ -85,6 +188,36 @@ load_config() {
     # validate_uint her zaman tanımlıdır (yukarıda load_config'den önce tanımlandı).
     validate_uint "$SSH_PORT" 65535 || error "Geçersiz SSH_PORT: ${SSH_PORT} (1-65535 arası tam sayı)"
     [[ "$WEB_ROOT" == /* ]] || error "Geçersiz WEB_ROOT: ${WEB_ROOT} (mutlak yol olmalı)"
+    validate_uint "$DEPLOY_KEEP_RELEASES" 1000 \
+        || error "Geçersiz DEPLOY_KEEP_RELEASES: ${DEPLOY_KEEP_RELEASES} (1-1000 arası tam sayı)"
+    (( DEPLOY_KEEP_RELEASES >= 2 )) \
+        || error "DEPLOY_KEEP_RELEASES en az 2 olmalı (rollback hedefi gerekir): ${DEPLOY_KEEP_RELEASES}"
+    validate_uint "$DEPLOY_PRUNE_BAK_DAYS" 3650 \
+        || error "Geçersiz DEPLOY_PRUNE_BAK_DAYS: ${DEPLOY_PRUNE_BAK_DAYS}"
+    validate_bool "$DEPLOY_RUN_MIGRATIONS" \
+        || error "Geçersiz DEPLOY_RUN_MIGRATIONS: ${DEPLOY_RUN_MIGRATIONS} (true|false olmalı)"
+    validate_bool "$DEPLOY_NPM_BUILD" \
+        || error "Geçersiz DEPLOY_NPM_BUILD: ${DEPLOY_NPM_BUILD} (true|false olmalı)"
+    validate_uint "$DEPLOY_HEALTH_RETRIES" 60 \
+        || error "Geçersiz DEPLOY_HEALTH_RETRIES: ${DEPLOY_HEALTH_RETRIES} (0-60 arası tam sayı)"
+    validate_uint "$DEPLOY_HEALTH_INTERVAL" 300 \
+        || error "Geçersiz DEPLOY_HEALTH_INTERVAL: ${DEPLOY_HEALTH_INTERVAL} (0-300 arası saniye)"
+    [[ -n "$DEPLOY_HEALTH_OK_CODES" ]] \
+        || error "Geçersiz DEPLOY_HEALTH_OK_CODES: boş olamaz"
+    local _code
+    for _code in $DEPLOY_HEALTH_OK_CODES; do
+        validate_http_code "$_code" \
+            || error "Geçersiz DEPLOY_HEALTH_OK_CODES girdisi: '${_code}' (100-599 arası 3 haneli HTTP kodu olmalı)"
+    done
+
+    [[ -z "$BACKUP_GPG_RECIPIENT" ]] || validate_gpg_recipient "$BACKUP_GPG_RECIPIENT" \
+        || error "Geçersiz BACKUP_GPG_RECIPIENT: ${BACKUP_GPG_RECIPIENT} (boşluk/öncü '-' yok; yalnız harf/rakam/._%+=@- karakterleri)"
+    validate_uint "$BACKUP_MIN_FREE_MB" 10000000 \
+        || error "Geçersiz BACKUP_MIN_FREE_MB: ${BACKUP_MIN_FREE_MB} (0-10000000 arası MB)"
+    validate_uint "$SELFUPDATE_KEEP_BACKUPS" 1000 \
+        || error "Geçersiz SELFUPDATE_KEEP_BACKUPS: ${SELFUPDATE_KEEP_BACKUPS} (1-1000 arası tam sayı)"
+    (( SELFUPDATE_KEEP_BACKUPS >= 1 )) \
+        || error "SELFUPDATE_KEEP_BACKUPS en az 1 olmalı (rollback hedefi kaybolmasın): ${SELFUPDATE_KEEP_BACKUPS}"
 }
 
 load_config
@@ -102,6 +235,51 @@ _stat_owner() {
 # Bir yolun octal izinlerini yaz
 _stat_mode() {
     stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+# Bir yolun sahip GRUBUNU yaz (chown --reference GNU-only olduğundan
+# _sed_inplace'te sahiplik/grup korumasını portable şekilde yeniden
+# uygulamak için kullanılır — bkz. KARAR 2)
+_stat_group() {
+    stat -c '%G' "$1" 2>/dev/null || stat -f '%Sg' "$1"
+}
+
+# ─── KARAR 2 (denetim DALGA 4): atomik/portable 'sed -i' sarmalayıcısı ───
+# GEREKÇE: repoda 26+ çıplak 'sed -i' (GNU-only, macOS BSD sed'de '-i' AYRI
+# bir argüman ister — burada çalıştırılmıyor olsa da portable helper istendi)
+# ve 1 adet 'sed -i.bak' vardı. 'sed -i.bak' deseni users.acl.bak,
+# .credentials.bak, srvctl.conf.bak gibi SIR İÇEREN kalıcı yedek dosyaları
+# bırakır — yedek/exclude listeleri (tests/test_backup_excludes_creds.sh)
+# '.credentials'ı bilir ama '*.bak' türevlerini BİLMEZ. Ayrıca GNU 'sed -i'
+# bile atomik DEĞİLDİR (bazı durumlarda dosyayı yerinde truncate+write eder) —
+# 'users.acl'/'sshd_config' gibi eşzamanlı okunan dosyalarda yarım-yazılmış
+# içerik riski taşır.
+# STRATEJİ: geçici dosyaya yaz → sed BAŞARILIYSA orijinalin mod/sahip/grubunu
+# (chown/chmod --reference GNU-only olduğundan _stat_mode/_stat_owner/
+# _stat_group ile PORTABLE biçimde) uygula → aynı dizinde 'mv' ile ATOMİK
+# olarak üzerine al. sed BAŞARISIZSA geçici dosya silinir, ORİJİNALE
+# DOKUNULMAZ, 1 döner — çağıran '|| true' ile mi yoksa 'set -e' ile mi
+# durdurulacağına karar verir (H5 bulgusu: eskiden 'sed -i.bak ... && rm'
+# zincirinin dönüş değeri hiç kontrol edilmiyordu).
+# Kullanım: _sed_inplace <dosya> <sed argümanları...>  (ör. -e 's|a|b|')
+_sed_inplace() {
+    local file="$1"; shift
+    [[ -f "$file" ]] || return 1
+    local mode owner group tmp
+    mode="$(_stat_mode "$file")" || mode=""
+    owner="$(_stat_owner "$file")" || owner=""
+    group="$(_stat_group "$file")" || group=""
+    tmp="$(mktemp "${file}.srvctl.XXXXXX")" || return 1
+    if sed "$@" "$file" > "$tmp"; then
+        # set -e altında '[[ ]] && cmd' ifadesinin kendisi 0/1 dönebilir —
+        # koşul YANLIŞSA (mode/owner boşsa) '|| true' olmadan script ölürdü.
+        { [[ -n "$mode" ]] && chmod "$mode" "$tmp" 2>/dev/null; } || true
+        { [[ -n "$owner" && -n "$group" ]] && chown "${owner}:${group}" "$tmp" 2>/dev/null; } || true
+        mv -f -- "$tmp" "$file"
+    else
+        rm -f -- "$tmp"
+        return 1
+    fi
 }
 
 # ─── Geri kalan doğrulayıcılar ───
@@ -183,17 +361,61 @@ validate_country() {
     [[ "$1" =~ ^[A-Z]{2}$ ]]
 }
 
+# ─── Git repo URL güvenlik kapısı (PREDİKAT: 0=güvenli 1=güvensiz; exit YOK) ───
+# KONSOLİDASYON (DALGA 7): bu predikat DALGA 5'te lib/deploy.sh'ta
+# '_deploy_validate_repo_url' olarak yazıldı; DALGA 6'da lib/plugin.sh'a
+# '_plugin_validate_source' ve lib/selfupdate.sh'a '_selfupdate_validate_repo_url'
+# adlarıyla BİREBİR KOPYALANDI (üç modül de kullanıcı/config kaynaklı bir URL'i
+# doğrudan 'git clone'a geçiriyor). Üç kopya = ayrışma riski (biri düzeltilip
+# diğer ikisi unutulabilir) — core.sh HER ZAMAN ilk source edildiğinden tek
+# doğruluk kaynağı burasıdır. Yalnız https://, ssh://, git@host:path şemaları
+# kabul edilir; git transport helper'ları ('ext::', 'fd::', 'file::' — kabuk
+# komutu çalıştırabilen RCE vektörleri), baştaki '-' (option-injection),
+# boşluk ve çıplak '::' reddedilir.
+# GERİYE UYUMLULUK: lib/deploy.sh/lib/plugin.sh/lib/selfupdate.sh KENDİ
+# '_deploy_validate_repo_url'/'_plugin_validate_source'/
+# '_selfupdate_validate_repo_url' kopyalarını hâlâ kullanıyor (bu dosyaların
+# sahibi biz değiliz, kırılmasınlar diye dokunulmadı) — bu üç fonksiyonun
+# gövdesini buraya delege etmesi devredilen bir iştir (bkz. rapor).
+validate_git_url() {
+    local url="$1"
+    [[ -n "$url" ]] || return 1
+    [[ "$url" == -* ]] && return 1
+    [[ "$url" =~ [[:space:]] ]] && return 1
+    [[ "$url" == *"::"* ]] && return 1
+    [[ "$url" == file://* ]] && return 1
+    [[ "$url" =~ ^https://[A-Za-z0-9._~:/@%?=\&-]+$ ]] && return 0
+    [[ "$url" =~ ^ssh://[A-Za-z0-9._~:/@%-]+$ ]] && return 0
+    [[ "$url" =~ ^git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+$ ]] && return 0
+    return 1
+}
+
 # ─── Katı key=value okuyucu (ASLA source/eval) ───
 # Kullanım: read_kv_file <dosya> KEY1 KEY2 ...
 # Her KEY için: ^KEY= ile eşleşen İLK satırı bul, ilk '='ten sonrasını
 # (ham, tırnak çözmeden) global KEY değişkenine ata. Eksik anahtar → değişkene
 # dokunma. Her durumda 0 döner. Komut-subst/eval ASLA tetiklenmez.
+# O1 DÜZELTMESİ (denetim DALGA 4): yorum '^KEY=' diyordu ama eşleşme
+# 'grep -F "${k}="' idi — SATIR BAŞINA SABİTLENMEMİŞTİ, oysa write_meta()
+# aynı anahtarı SİLERKEN 'grep -v "^${key}="' ile SABİTLİ arıyordu (asimetri).
+# Web-yazılabilir (henüz hardened olmayan) bir meta/credentials dosyasına
+# saldırgan başına boşluk eklenmiş bir satır (' FRAMEWORK=laravel') yazarsa:
+# eski davranışta bu satır YİNE okunuyordu (grep -F satır içinde herhangi
+# yerde arar) ama write_meta onu SİLEMİYORDU (anchor'lı grep -v eşleşmiyor) —
+# harden-fs dosyayı root:root yapsa bile İÇERİK temizlenmediğinden zehirlenme
+# KALICI oluyordu. Şimdi okuma da SATIR BAŞINA sabit (grep -E "^${k}=") —
+# böyle bir satır artık HİÇ okunmaz (zararsız, ölü satır olarak kalır) ve
+# okuma/yazma sahiplik politikası simetrik hale gelir. assert_safe_ident ile
+# anahtar adı da doğrulanır (çağıranlar hep sabit [A-Za-z0-9_]+ anahtar
+# kullanır — bu yalnızca gelecekte yanlış kullanım/regex meta-karakter
+# enjeksiyonuna karşı savunma katmanıdır).
 read_kv_file() {
     local file="$1"; shift
     [[ -f "$file" ]] || return 0
     local k line
     for k in "$@"; do
-        line="$(grep -F "${k}=" "$file" 2>/dev/null | head -1)" || true
+        assert_safe_ident "$k" || { warn "read_kv_file: geçersiz anahtar adı reddedildi: '${k}'"; continue; }
+        line="$(grep -E "^${k}=" "$file" 2>/dev/null | head -1)" || true
         [[ -n "$line" ]] || continue
         # İlk '='ten sonrasını ata — komut-substitution YOK (printf -v atama)
         printf -v "$k" '%s' "${line#*=}"
@@ -250,14 +472,14 @@ _domain_is_hardened() {
 
 # Sahiplik politikası (PREDIKAT: 0=devam, 1=tamper → çağıran error eder).
 # root-owned değilse: hardened domain → tamper (1); migrate edilmemiş → warn + 0.
-# UYARI STDERR'e gider (yoksa stdout→config çıktılarını kirletir).
+# warn() ARTIK KENDİLİĞİNDEN stderr'e yazar (KARAR 1) — elle '>&2' gerekmez.
 _require_owned_or_warn() {
     local domain="$1" file="$2"
     assert_root_owned_path "$file" && return 0
     if _domain_is_hardened "$domain"; then
         return 1
     fi
-    warn "Domain '${domain}' henüz hardened değil — 'srvctl security harden-fs ${domain}' önerilir" >&2
+    warn "Domain '${domain}' henüz hardened değil — 'srvctl security harden-fs ${domain}' önerilir"
     return 0
 }
 
@@ -335,8 +557,14 @@ safe_name() {
 }
 
 # Domain varlığını kontrol et
+# Domain var mı? (PREDIKAT: 0=var, 1=yok/geçersiz)
+# validate_domain kapısı BURADA: neredeyse her komut yalnız domain_exists'e
+# güveniyordu, o da '../..' içeren girdiyi memnuniyetle kabul ediyordu
+# (örn. 'domain remove ../../var/log' → rm -rf /var/www/../../var/log).
+# Tek noktadan kapatmak tüm çağrı yerlerini birden korur.
 domain_exists() {
     local domain="$1"
+    validate_domain "$domain" || return 1
     [[ -d "${WEB_ROOT}/${domain}" ]]
 }
 
@@ -400,20 +628,51 @@ service_is_active() {
 }
 
 # Tüm domain'leri listele (sadece isimler)
+# WEB_ROOT altındaki SRVCTL DOMAİNLERİNİ listeler.
+#
+# HOST BULGUSU (Ubuntu 24.04, gerçek VM): eski hali '${WEB_ROOT}/*/' altındaki
+# HER dizini domain sayıyordu. nginx paketi '/var/www/html' dizinini kendi
+# kuruyor → 'srvctl security audit' onu domain sanıp sahte FAIL'ler üretti:
+#   ❌ FAIL  html: chroot aktif
+#   ❌ FAIL  html: AppArmor enforce DEĞİL
+# Yalnız gürültü değil: 'harden-fs --all' / 'domain repair --all' /
+# 'deploy prune --all' gibi TOPLU komutlar da bu sahte girdiyi işlemeye
+# çalışır. Ayırt edici işaret '.credentials' — 'domain add' her domain için
+# root:600 olarak yazar (bkz. _domain_write_credentials); nginx'in html
+# dizininde bulunmaz.
 list_all_domains() {
+    local dir name
     for dir in "${WEB_ROOT}"/*/; do
-        [[ -d "$dir" ]] && basename "$dir"
+        [[ -d "$dir" ]] || continue
+        name=$(basename "$dir")
+        # Domain adı kuralına uymayan dizinleri ele (savunma derinliği)
+        validate_domain "$name" || continue
+        # srvctl tarafından oluşturulmuş mu? (.credentials = domain işareti)
+        [[ -f "${dir}.credentials" ]] || continue
+        printf '%s\n' "$name"
     done
 }
 
 # Credentials dosyasını oku (source DEĞİL — katı parse)
 # Sahiplik kapısı: hardened domain + root-owned-değil → tamper → error (çıkış).
 # Migrate edilmemiş (marker yok) → warn stderr + oku.
+# O2 DÜZELTMESİ (denetim DALGA 4): read_kv_file "eksik anahtar → değişkene
+# dokunma" sözleşmesine sahiptir — read_credentials KENDİSİ sıfırlamıyordu.
+# 'domain repair --all' gibi bir döngüde A domaini için okunan DB_PASS/
+# REDIS_PASS/PHP_VERSION GLOBAL kalıyordu; B domaininin .credentials'ı eksik/
+# bozuksa bu ESKİ (A'ya ait) değerler B için SESSİZCE yeniden kullanılıyordu
+# (ör. 'usr_b' parolası A'nınkiyle senkronlanırdı — kiracılar arası parola
+# bulaşması). Şimdi her çağrıda ÖNCE tüm alanlar sıfırlanır, SONRA dosyadan
+# okunur — eksik bir alan artık HER ZAMAN boş kalır, önceki çağrıdan miras
+# KALMAZ.
 read_credentials() {
     local domain="$1"
     local creds_file="${WEB_ROOT}/${domain}/.credentials"
     _require_owned_or_warn "$domain" "$creds_file" \
         || error "Güvenlik: ${creds_file} root-owned değil (tamper). Okuma reddedildi."
+    DOMAIN="" SAFE_NAME="" WEB_USER="" PHP_VERSION=""
+    DB_NAME="" DB_USER="" DB_PASS=""
+    REDIS_USER="" REDIS_PASS="" REDIS_PREFIX=""
     read_kv_file "$creds_file" \
         DOMAIN SAFE_NAME WEB_USER PHP_VERSION \
         DB_NAME DB_USER DB_PASS \
@@ -461,13 +720,14 @@ rate_profile_names() {
     grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$SRVCTL_RATE_PROFILES" | cut -d: -f1
 }
 
-# Geçerli profil adını döndür; geçersiz/boş ise 'standard'a düş (uyarı stderr'e)
+# Geçerli profil adını döndür; geçersiz/boş ise 'standard'a düş
+# (warn() zaten stderr'e yazar — stdout yalnız 'echo "$profile"' ile kirlenmez)
 rate_profile_resolve() {
     local profile="$1"
     if [[ -n "$profile" && -n "$(rate_profile_line "$profile")" ]]; then
         echo "$profile"
     else
-        [[ -n "$profile" ]] && warn "Bilinmeyen rate-limit profili: ${profile} — 'standard' kullanılıyor" >&2
+        [[ -n "$profile" ]] && warn "Bilinmeyen rate-limit profili: ${profile} — 'standard' kullanılıyor"
         echo "standard"
     fi
 }
