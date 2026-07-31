@@ -606,6 +606,44 @@ _deploy_reload_fpm() {
     error "${unit} restart de başarısız — PHP-FPM ÇALIŞMIYOR OLABİLİR, site 502/503 dönüyor olabilir. Manuel müdahale: systemctl status ${unit} / journalctl -u ${unit}"
 }
 
+# ───────────────────────────────────────────────────────────────
+#  Chroot algılama — _deploy_build'in build SONUNDA mutlak-host-yolu gömen
+#  framework cache/manifest artefaktlarını temizleyip temizlemeyeceğine karar
+#  vermek için. PREDİKAT: 0=chroot aktif, 1=değil.
+#
+#  KÖK NEDEN (gerçek Laravel 13.x deploy'u, Ubuntu 22.04 — VM'de ölçüldü):
+#  build adımı (composer install + artisan config:cache/route:cache/...)
+#  HOST'ta, chroot'un DIŞINDA, web_user olarak (runuser ile) çalışır.
+#  Laravel'in composer 'post-autoload-dump' script'i (package:discover) ve
+#  'artisan config:cache' HOST'un mutlak yolunu (ör.
+#  /var/www/laravel.local/releases/<id>/...) 'bootstrap/cache/*.php'ye GÖMER.
+#  FPM chroot'lu çalıştığından (pool.conf.tpl: 'chroot = {{WEB_ROOT}}/{{DOMAIN}}')
+#  ve open_basedir chroot-GÖRELİ yollarla sınırlı olduğundan, bu gömülü HOST
+#  yolu asla ÇÖZÜLEMEZ → 'is_dir(): open_basedir restriction in effect' ile
+#  HTTP 500 (gerçek hata mesajı ve dosya yolu rapor edilmiştir).
+#
+#  BELİRSİZLİKTE YÖN (bu dosyadaki diğer fail-closed kurallarının BİLİNÇLİ bir
+#  İSTİSNASI): srvctl'in normal 'domain add' akışı HER domain'i KOŞULSUZ
+#  chroot'lar (pool.conf.tpl'de opsiyonel bir anahtar YOK) — yani bu fonksiyon
+#  pratikte neredeyse HER ZAMAN "aktif" döner. Yine de körlemesine varsaymak
+#  yerine GERÇEK pool config'ini okur (lib/domain.sh/_domain_row ve
+#  lib/security.sh'ın zaten kullandığı AYNI 'grep chroot' deseniyle AYNI
+#  politika). Pool dosyası HİÇ bulunamazsa (elle kurulum, henüz 'domain add'
+#  çalışmamış, test ortamı) belirsizlik "chroot aktif" YÖNÜNE düşürülür —
+#  çünkü iki yanlış yönün maliyeti SİMETRİK DEĞİL: chroot'u "yok" sanıp
+#  mutlak host yolu gömülü cache'i canlıya almak KATASTROFİK (bu fonksiyonun
+#  düzelttiği asıl bug — open_basedir 500); chroot'u "var" sanıp cache'i
+#  temizlemek framework'ün onu ÇALIŞMA ZAMANINDA (aynı, doğru ortamda) yeniden
+#  üretmesine yol açar — yalnız ilk isteğin soğuk-cache gecikmesi, ZARARSIZ.
+# ───────────────────────────────────────────────────────────────
+_deploy_chroot_active() {
+    local sname="$1" php_version="$2"
+    local pool_conf="${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/${sname}.conf"
+    [[ -f "$pool_conf" ]] || pool_conf="${SRVCTL_PHP_POOL_DIR:-/etc/php/${php_version}/fpm/pool.d}/${sname}.conf"
+    [[ -f "$pool_conf" ]] || return 0
+    grep -q "^[[:space:]]*chroot[[:space:]]*=" "$pool_conf" 2>/dev/null
+}
+
 # Framework'e özgü build/cache adımları. DAİMA web_user (privdrop) —
 # artisan/spark/console repodan gelir ve lifecycle kod çalıştırır, root
 # ASLA. Switch'ten ÖNCE çağrılır (bkz. _deploy_run 6/9): cache/asset
@@ -623,8 +661,27 @@ _deploy_reload_fpm() {
 # yalnız warn ile bildirilir, deploy durmaz (en kötü ihtimalle STALE
 # cache servis edilir; bu risk zaten OPcache validate_timestamps=0 ile
 # kabul edilmiş bir modeldir, bkz. rapor).
+#
+# 5. parametre 'chroot_active' (bkz. _deploy_chroot_active): "true" ise,
+# yukarıdaki cache adımlarının HOST'ta ürettiği ve mutlak HOST yolu gömen
+# Laravel 'bootstrap/cache/*.php' (ve hipotez olarak Symfony
+# 'var/cache/<env>') artefaktları build SONUNDA silinir — framework onları
+# ÇALIŞMA ZAMANINDA, chroot İÇİNDE (bu kez doğru yollarla) yeniden üretir.
+# CI4 bu sınıftan ETKİLENMEZ (gerçek deploy'da HTTP 200, open_basedir hatası
+# sıfır — bkz. rapor) — CI4 dalına KASITLI olarak dokunulmadı.
 _deploy_build() {
     local framework="$1" release_dir="$2" web_user="$3" php_bin="$4"
+    local chroot_active="${5:-true}"
+
+    # GÜVENLİK: release_dir boş/yok İSE aşağıdaki 'rm -rf --
+    # "${release_dir}/var/cache/prod/"*' gibi temizlik satırları
+    # '"${release_dir}"' boş string'e çözülürse (ör. bir çağıran satırı
+    # 'set -u'suz bir bağlamda unutkanlıkla boş geçerse) '/var/cache/prod/*'
+    # gibi HOST'un GERÇEK kök dizinine sızabilirdi. release_dir HER ZAMAN
+    # _deploy_run tarafından dolu geçirilir (bu erken çıkış normal akışı
+    # DEĞİŞTİRMEZ) — bu yalnız savunma-derinliği katmanıdır.
+    [[ -n "$release_dir" && -d "$release_dir" ]] \
+        || { warn "_deploy_build: release_dir geçersiz/boş — build atlandı: '${release_dir}'"; return 1; }
 
     case "$framework" in
         laravel)
@@ -637,6 +694,29 @@ _deploy_build() {
                         env HOME="$release_dir" "$php_bin" "${release_dir}/artisan" "$step_name" --no-interaction \
                         || error "artisan ${step_name} başarısız — deploy durduruldu (bozuk önbellek canlıya alınmaz)"
                 done
+
+                # BUG DÜZELTMESİ (chroot ↔ host yol uzayı çatışması — bkz.
+                # _deploy_chroot_active yorumu, gerçek Laravel 13.x deploy'unda
+                # ölçüldü): yukarıdaki 'config:cache' vb. HOST'ta (chroot'un
+                # DIŞINDA) çalıştığından ürettiği 'bootstrap/cache/*.php' mutlak
+                # HOST yolu gömer; chroot'lu FPM bunu asla çözemez (open_basedir
+                # reddi → HTTP 500). VM'DE KANITLANAN çözüm: bu artefaktları SİL
+                # — Laravel onları ÇALIŞMA ZAMANINDA, chroot İÇİNDE (bu kez
+                # DOĞRU, chroot-göreli yollarla) yeniden üretir. Bedel: deploy
+                # sonrası ilk istek soğuk-cache ile karşılaşır (bilinçli kabul
+                # edilmiş bir maliyet). 'bootstrap/cache' HER release'de
+                # 'shared/bootstrap-cache'e symlink'tir (adım 2, _deploy_link_shared)
+                # — bu silme aynı zamanda ESKİ bir release'in ürettiği manifest'in
+                # YENİ release'e SIZMASINI da engeller (paylaşılan dizin HER
+                # deploy'da fiilen boşaltılır, bkz. koordinatör notu 4).
+                # Chroot AKTİF DEĞİLSE dokunulmaz: o zaman 'config:cache' zaten
+                # HOST ile AYNI ortamda servis edildiğinden ürettiği yol doğrudur
+                # ve gerçek bir performans kazancıdır — körlemesine kaldırılmaz.
+                if [[ "$chroot_active" == "true" ]]; then
+                    rm -f -- "${release_dir}/bootstrap/cache/"*.php 2>/dev/null || true
+                    info "Chroot aktif — bootstrap/cache manifest'leri temizlendi (framework chroot içinde yeniden üretecek)"
+                fi
+
                 # storage:link: public/storage -> storage/app/public. HER release
                 # yeni bir dizin olduğundan bu symlink HER seferinde yeniden kurulmalı.
                 _deploy_privdrop "$web_user" \
@@ -663,6 +743,24 @@ _deploy_build() {
                 _deploy_privdrop "$web_user" \
                     env HOME="$release_dir" "$php_bin" "${release_dir}/bin/console" cache:warmup --env=prod --no-interaction \
                     || warn "bin/console cache:warmup başarısız (devam ediliyor)"
+
+                # HİPOTEZ — VM'DE DOĞRULANMADI (Laravel dalının aksine bu proje
+                # gerçek bir Symfony deploy'unda HENÜZ ölçülmedi; HOST'ta
+                # doğrulanmalı). Aynı kök neden BEKLENİYOR: Symfony'nin
+                # derlenmiş DI container'ı (var/cache/<env>/...Container.php)
+                # 'kernel.project_dir' parametresini BUILD ANINDA (Kernel
+                # sınıfının ReflectionObject ile bulunan dosya yolundan)
+                # hesaplayıp mutlak HOST yolu olarak container'a GÖMER —
+                # Laravel'in bootstrap/cache'iyle AYNI sınıf hata (chroot'lu
+                # FPM bu HOST yolunu asla çözemez). Aynı savunma-derinliği:
+                # chroot aktifse derlenmiş cache SİLİNİR; Symfony prod'da
+                # container eksikse HATA VERMEZ, ilk istekte lazily (bu kez
+                # chroot İÇİNDE, doğru yollarla) yeniden derler.
+                if [[ "$chroot_active" == "true" ]]; then
+                    rm -rf -- "${release_dir}/var/cache/prod/"* 2>/dev/null || true
+                    info "Chroot aktif — Symfony var/cache/prod temizlendi (HİPOTEZ, HOST'ta doğrulanmalı — bkz. _deploy_chroot_active yorumu)"
+                fi
+
                 _deploy_privdrop "$web_user" \
                     env HOME="$release_dir" "$php_bin" "${release_dir}/bin/console" assets:install --no-interaction "${release_dir}/public" \
                     || warn "bin/console assets:install başarısız (devam ediliyor)"
@@ -752,6 +850,14 @@ _deploy_run() {
     php_bin=$(command -v "php${php_version}" 2>/dev/null) || php_bin=""
     [[ -z "$php_bin" ]] && php_bin=$(command -v php 2>/dev/null)
     [[ -z "$php_bin" ]] && php_bin="php"
+
+    # Chroot'lu FPM ↔ chroot'suz build arasındaki yol uzayı çatışması (bkz.
+    # _deploy_chroot_active yorumu): build adımı (composer/artisan) HER ZAMAN
+    # host'ta, chroot'un DIŞINDA çalışır; _deploy_build bu bayrağa göre
+    # mutlak-host-yolu gömen cache artefaktlarını temizleyip temizlemeyeceğine
+    # karar verir.
+    local chroot_active="false"
+    _deploy_chroot_active "$sname" "$php_version" && chroot_active="true"
 
     # ── Per-domain meta: FRAMEWORK/RUN_MIGRATIONS/KEEP_GIT (KULLANICI KARARI) ──
     # Meta web-yazılabilir olabildiğinden (hardened olmayan domain) GÜVENİLMEZ;
@@ -1019,7 +1125,7 @@ _deploy_run() {
 
     # 6. Framework build (cache/asset) — switch'ten ÖNCE, web_user olarak.
     step "6/9" "Framework build (${FRAMEWORK})..."
-    _deploy_build "$FRAMEWORK" "$release_dir" "$web_user" "$php_bin"
+    _deploy_build "$FRAMEWORK" "$release_dir" "$web_user" "$php_bin" "$chroot_active"
 
     # DRY-RUN: burada dur
     if [[ "$dry_run" == "1" ]]; then
