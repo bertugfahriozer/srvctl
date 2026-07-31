@@ -888,14 +888,44 @@ loglevel notice
 logfile /var/log/redis/redis-server.log
 REDISCONF
 
+    # ─── Kanal (pub/sub) ACL token'ı — SÜRÜM KOŞULLU (bkz. core.sh:
+    # _redis_channel_isolation_mode üstündeki kaynak referanslı gerekçe) ───
+    # '&*' (tüm kanallara pub/sub izni) Redis 6.2'den ÖNCE parser'da HİÇ
+    # TANIMLI DEĞİL — koşulsuz yazılırsa HEM admin HEM default satırı
+    # "Syntax error" ile reddedilir ve Redis HİÇ BAŞLAMAZ (Ubuntu 22.04 =
+    # redis-server 6.0.16'da gerçek VM'de gözlemlendi: '/etc/redis/
+    # users.acl:1' ve ':2' — yani BİREBİR bu iki satır). Tespit BURADA,
+    # redis-server paketi az önce kurulduktan SONRA yapılır ki '_install_redis'
+    # her çağrıldığında (ilk kurulum ya da 'srvctl init --force' ile tekrar)
+    # CANLI/GÜNCEL sürüme göre karar versin — ör. Redis 6.0→6.2+ yükseltmesi
+    # sonrası tekrar çalıştırılırsa otomatik olarak doğru satırı üretir
+    # (statik/önbelleklenmiş bir karar DEĞİL).
+    local init_redis_major="" init_redis_minor="" init_channel_status init_channel_suffix=""
+    read -r init_redis_major init_redis_minor <<< "$(_redis_version_pair)"
+    init_channel_status=$(_redis_channel_isolation_mode "$init_redis_major" "$init_redis_minor")
+    if [[ "$init_channel_status" == "supported" ]]; then
+        init_channel_suffix=" &*"
+    else
+        # Redis 6.0'da pub/sub ACL denetimi KAVRAM OLARAK YOK — '&*'yi
+        # atlamak bir kısıtlamayı GEVŞETMEZ (zaten yoktu), yalnızca Redis'i
+        # başlatılabilir kılar. Operatöre BİR KEZ (per-domain değil, burada,
+        # sunucu geneli init adımında) açıkça söylenir; 'srvctl domain add/
+        # repair' zaten her domain için AYRICA (ve haklı olarak) uyarıyor.
+        if [[ "$init_channel_status" == "unknown" ]]; then
+            warn "Redis sürümü tespit edilemedi — fail-closed: pub/sub kanal ACL token'ı ('&*') ATLANDI. Gerçek durumu 'redis-server --version' ile doğrulayın."
+        else
+            warn "Redis ${init_redis_major}.${init_redis_minor} tespit edildi (6.2 altı) — pub/sub kanal ACL'i bu sürümde MÜMKÜN DEĞİL: TÜM kimliği doğrulanmış istemciler TÜM kanallara serbestçe abone olabilir/yayın yapabilir (bu, Redis'in KENDİ sınırlamasıdır, srvctl'in eksikliği değil). İzolasyon gerekiyorsa Redis'i 6.2+'a yükseltin (Ubuntu 24.04'te varsayılan sürüm zaten 6.2+'tır)."
+        fi
+    fi
+
     # ACL dosyası (umask 077 — parola world-readable olmasın)
     (
         umask 077
         # NOT: aclfile YORUM (#) ve boş satır KABUL ETMEZ (redis "should start with
         # user keyword" ile başlatmayı iptal eder). Yalnız 'user ...' satırları yaz.
         cat > /etc/redis/users.acl << REDISACL
-user admin on >${redis_admin_pass} ~* &* +@all
-user default off nopass ~* &* -@all
+user admin on >${redis_admin_pass} ~*${init_channel_suffix} +@all
+user default off nopass ~*${init_channel_suffix} -@all
 REDISACL
     )
     # redis.conf sır içermez (0640); users.acl parola taşır (0600), sahibi redis daemon

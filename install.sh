@@ -197,6 +197,11 @@ fi
 
 # rate-profiles.conf VERİ dosyasıdır (kullanıcı config'i değil) — her kurulumda güncellenir.
 cp "${SCRIPT_DIR}/conf/rate-profiles.conf" "${INSTALL_DIR}/conf/rate-profiles.conf" 2>/dev/null || true
+# resource-profiles.conf da VERİ dosyasıdır (micro/standard/ecommerce/heavy
+# kaynak profilleri; MemoryHigh/Max/SwapMax ve pm.* değerleri buradan TÜRETİLİR).
+# Kopyalanmazsa lib/core.sh:resource_profile_load dahili 'standard' güvenlik
+# ağına düşer ve operatörün profil seçimi sessizce yok sayılır.
+cp "${SCRIPT_DIR}/conf/resource-profiles.conf" "${INSTALL_DIR}/conf/resource-profiles.conf" 2>/dev/null || true
 
 # completions/ — daha önce hiç kopyalanmıyordu: lib/selfupdate.sh güncellemede
 # "${SRVCTL_ROOT}/completions/"e kopyalamayı DENİYOR ama dizin hiç kurulumda

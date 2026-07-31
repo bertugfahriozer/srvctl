@@ -23,9 +23,23 @@
 # tespit ediyoruz: eğer gelecekte SRVCTL_SYSTEMD_DIR onurlandırılırsa bu
 # test kendiliğinden tam kapsamlı hale gelir, onurlandırılmıyorsa açıkça
 # SKIP edip nedenini raporlar (real /etc'ye ASLA yazmaya çalışmaz).
+#
+# GÜNCELLEME (kaynak profilleri): "varsayılan doldurulan" TasksMax/
+# MemorySwapMax değerleri artık _domain_cgroups_defaults'taki SABİT
+# "4096M 4608M 512M 200" DEĞİL — domain'in kaynak profilinden (.srvctl-meta
+# RESOURCE_PROFILE, yoksa 'standard') resource_profile_load (core.sh) ile
+# TÜRETİLİYOR (bkz. conf/resource-profiles.conf). Meta yoksa profil
+# 'standard' (ondemand:8:256:120) olur: MemoryHigh=8×256=2048M,
+# MemoryMax=2048×9/8=2304M, MemorySwapMax=2048/8=256M, TasksMax=120 (bu
+# profilden DOĞRUDAN okunur, formülle türetilmez). Bu testteki domain'in
+# hiç meta'sı yok, dolayısıyla aşağıdaki "varsayılan dolduruldu/KORUNDU"
+# beklentileri 'standard' profilinin bu türevleridir — SABİT DEĞİL, profil
+# dosyası değişirse bu test de güncellenmeli (bkz. tests/test_resource_profile_load.sh
+# profilin kendisini ayrıca doğrular).
 set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export WEB_ROOT="$(mktemp -d)"
+export SRVCTL_RESOURCE_PROFILES="${REPO_ROOT}/conf/resource-profiles.conf"
 source "${REPO_ROOT}/tests/lib.sh"
 source "${REPO_ROOT}/lib/core.sh"
 SRVCTL_TEMPLATES="${REPO_ROOT}/templates"
@@ -97,8 +111,8 @@ if [[ -f "$seam_slice" ]]; then
     assert_contains "$conf1" "MemoryMax=512M"    "ilk çağrı: memory uygulandı"
     assert_contains "$conf1" "CPUQuota=50%"      "ilk çağrı: cpu uygulandı"
     assert_contains "$conf1" "IOWeight=150"      "ilk çağrı: io uygulandı"
-    assert_contains "$conf1" "TasksMax=200"      "ilk çağrı: varsayılan TasksMax dolduruldu"
-    assert_contains "$conf1" "MemorySwapMax=512M" "ilk çağrı: varsayılan MemorySwapMax dolduruldu"
+    assert_contains "$conf1" "TasksMax=120"      "ilk çağrı: varsayılan (standard profili) TasksMax dolduruldu"
+    assert_contains "$conf1" "MemorySwapMax=256M" "ilk çağrı: varsayılan (standard profili) MemorySwapMax dolduruldu"
 
     # 2) İkinci çağrı: SADECE memory değiştirilir. cpu/io/tasks/swap KORUNMALI
     #    (regresyon: eski kod bunları burada sessizce silerdi).
@@ -107,8 +121,8 @@ if [[ -f "$seam_slice" ]]; then
     assert_contains "$conf2" "MemoryMax=1G"       "ikinci çağrı: yalnız memory güncellendi"
     assert_contains "$conf2" "CPUQuota=50%"       "ikinci çağrı: ÖNCEKİ cpu KORUNDU"
     assert_contains "$conf2" "IOWeight=150"       "ikinci çağrı: ÖNCEKİ io KORUNDU"
-    assert_contains "$conf2" "TasksMax=200"       "ikinci çağrı: TasksMax KORUNDU"
-    assert_contains "$conf2" "MemorySwapMax=512M" "ikinci çağrı: MemorySwapMax KORUNDU"
+    assert_contains "$conf2" "TasksMax=120"       "ikinci çağrı: TasksMax KORUNDU"
+    assert_contains "$conf2" "MemorySwapMax=256M" "ikinci çağrı: MemorySwapMax KORUNDU"
 
     # 3) Üçüncü çağrı: SADECE io değiştirilir. memory/cpu KORUNMALI.
     SRVCTL_SYSTEMD_DIR="$p_dir" _run_isolated _domain_resources "$d2" --io=300 >/dev/null 2>&1

@@ -134,6 +134,18 @@ load_config() {
     BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
     DEPLOYER_USER="${DEPLOYER_USER:-deployer}"
 
+    # ─── Per-domain FPM izolasyonu (Faz 2/T7a — Seçenek C, kullanıcı kararı) ───
+    # Varsayılan AÇIK: 'domain add' sonunda domain otomatik olarak paylaşılan
+    # php<ver>-fpm master'ından kendi 'srvctl-fpm-<sname>.service' unit'ine
+    # (AppArmor/cgroups/seccomp GERÇEKTEN attach — bkz. HOST doğrulaması)
+    # taşınır. Migrasyon mantığının TEK kaynağı lib/security.sh:_harden_fpm_apply'dır
+    # (buradan yalnız ÇAĞRILIR, KOPYALANMAZ — bkz. lib/domain.sh
+    # _domain_migrate_to_isolated_fpm). 100 domain / hepsi e-ticaret hedefi
+    # için varsayılan izolasyon istendi. fail-closed: migrasyon başarısız
+    # olursa domain PAYLAŞILAN pool'da çalışmaya DEVAM eder — 'domain add'
+    # bu yüzden ASLA başarısız SAYILMAZ.
+    DOMAIN_ISOLATED_FPM="${DOMAIN_ISOLATED_FPM:-true}"
+
     # ─── Deploy release saklama ───
     # Rollback hedefi gerektiğinden taban 2'dir; altı zorlanır.
     DEPLOY_KEEP_RELEASES="${DEPLOY_KEEP_RELEASES:-5}"
@@ -188,6 +200,8 @@ load_config() {
     # validate_uint her zaman tanımlıdır (yukarıda load_config'den önce tanımlandı).
     validate_uint "$SSH_PORT" 65535 || error "Geçersiz SSH_PORT: ${SSH_PORT} (1-65535 arası tam sayı)"
     [[ "$WEB_ROOT" == /* ]] || error "Geçersiz WEB_ROOT: ${WEB_ROOT} (mutlak yol olmalı)"
+    validate_bool "$DOMAIN_ISOLATED_FPM" \
+        || error "Geçersiz DOMAIN_ISOLATED_FPM: ${DOMAIN_ISOLATED_FPM} (true|false olmalı)"
     validate_uint "$DEPLOY_KEEP_RELEASES" 1000 \
         || error "Geçersiz DEPLOY_KEEP_RELEASES: ${DEPLOY_KEEP_RELEASES} (1-1000 arası tam sayı)"
     (( DEPLOY_KEEP_RELEASES >= 2 )) \
@@ -742,6 +756,236 @@ rate_profile_load() {
     RL_LOGIN_ZONE=$(rate_profile_field "$profile" 4)
     RL_LOGIN_BURST=$(rate_profile_field "$profile" 5)
     RL_CONN=$(rate_profile_field "$profile" 6)
+}
+
+# ─── Kaynak (Resource) Profilleri — cgroups + FPM pool boyutlandırma ───
+# Sözleşme (conf/resource-profiles.conf, ops-infra sahipliğinde):
+#   profil:pm_mode:max_children:memory_limit_mb:tasks_max
+# ör. "ecommerce:dynamic:16:512:300". Bu format DEĞİŞTİRİLMEZ; rate_profile_*
+# desenin BİREBİR kardeşidir (aynı dosya/stil).
+SRVCTL_RESOURCE_PROFILES="${SRVCTL_RESOURCE_PROFILES:-${SRVCTL_ROOT}/conf/resource-profiles.conf}"
+
+# Bir profilin conf satırını getir (yorum/boş satırlar hariç)
+resource_profile_line() {
+    [[ -f "$SRVCTL_RESOURCE_PROFILES" ]] || return 1
+    grep -E "^${1}:" "$SRVCTL_RESOURCE_PROFILES" 2>/dev/null | grep -v '^#' | head -1
+}
+
+# Bir profilin N. alanını getir (1=ad 2=pm_mode 3=max_children 4=memory_limit_mb 5=tasks_max)
+resource_profile_field() {
+    local line
+    line=$(resource_profile_line "$1") || return 1
+    [[ -z "$line" ]] && return 1
+    echo "$line" | cut -d: -f"$2"
+}
+
+# Tüm profil adlarını listele
+resource_profile_names() {
+    [[ -f "$SRVCTL_RESOURCE_PROFILES" ]] || return 1
+    grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$SRVCTL_RESOURCE_PROFILES" | cut -d: -f1
+}
+
+# Geçerli profil adını döndür; geçersiz/boş/dosya-yok ise 'standard'a düş
+# (rate_profile_resolve İLE BİREBİR AYNI desen — warn() zaten stderr'e yazar).
+resource_profile_resolve() {
+    local profile="$1"
+    if [[ -n "$profile" && -n "$(resource_profile_line "$profile")" ]]; then
+        echo "$profile"
+    else
+        [[ -n "$profile" ]] && warn "Bilinmeyen kaynak profili: ${profile} — 'standard' kullanılıyor"
+        echo "standard"
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────
+#  Profili global RES_* değişkenlerine yükler — cgroups slice VE FPM pool
+#  boyutlandırmasının TEK doğruluk kaynağı budur (görev sözleşmesi: "iki
+#  bağımsız sabit bırakma, drift'in sebebi buydu"). Formüller conf/
+#  resource-profiles.conf VE templates/php-fpm/pool.conf.tpl başlık
+#  yorumlarıyla (ops-infra sözleşmesi, karşılıklı çapraz-referanslı) BİREBİR
+#  AYNI olmalıdır:
+#    MemoryHigh (MB)    = max_children × memory_limit_mb
+#    MemoryMax (MB)     = MemoryHigh × 9/8   (tamsayı aritmetiği, ≈ ×1.125)
+#    MemorySwapMax (MB) = MemoryHigh / 8     (tamsayı bölme, TABAN 1M — sabit
+#                         256M taban EKLENMEDİ: küçük profillerde (ör. micro
+#                         512M tepe → 64M swap) mutlak değerin küçük olması
+#                         sorun değil, ORANIN sıfır OLMAMASI önemliydi)
+#  pm.start_servers/min_spare_servers/max_spare_servers ('dynamic' bunları
+#  ZORUNLU kılar; 'ondemand' sessizce yok sayar, status=78/CONFIG VERMEZ —
+#  Ubuntu 22.04/24.04'te 'php-fpm -t' ile doğrulandı) tamsayı bölme + clamp:
+#    min_spare_servers = max(1, max_children / 8)
+#    start_servers      = max(1, max_children / 4)
+#    max_spare_servers  = clamp(max_children / 2, start_servers, max_children)
+#  ör. ecommerce (max_children=16) → min=2 start=4 max=8; heavy (32) →
+#  min=4 start=8 max=16 (pool.conf.tpl/resource-profiles.conf ile doğrulanan
+#  ÖRNEKLERLE BİREBİR EŞLEŞİR). pm.process_idle_timeout TOKEN DEĞİL — sabit
+#  '10s' pool.conf.tpl içine gömülü (yalnız 'ondemand'ta anlamlı).
+#  Profil/dosya bulunamazsa (ör. conf/resource-profiles.conf henüz kurulu
+#  değil) alanlar boş kalır ve aşağıda fail-closed 'standard' sözleşme
+#  değerlerine (ondemand:8:256:120) düşülür — bu İKİNCİ bir bağımsız sabit
+#  DEĞİLDİR, yalnızca 'standard' satırının sözleşmedeki DEĞERİYLE birebir
+#  aynı bir dahili güvenlik ağıdır.
+# ───────────────────────────────────────────────────────────────
+resource_profile_load() {
+    local profile
+    profile=$(resource_profile_resolve "$1")
+    RES_PROFILE="$profile"
+    RES_PM_MODE=$(resource_profile_field "$profile" 2) || RES_PM_MODE=""
+    RES_MAX_CHILDREN=$(resource_profile_field "$profile" 3) || RES_MAX_CHILDREN=""
+    RES_MEMORY_LIMIT_MB=$(resource_profile_field "$profile" 4) || RES_MEMORY_LIMIT_MB=""
+    RES_TASKS_MAX=$(resource_profile_field "$profile" 5) || RES_TASKS_MAX=""
+
+    case "$RES_PM_MODE" in
+        ondemand|dynamic|static) : ;;
+        *) RES_PM_MODE="ondemand" ;;
+    esac
+    if ! validate_uint "$RES_MAX_CHILDREN" 1000 || (( RES_MAX_CHILDREN < 1 )); then
+        RES_MAX_CHILDREN=8
+    fi
+    if ! validate_uint "$RES_MEMORY_LIMIT_MB" 1000000 || (( RES_MEMORY_LIMIT_MB < 1 )); then
+        RES_MEMORY_LIMIT_MB=256
+    fi
+    if ! validate_uint "$RES_TASKS_MAX" 1000000 || (( RES_TASKS_MAX < 1 )); then
+        RES_TASKS_MAX=120
+    fi
+
+    # MemoryHigh/Max/SwapMax — conf/resource-profiles.conf'un GERÇEK
+    # uygulaması (tamsayı aritmetiği, taban 1M — 256M taban YOK).
+    local mem_high_mb mem_max_mb mem_swap_mb
+    mem_high_mb=$(( RES_MAX_CHILDREN * RES_MEMORY_LIMIT_MB ))
+    mem_max_mb=$(( mem_high_mb * 9 / 8 ))
+    mem_swap_mb=$(( mem_high_mb / 8 ))
+    (( mem_swap_mb >= 1 )) || mem_swap_mb=1
+
+    RES_MEMORY_HIGH_MB="$mem_high_mb"
+    RES_MEMORY_MAX_MB="$mem_max_mb"
+    RES_MEMORY_SWAP_MB="$mem_swap_mb"
+    RES_MEMORY_HIGH="${mem_high_mb}M"
+    RES_MEMORY_MAX="${mem_max_mb}M"
+    RES_MEMORY_SWAP="${mem_swap_mb}M"
+
+    # pm.min_spare/start/max_spare_servers — ops-infra'nın clamp formülü
+    # (templates/php-fpm/pool.conf.tpl + conf/resource-profiles.conf başlık
+    # yorumlarıyla BİREBİR AYNI; örnekleriyle doğrulandı: bkz. yukarı).
+    local min_spare start max_spare half
+    min_spare=$(( RES_MAX_CHILDREN / 8 )); (( min_spare >= 1 )) || min_spare=1
+    start=$(( RES_MAX_CHILDREN / 4 )); (( start >= 1 )) || start=1
+    half=$(( RES_MAX_CHILDREN / 2 ))
+    max_spare=$half
+    (( max_spare >= start )) || max_spare=$start
+    (( max_spare <= RES_MAX_CHILDREN )) || max_spare=$RES_MAX_CHILDREN
+    RES_PM_MIN_SPARE_SERVERS="$min_spare"
+    RES_PM_START_SERVERS="$start"
+    RES_PM_MAX_SPARE_SERVERS="$max_spare"
+}
+
+# ═══════════════════════════════════════════════
+#  Redis sürüm tespiti + ACL kanal-izolasyonu yetenek kararı
+#  (ÇAPRAZ-MODÜL PAYLAŞIMLI — bkz. aşağıdaki "NEDEN core.sh'TA" notu)
+# ═══════════════════════════════════════════════
+# NEDEN core.sh'TA (lib/domain.sh'ta DEĞİL): hem lib/domain.sh (per-domain
+# Redis ACL kullanıcısı, bkz. _domain_build_redis_acl_line) hem lib/init.sh
+# (sunucu-geneli admin/default Redis ACL kullanıcıları, bkz. _install_redis)
+# AYNI "Redis'in şu an hangi sürümde çalıştığı" ve "pub/sub kanal ACL'i bu
+# sürümde MÜMKÜN MÜ" kararına ihtiyaç duyuyor. '_load_and_run' (bin/srvctl)
+# YALNIZ dispatch edilen TEK modülü source ettiğinden (bkz. CLAUDE.md)
+# domain.sh'ta tanımlı kalsaydı init.sh'tan çağrısı çalışma zamanında
+# "command not found" (127) verirdi — resource_profile_*/rate_profile_*
+# İLE AYNI gerekçeyle burası (her modülde HER ZAMAN ilk source edilen
+# core.sh) doğru ev. Bu üç fonksiyon 2026-07-31'de lib/domain.sh'tan
+# BURAYA TAŞINDI (_domain_redis_channel_isolation_mode ->
+# _redis_channel_isolation_mode olarak yeniden adlandırıldı — artık
+# domain.sh'a özel değil; _redis_version_pair/_redis_major_version isim
+# DEĞİŞTİRMEDİ, domain.sh çağrı yerleri kırılmadı).
+#
+# GEREKÇE (KENDİ DOĞRULAMAM, kaynaklı — kanal izolasyonu kararı için):
+#   - 'resetchannels', '&pattern' VE 'allchannels' (üçü de pub/sub kanal
+#     ACL'i) Redis'e 6.2.0'da eklendi: resmi 6.2 RELEASENOTES'ta 6.0.9
+#     tabanına kıyasla yeni özellik olarak "ACL patterns for Pub/Sub
+#     channels (#7993)" geçer (github.com/redis/redis, 00-RELEASENOTES,
+#     6.2 dalı — indirip grep ile teyit edildi).
+#   - Redis 6.0.16'nın KENDİ kaynağında (src/acl.c) ACLSetUser'ın op
+#     ayrıştırma zincirinde ('~' anahtar deseni dalından hemen sonra
+#     '+'/'-' komut bayrağı dalına geçer) '&' İÇİN HİÇBİR DAL YOK; Redis
+#     6.2.0'ın AYNI zincirinde 'op[0] == '&'' diye AYRI bir dal var (satır
+#     928). 'allchannels'/'resetchannels' string'leri de 6.0.16 kaynağında
+#     SIFIR kez geçiyor (grep ile teyit edildi — ne token ne de config
+#     yönergesi 'acl-pubsub-default' 6.0.16'da mevcut, o da 6.2 eklentisi).
+#     Sonuç: 6.0'da '&*' gibi bir token parser'ın HİÇBİR dalına uymadığından
+#     jenerik "Syntax error"a düşer ve Redis HİÇ BAŞLAMAZ — bu, gerçek
+#     Ubuntu 22.04 VM'de hem domain.sh'ın per-domain ACL satırında hem
+#     init.sh'ın ürettiği admin/default satırlarında (ikisi de '&*'
+#     içeriyordu) birebir gözlemlendi.
+#   - Ubuntu 22.04 (jammy) paketi: redis-server 6.0.16 (6.2 ALTI). Ubuntu
+#     24.04 (noble) paketi: redis-server 7.0.15 (6.2 ÜSTÜ). Kaynak:
+#     packages.ubuntu.com/{jammy,noble}/redis-server.
+#   - ÖNEMLİ (güvenlik açısından): Redis 6.0'da pub/sub ACL denetimi KAVRAM
+#     OLARAK YOK — kanal token'ını ATLAMAK bir kısıtlamayı GEVŞETMEZ (zaten
+#     hiçbir kısıtlama yoktu, TÜM kimliği doğrulanmış istemciler TÜM
+#     kanallara serbestçe abone olabilir/yayın yapabilir); yalnızca Redis'in
+#     BAŞLAMASINI sağlar. Bu izolasyonsuzluk operatöre SESSİZCE değil,
+#     AÇIKÇA bildirilmelidir (bkz. çağıran taraflardaki warn metinleri:
+#     lib/domain.sh per-domain, lib/init.sh sunucu-geneli — BİR KEZ).
+
+# Redis sunucu (MAJOR, MINOR) sürüm ÇİFTİNİ tespit eder. Önce
+# 'redis-server --version' (host'ta paket kuruluysa her zaman mevcuttur,
+# auth gerekmez), yoksa 'redis-cli INFO server' düşer (parola argv'ye değil
+# REDISCLI_AUTH env'e gider — çağıran taraf gerekirse onu set etmeli).
+# Belirlenemezse 1 döner (stdout boş) — çağıran fail-closed davranmalı.
+# NEDEN çift (yalnız major değil): kanal (pub/sub) ACL izolasyonu kararı
+# major=6 içinde İKİYE bölünür — 6.0'da 'resetchannels'/'&pattern' token'ları
+# PARSER'DA HİÇ TANIMLI DEĞİL (bkz. yukarıdaki kaynak referanslı gerekçe),
+# 6.2+'da tanımlı. Yalnız major bilgisiyle bu ayrım yapılamaz.
+_redis_version_pair() {
+    local out
+    if command -v redis-server >/dev/null 2>&1; then
+        out=$(redis-server --version 2>/dev/null)
+        if [[ "$out" =~ v=([0-9]+)\.([0-9]+)\. ]]; then
+            echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+            return 0
+        fi
+    fi
+    out=$(redis-cli INFO server 2>/dev/null | grep -m1 '^redis_version:')
+    if [[ "$out" =~ redis_version:([0-9]+)\.([0-9]+)\. ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+# Geriye uyumlu ince sarmalayıcı — yalnız MAJOR döndürür (mevcut çağıranlar/
+# testler bunu bekliyor: bkz. tests/test_pure_helpers.sh, lib/domain.sh).
+# Tek gerçek kaynak _redis_version_pair'dir; iki ayrı redis-server/redis-cli
+# çağrısı YAPMAZ.
+_redis_major_version() {
+    local pair major
+    pair=$(_redis_version_pair) || return 1
+    major="${pair%% *}"
+    [[ -n "$major" ]] || return 1
+    echo "$major"
+}
+
+# Saf karar fonksiyonu — redis-server/redis-cli ÇAĞIRMAZ, macOS'ta argüman
+# enjeksiyonuyla unit-test edilebilir (bkz. lib/domain.sh:
+# _domain_redis_scripting_mode ile aynı desen). KARAR: major>6 OR
+# (major==6 AND minor>=2) -> 'supported'; aksi halde (6.0/6.1 ya da sürüm
+# belirlenemedi) -> 'unsupported'/'unknown' — çağıran taraf bu durumda
+# kanal token'larını ('resetchannels'/'&pattern'/'allchannels') ACL
+# satırına HİÇ EKLEMEMELİ (fail-closed: başlamayan bir Redis, izolasyonsuz
+# ama ÇALIŞAN bir Redis'ten kötüdür — ama izolasyonsuzluk operatöre AÇIKÇA
+# uyarılarak kabul edilir; bkz. çağıran taraftaki warn metinleri).
+# Çıktı: durum kodu (supported|unsupported|unknown).
+_redis_channel_isolation_mode() {
+    local major="$1" minor="$2"
+    if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
+        if (( major > 6 || (major == 6 && minor >= 2) )); then
+            echo "supported"
+        else
+            echo "unsupported"
+        fi
+    else
+        echo "unknown"
+    fi
 }
 
 # ─── Per-Domain Meta (sır değil) ───

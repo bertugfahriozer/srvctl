@@ -123,7 +123,11 @@ _security_load_domain_lib() {
 # KEEP_GIT). Yeni bir 'write_meta domain KEY value' eklerken KEY buraya da
 # eklenmelidir — aksi halde harden-fs --apply o anahtarı SESSİZCE atar.
 _meta_known_keys() {
-    echo "RATE_PROFILE SENSITIVE_PATHS FRAMEWORK RUN_MIGRATIONS KEEP_GIT REDIS_SCRIPTING"
+    # ISOLATED_FPM / RESOURCE_PROFILE bu oturumda eklendi (seçenek C + kaynak
+    # profilleri). Whitelist'te olmazlarsa 'harden-fs --apply' meta'yı yeniden
+    # yazarken bu iki satırı SESSİZCE atar → domain bir sonraki repair/add'de
+    # varsayılana döner (izolasyon kapanır, profil 'standard'a düşer).
+    echo "RATE_PROFILE SENSITIVE_PATHS FRAMEWORK RUN_MIGRATIONS KEEP_GIT REDIS_SCRIPTING REDIS_CHANNEL_ISOLATION ISOLATED_FPM RESOURCE_PROFILE"
 }
 
 # Anahtar bilinen listede mi? (PREDİKAT: 0=evet)
@@ -152,6 +156,15 @@ _meta_validate_value() {
         RUN_MIGRATIONS)  validate_bool "$value" ;;
         KEEP_GIT)        validate_bool "$value" ;;
         REDIS_SCRIPTING) [[ "$value" == "enabled" || "$value" == "disabled" || "$value" == "unknown" ]] ;;
+        # Redis kanal (pub/sub) izolasyonu — 'resetchannels &<sname>:*' yalnız
+        # Redis 6.2+ sözdizimidir; 22.04'ün 6.0.16'sında ACL parser bunu
+        # tanımaz ve Redis HİÇ BAŞLAMAZ. Durum per-domain kalıcı kaydedilir.
+        REDIS_CHANNEL_ISOLATION) [[ "$value" == "supported" || "$value" == "unsupported" || "$value" == "unknown" ]] ;;
+        # Per-domain FPM izolasyonu override'ı (global DOMAIN_ISOLATED_FPM'i ezer)
+        ISOLATED_FPM)    validate_bool "$value" ;;
+        # Kaynak profili — conf/resource-profiles.conf'ta TANIMLI olmalı.
+        # RATE_PROFILE ile aynı desen: profil satırı yoksa değer geçersiz sayılır.
+        RESOURCE_PROFILE) [[ -n "$(resource_profile_line "$value" 2>/dev/null)" ]] ;;
         *)               return 1 ;;
     esac
 }

@@ -28,7 +28,9 @@ cmd_domain() {
             echo ""
             echo "  Temel:"
             echo "    add <domain> [--php=8.3] [--framework=ci4|laravel|symfony]"
-            echo "                                     Yeni domain ekle (framework varsayılan: ci4)"
+            echo "        [--resources=micro|standard|ecommerce|heavy]"
+            echo "                                     Yeni domain ekle (framework varsayılan: ci4,"
+            echo "                                     kaynak profili varsayılan: standard)"
             echo "    remove <domain>                 Domain kaldır"
             echo "    list                            Tüm domain'leri listele"
             echo "    info <domain> [--show-secrets]  Domain bilgisi (parolalar varsayılan gizli)"
@@ -187,12 +189,22 @@ _domain_repair() {
     _apply_chroot_php_deps "${base}" "${php_ver}"
     
     step "2/4" "PHP-FPM Pool ve AppArmor yapılandırmaları yenileniyor..."
+    # Kaynak profili domain'in KENDİ meta beyanından (RESOURCE_PROFILE) okunur
+    # — repair, 'domain add' anındaki '--resources=' seçimini sessizce
+    # 'standard'a DÜŞÜRMEMELİ (bkz. _domain_render_fpm_unit ile AYNI desen).
+    local repair_resource_profile; repair_resource_profile=$(_domain_read_resource_profile "$target")
+    resource_profile_load "$repair_resource_profile"
     render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
         "SAFE_NAME=${sname}" \
         "DOMAIN=${target}" \
         "WEB_USER=${web_user}" \
         "WEB_ROOT=${WEB_ROOT}" \
         "PHP_VERSION=${php_ver}" \
+        "PM_MODE=${RES_PM_MODE}" "PM_MAX_CHILDREN=${RES_MAX_CHILDREN}" \
+        "PM_START_SERVERS=${RES_PM_START_SERVERS}" \
+        "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
+        "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
+        "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
         > "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf"
 
     render_template "${SRVCTL_TEMPLATES}/apparmor/profile.tpl" \
@@ -249,11 +261,12 @@ SQL
     # onarılmasını sağlar.
     if [[ -n "$redis_user" && -n "$redis_pass" ]]; then
         _sed_inplace /etc/redis/users.acl "/^user ${redis_user} /d" 2>/dev/null || true
-        local redis_major scripting_flag scripting_status
-        redis_major=$(_redis_major_version) || redis_major=""
+        local redis_major="" redis_minor="" scripting_flag scripting_status channel_status
+        read -r redis_major redis_minor <<< "$(_redis_version_pair)"
         read -r scripting_flag scripting_status <<< "$(_domain_redis_scripting_mode "$redis_major")"
+        channel_status=$(_redis_channel_isolation_mode "$redis_major" "$redis_minor")
         local acl_line
-        acl_line=$(_domain_build_redis_acl_line "$redis_user" "$redis_pass" "$sname" "$scripting_flag")
+        acl_line=$(_domain_build_redis_acl_line "$redis_user" "$redis_pass" "$sname" "$scripting_flag" "$channel_status")
         echo "$acl_line" >> /etc/redis/users.acl
 
         local redis_admin_pass
@@ -269,6 +282,16 @@ SQL
         if [[ "$scripting_status" != "enabled" ]]; then
             warn "Redis scripting (EVAL/Lua) bu domainde KAPALI (${scripting_status}) — Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAZ; QUEUE_CONNECTION=database kullanın."
         fi
+
+        write_meta "$target" "REDIS_CHANNEL_ISOLATION" "$channel_status"
+        case "$channel_status" in
+            unsupported)
+                warn "Redis ${redis_major}.${redis_minor} tespit edildi (6.2 altı) — pub/sub KANAL izolasyonu ACL ile YAPILAMIYOR: bu domain diğer domainlerin kanallarını görebilir/yayın yapabilir. İzolasyon için Redis'i 6.2+'a yükseltin ya da domain başına ayrı Redis instance'ı kullanın."
+                ;;
+            unknown)
+                warn "Redis sürümü tespit edilemedi — fail-closed: pub/sub KANAL izolasyon token'ları ACL'e EKLENMEDİ (izolasyonsuz ama çalışan Redis, hiç başlamayan Redis'e tercih edildi). 'redis-cli ACL GETUSER ${redis_user}' ile doğrulayın."
+                ;;
+        esac
     fi
 
     # ─── .credentials'ı KANONİK hale getir (K3 kapanışı) ───
@@ -463,6 +486,172 @@ _domain_read_framework() {
     esac
 }
 
+# Domain'in kaynak (cgroups/FPM pool) profili beyanını (.srvctl-meta)
+# whitelist'ten geçirerek oku. _domain_read_framework İLE AYNI KAPI/DESEN
+# (core.sh read_meta yalnız RATE_PROFILE/SENSITIVE_PATHS bilir) — .srvctl-meta
+# web-yazılabilir olduğundan ham RESOURCE_PROFILE değerine GÜVENİLMEZ;
+# resource_profile_resolve (core.sh, conf/resource-profiles.conf'a karşı)
+# ile doğrulanır, tanınmayan/boş değer 'standard'a düşer. Hardened bir
+# domain'de dosya root-owned değilse (tamper) sert hata — bu fonksiyon
+# yalnız OPERATÖR tarafından çağrılan çalışma-zamanı komutlarında
+# (_domain_resources, _domain_render_fpm_unit) kullanılır; 'domain add'
+# İÇİNDE KULLANILMAZ (add zaten CLI'dan gelen doğrulanmış değeri elinde
+# tutar — bkz. _domain_capacity_read_profile, KAPASİTE taraması için ayrı
+# ve YUMUŞAK/warn-only bir kopya kullanır, başka bir domainin tamper'ı BU
+# domain add'i asla engellememeli).
+_domain_read_resource_profile() {
+    local domain="$1"
+    local meta_file="${WEB_ROOT}/${domain}/.srvctl-meta"
+    local RESOURCE_PROFILE=""
+    if [[ -f "$meta_file" ]]; then
+        if _require_owned_or_warn "$domain" "$meta_file"; then
+            read_kv_file "$meta_file" RESOURCE_PROFILE
+        else
+            error "Güvenlik: ${meta_file} root-owned değil (tamper). Okuma reddedildi."
+        fi
+    fi
+    resource_profile_resolve "${RESOURCE_PROFILE:-standard}"
+}
+
+# _domain_read_resource_profile'ın YUMUŞAK kopyası — yalnız kapasite
+# planlayıcı (_domain_capacity_check) TÜM domainleri tararken kullanır.
+# Tamper durumunda 'error' ile EXIT ETMEZ (yalnız warn + 'standard'a düşer):
+# kapasite tahmini bir GÜVENLİK SINIRI değildir (config/unit'e akmaz, salt
+# bilgi amaçlı toplam gösterir) — BAŞKA bir domainin tampered meta'sı, o an
+# eklenmekte olan YENİ domainin 'domain add' akışını ASLA engellememeli.
+_domain_capacity_read_profile() {
+    local domain="$1"
+    local meta_file="${WEB_ROOT}/${domain}/.srvctl-meta"
+    local RESOURCE_PROFILE=""
+    if [[ -f "$meta_file" ]]; then
+        if _require_owned_or_warn "$domain" "$meta_file"; then
+            read_kv_file "$meta_file" RESOURCE_PROFILE
+        else
+            warn "Kapasite tahmini: ${domain} meta dosyası root-owned değil (tamper şüphesi) — 'standard' varsayılıyor"
+        fi
+    fi
+    resource_profile_resolve "${RESOURCE_PROFILE:-standard}"
+}
+
+# DOMAIN_ISOLATED_FPM efektif değerini döndürür (stdout: "true"|"false").
+# Öncelik: .srvctl-meta ISOLATED_FPM (web-yazılabilir → validate_bool ile
+# doğrulanır) > global DOMAIN_ISOLATED_FPM (conf/srvctl.conf, core.sh
+# load_config zaten validate_bool ile doğruladı). Meta değeri eksik/
+# geçersizse SESSİZCE global değere düşülür — hatalı/tampered bir meta
+# satırı varsayılanı ASLA override edemez (fail-closed: bkz. rapor —
+# lib/security.sh:_meta_known_keys whitelist'ine ISOLATED_FPM eklenmesi
+# gerekir, o dosya bu görevin kapsamı dışında).
+_domain_isolated_fpm_effective() {
+    local domain="$1"
+    local meta_file="${WEB_ROOT}/${domain}/.srvctl-meta"
+    local ISOLATED_FPM=""
+    if [[ -f "$meta_file" ]]; then
+        if _require_owned_or_warn "$domain" "$meta_file"; then
+            read_kv_file "$meta_file" ISOLATED_FPM
+        else
+            warn "Güvenlik: ${meta_file} root-owned değil (tamper) — ISOLATED_FPM override YOK SAYILIYOR, global değer kullanılıyor"
+        fi
+    fi
+    if [[ -n "$ISOLATED_FPM" ]] && validate_bool "$ISOLATED_FPM"; then
+        echo "$ISOLATED_FPM"
+    else
+        [[ -n "$ISOLATED_FPM" ]] && warn "Geçersiz ISOLATED_FPM meta değeri (${domain}): '${ISOLATED_FPM}' — global değer (${DOMAIN_ISOLATED_FPM}) kullanılıyor"
+        echo "${DOMAIN_ISOLATED_FPM}"
+    fi
+}
+
+# ─── Per-domain FPM izolasyonuna OTOMATİK GEÇİŞ (Faz 2/T7a — Seçenek C) ───
+# 'domain add' sonunda çağrılır. Migrasyon mantığı BURADA KOPYALANMAZ:
+# lib/security.sh:_harden_fpm_apply zaten fail-closed davranışı sağlıyor
+# (eski paylaşılan pool'u yedekler, yeni unit aktifleşmezse GERİ YÜKLER —
+# bkz. o fonksiyonun başlık yorumu). '_load_and_run' (bin/srvctl) YALNIZ
+# dispatch edilen TEK modülü source ettiğinden (bkz. CLAUDE.md) burada
+# AÇIKÇA + GUARD'LI 'source' edilir — eksik/bozuk security.sh domain add'i
+# ÖLDÜRMEMELİ, yalnız izolasyonu atlayıp uyarmalı.
+# KRİTİK SÖZLEŞME: bu fonksiyon HİÇBİR KOŞULDA 'error' ile exit ETMEZ —
+# dönüş değeri her zaman 0'dır; migrasyon başarısızlığı 'domain add'in
+# genel başarısını ASLA etkilemez (çağıran taraf bu invariantı 'trap - EXIT'
+# SONRASI çağırarak da garanti eder — bkz. _domain_add).
+_domain_migrate_to_isolated_fpm() {
+    local domain="$1"
+    local effective; effective=$(_domain_isolated_fpm_effective "$domain")
+    [[ "$effective" == "true" ]] || return 0
+
+    # shellcheck disable=SC1091
+    source "${SRVCTL_ROOT}/lib/security.sh" 2>/dev/null || {
+        warn "lib/security.sh yüklenemedi — per-domain FPM izolasyonu ATLANDI (${domain}). Elle deneyin: srvctl security harden-fpm ${domain} --apply"
+        return 0
+    }
+    if ! declare -F _harden_fpm_apply >/dev/null 2>&1; then
+        warn "_harden_fpm_apply bulunamadı — per-domain FPM izolasyonu ATLANDI (${domain})"
+        return 0
+    fi
+
+    info "Per-domain FPM izolasyonuna geçiliyor (DOMAIN_ISOLATED_FPM=true)..."
+    if _harden_fpm_apply "$domain"; then
+        success "Domain per-domain FPM unit'e taşındı: srvctl-fpm-$(safe_name "$domain")"
+    else
+        warn "Per-domain FPM izolasyonu BAŞARISIZ — domain PAYLAŞILAN pool'da çalışmaya devam ediyor: ${domain}"
+        warn "Elle deneyin: srvctl security harden-fpm ${domain} --apply"
+    fi
+    return 0
+}
+
+# ─── Kapasite planlayıcı (100 domain hedefi) ───
+# 'domain add' ÖNCESİ toplam taahhüdü fiziksel RAM ile karşılaştırır ve
+# aşarsa UYARIR — ENGELLEMEZ (overcommit meşru bir operatör tercihidir,
+# cgroups zaten MemoryMax ile HER domaini ayrı ayrı sınırlar) ama SESSİZ
+# KALMAZ. Ölçülen gerçek sabit (bkz. rapor — Ubuntu 24.04 gerçek VM):
+# DOMAIN_ISOLATED_FPM=true iken her per-domain FPM master'ı ~35 MB KALICI
+# RSS ekler — bu, cgroups MemoryMax'ten (worker havuzunun TEPE talebi)
+# BAĞIMSIZ, master sürecinin KENDİ sabit yüküdür.
+_SRVCTL_FPM_MASTER_RSS_MB=35
+
+_domain_capacity_check() {
+    local new_profile="$1"
+
+    # Test-seam: _domain_resources'taki SRVCTL_SYSTEMD_DIR ile aynı desen.
+    # Yol sabitken eşik/uyarı mantığı YALNIZ gerçek Linux'ta test edilebiliyordu
+    # (macOS'ta fonksiyon erken return 0 yapıp sessizce atlanıyordu). Üretimde
+    # davranış değişmez — varsayılan hâlâ /proc/meminfo.
+    local meminfo="${SRVCTL_MEMINFO:-/proc/meminfo}"
+    [[ -r "$meminfo" ]] || return 0
+    local mem_total_kb
+    mem_total_kb=$(grep -m1 '^MemTotal:' "$meminfo" 2>/dev/null | awk '{print $2}')
+    validate_uint "${mem_total_kb:-}" || return 0
+    local mem_total_mb=$(( mem_total_kb / 1024 ))
+
+    resource_profile_load "$new_profile"
+    local total_commit_mb=$RES_MEMORY_MAX_MB
+    local domain_count=1
+    local d prof
+    while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        prof=$(_domain_capacity_read_profile "$d")
+        resource_profile_load "$prof"
+        total_commit_mb=$(( total_commit_mb + RES_MEMORY_MAX_MB ))
+        domain_count=$(( domain_count + 1 ))
+    done < <(list_all_domains)
+
+    # Per-domain FPM master RSS'i yalnız izolasyon fiilen AÇIKSA kalıcı ek yüktür.
+    local master_overhead_mb=0
+    if [[ "${DOMAIN_ISOLATED_FPM}" == "true" ]]; then
+        master_overhead_mb=$(( domain_count * _SRVCTL_FPM_MASTER_RSS_MB ))
+    fi
+    local grand_total_mb=$(( total_commit_mb + master_overhead_mb ))
+
+    if (( grand_total_mb > mem_total_mb )); then
+        warn "Kapasite uyarısı: bu ekleme dahil ${domain_count} domain, profil bazlı MemoryMax taahhüdü ~${total_commit_mb}MB"
+        if [[ "${DOMAIN_ISOLATED_FPM}" == "true" ]]; then
+            warn "  + per-domain FPM master kalıcı yükü: ${domain_count} × ${_SRVCTL_FPM_MASTER_RSS_MB}MB ≈ ${master_overhead_mb}MB"
+        fi
+        warn "  Toplam taahhüt ~${grand_total_mb}MB, fiziksel RAM ${mem_total_mb}MB'yi AŞIYOR (overcommit)"
+        warn "  Öneri: bu domain için daha düşük profil (--resources=micro|standard) seçin ya da RAM artırın"
+    else
+        info "Kapasite: ${domain_count} domain, taahhüt ~${grand_total_mb}MB / fiziksel RAM ${mem_total_mb}MB"
+    fi
+}
+
 # ─── Render sonrası leftover-token guard'ı (DALGA 5 — BLOKE EDİCİ kapanışı) ───
 # render_template (core.sh) beslenmeyen bir token'ı SESSİZCE atlar ve literal
 # '{{TOKEN}}' metnini ÇIKTIDA BIRAKIR (hata YOK) — bu sınıf boşluk bu
@@ -570,13 +759,30 @@ _domain_render_fpm_unit() {
     mkdir -p "$fpm_dir" "$sysd_dir"
     local fpm_conf="${fpm_dir}/${sname}.conf"
     local unit_file="${sysd_dir}/srvctl-fpm-${sname}.service"
+
+    # ─── Kaynak profili (GÖREV 2 — ops-infra sözleşmesi) ───
+    # Domain'in KENDİ meta beyanından (RESOURCE_PROFILE) okunur — harden-fpm
+    # migrasyonu 'domain add' anındaki '--resources=' seçimini KORUMALI,
+    # sessizce 'standard'a düşürmemeli. PM_MODE/PM_MAX_CHILDREN/
+    # PM_START_SERVERS/PM_MIN_SPARE_SERVERS/PM_MAX_SPARE_SERVERS/
+    # MEMORY_LIMIT token adları pool.conf.tpl'nin kendi TOKENS beyanıyla
+    # (ops-infra) BİREBİR eşleşir. pm.process_idle_timeout TOKEN DEĞİL —
+    # pool.conf.tpl içine sabit '10s' olarak gömülü, buradan BESLENMEZ.
+    local resource_profile; resource_profile=$(_domain_read_resource_profile "$domain")
+    resource_profile_load "$resource_profile"
+
     # config = [global] + pool (pool.conf.tpl TEK kaynak, kopyalanmaz)
     {
         render_template "${SRVCTL_TEMPLATES}/php-fpm/fpm-global.conf.tpl" \
             "DOMAIN=${domain}" "SAFE_NAME=${sname}" "WEB_ROOT=${WEB_ROOT}"
         render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
             "DOMAIN=${domain}" "SAFE_NAME=${sname}" "WEB_ROOT=${WEB_ROOT}" \
-            "PHP_VERSION=${php_version}" "WEB_USER=${web_user}"
+            "PHP_VERSION=${php_version}" "WEB_USER=${web_user}" \
+            "PM_MODE=${RES_PM_MODE}" "PM_MAX_CHILDREN=${RES_MAX_CHILDREN}" \
+            "PM_START_SERVERS=${RES_PM_START_SERVERS}" \
+            "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
+            "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
+            "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M"
     } > "$fpm_conf"
     _domain_assert_no_leftover_tokens "$fpm_conf"
     render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-fpm.service.tpl" \
@@ -914,27 +1120,16 @@ ENVEOF
 # var mı" sorusu değil, çalışma zamanı semantiği olduğundan yetenekle tespit
 # edilemiyor — sürüm okuması burada meşru istisnadır.
 
-# Redis sunucu MAJOR sürümünü tespit eder. Önce 'redis-server --version'
-# (host'ta paket kuruluysa her zaman mevcuttur, auth gerekmez), yoksa
-# 'redis-cli INFO server' düşer (parola argv'ye değil REDISCLI_AUTH env'e
-# gider — çağıran taraf gerekirse onu set etmeli). Belirlenemezse 1 döner
-# (stdout boş) — çağıran fail-closed davranmalı.
-_redis_major_version() {
-    local out
-    if command -v redis-server >/dev/null 2>&1; then
-        out=$(redis-server --version 2>/dev/null)
-        if [[ "$out" =~ v=([0-9]+)\. ]]; then
-            echo "${BASH_REMATCH[1]}"
-            return 0
-        fi
-    fi
-    out=$(redis-cli INFO server 2>/dev/null | grep -m1 '^redis_version:')
-    if [[ "$out" =~ redis_version:([0-9]+)\. ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
-    fi
-    return 1
-}
+# NOT (kapsam genişletmesi): '_redis_version_pair' ve '_redis_major_version'
+# (redis-server/redis-cli sürüm tespiti) artık BURADA DEĞİL, lib/core.sh'ta
+# tanımlı. Neden: lib/init.sh (sunucu-geneli admin/default Redis ACL
+# kullanıcıları, bkz. _install_redis) de AYNI sürüm tespitine ihtiyaç
+# duyuyor ve '_load_and_run' (bin/srvctl) YALNIZ dispatch edilen TEK modülü
+# source ettiğinden domain.sh'ta kalsalardı init.sh'tan çağrısı "command not
+# found" (127) verirdi — resource_profile_*/rate_profile_* İLE AYNI gerekçeyle
+# core.sh (her modülde her zaman mevcut) doğru ev. domain.sh BURADAN sonra
+# bu iki fonksiyonu core.sh'un genel sözleşmesinden (her zaman ilk source
+# edilir) KULLANMAYA DEVAM EDER; çağrı yerleri DEĞİŞMEDİ.
 
 # Saf karar fonksiyonu (macOS'ta argüman enjeksiyonuyla unit-test edilebilir,
 # gerçek redis-server gerekmez): major sürüm girdisine göre ACL scripting
@@ -953,14 +1148,35 @@ _domain_redis_scripting_mode() {
     fi
 }
 
+# NOT (kapsam genişletmesi): 'Redis kanal (pub/sub) izolasyonu ACL kararı'
+# saf fonksiyonu da ('_domain_redis_channel_isolation_mode' idi) artık BURADA
+# DEĞİL, lib/core.sh'ta '_redis_channel_isolation_mode(major, minor)' adıyla
+# tanımlı — aynı çapraz-modül gerekçesi (lib/init.sh:_install_redis, sunucu-
+# geneli admin/default ACL kullanıcıları için AYNI karara ihtiyaç duyuyor).
+# Kaynak referanslı GEREKÇE (Redis 6.2.0'da eklenen 'resetchannels'/
+# '&pattern'/'allchannels' token'larının 6.0.x'te parser'da HİÇ TANIMLI
+# olmaması, ACL "Syntax error"ı ve Ubuntu 22.04=6.0.16 / 24.04=7.0.15 paket
+# eşlemesi) core.sh'taki tanımın başlık yorumunda BİREBİR KORUNDU.
+
 # Redis ACL kullanıcı satırını üretir — TEK KAYNAK: hem _domain_add hem
 # _domain_repair bunu çağırır, ACL mantığının iki yerde ayrışması/birbirinden
 # kopması riski kalmaz. Saf string üretici — redis-cli/redis-server ÇAĞIRMAZ,
 # dosya YAZMAZ, macOS'ta unit-test edilebilir.
+# 5. argüman (channel_status) OPSİYONELDİR, varsayılan 'unsupported' —
+# verilmezse/tanınmazsa FAIL-CLOSED (kanal token'ları eklenmez); yalnız tam
+# olarak 'supported' değeriyle 'resetchannels &<sname>:*' satıra eklenir.
+# Değer core.sh:_redis_channel_isolation_mode'dan gelir (bkz. yukarıdaki not).
+# Redis 6.0'da bu token'lar sözdizimi hatasına yol açtığından (yukarıdaki
+# gerekçe) burada KOŞULSUZ eklemek YERİNE sürüm bilgisine bağlanmıştır.
 _domain_build_redis_acl_line() {
     local redis_user="$1" redis_pass="$2" sname="$3" scripting_flag="$4"
-    printf 'user %s on >%s ~%s:* resetchannels &%s:* +@all -@dangerous %s +INFO -CONFIG -DEBUG -KEYS -SCAN -RANDOMKEY -FLUSHALL -FLUSHDB -SHUTDOWN' \
-        "$redis_user" "$redis_pass" "$sname" "$sname" "$scripting_flag"
+    local channel_status="${5:-unsupported}"
+    local line="user ${redis_user} on >${redis_pass} ~${sname}:*"
+    if [[ "$channel_status" == "supported" ]]; then
+        line+=" resetchannels &${sname}:*"
+    fi
+    line+=" +@all -@dangerous ${scripting_flag} +INFO -CONFIG -DEBUG -KEYS -SCAN -RANDOMKEY -FLUSHALL -FLUSHDB -SHUTDOWN"
+    printf '%s' "$line"
 }
 
 # Domain'in Redis EVAL/Lua (scripting) durumunu (.srvctl-meta) BEYAZ LİSTEDEN
@@ -987,6 +1203,28 @@ _domain_read_redis_scripting_status() {
     esac
 }
 
+# Domain'in Redis pub/sub KANAL İZOLASYONU durumunu (.srvctl-meta) BEYAZ
+# LİSTEDEN geçirerek okur — desen _domain_read_redis_scripting_status ile
+# birebir aynıdır (aynı gerekçe: core.sh'un read_meta'sı bu anahtarı
+# tanımıyor). 'unknown': meta hiç yazılmamış (eski domain — 'srvctl domain
+# repair' ile yazılır) ya da değer whitelist dışı.
+_domain_read_redis_channel_status() {
+    local domain="$1"
+    local meta_file="${WEB_ROOT}/${domain}/.srvctl-meta"
+    local REDIS_CHANNEL_ISOLATION=""
+    if [[ -f "$meta_file" ]]; then
+        if _require_owned_or_warn "$domain" "$meta_file"; then
+            read_kv_file "$meta_file" REDIS_CHANNEL_ISOLATION
+        else
+            error "Güvenlik: ${meta_file} root-owned değil (tamper). Okuma reddedildi."
+        fi
+    fi
+    case "${REDIS_CHANNEL_ISOLATION:-}" in
+        supported|unsupported) echo "$REDIS_CHANNEL_ISOLATION" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
 # ═══════════════════════════════════════════════
 #  DOMAIN ADD — 10 adımda tam güvenlikli domain
 # ═══════════════════════════════════════════════
@@ -1008,6 +1246,10 @@ _domain_add() {
     # belirlenir — otomatik tespit YOK. Belirtilmezse 'ci4' (mevcut dizin
     # yapısı zaten CI4 varsayımlıydı — geriye uyumlu varsayılan).
     local framework="ci4"
+    # GÖREV 2: kaynak (cgroups/FPM pool) profili — resource_profile_load
+    # deseninin CLI kapısı (rate_profile ile AYNI YUMUŞAK desen: tanınmayan
+    # değer sessizce 'standard'a düşer + warn, hard error DEĞİL).
+    local resource_profile="standard"
 
     # Argümanları parse et
     for arg in "$@"; do
@@ -1016,17 +1258,19 @@ _domain_add() {
             --rate=*)      rate_profile="${arg#--rate=}" ;;
             --sensitive=*) sensitive_paths="${arg#--sensitive=}" ;;
             --framework=*) framework="${arg#--framework=}" ;;
+            --resources=*) resource_profile="${arg#--resources=}" ;;
             --no-ssl)      do_ssl=false ;;
             -*) warn "Bilinmeyen seçenek: ${arg}" ;;
             *) domain="$arg" ;;
         esac
     done
 
-    [[ -z "$domain" ]] && error "Domain belirtilmedi. Kullanım: srvctl domain add example.com [--php=8.3] [--rate=standard] [--framework=ci4|laravel|symfony]"
+    [[ -z "$domain" ]] && error "Domain belirtilmedi. Kullanım: srvctl domain add example.com [--php=8.3] [--rate=standard] [--framework=ci4|laravel|symfony] [--resources=micro|standard|ecommerce|heavy]"
     _domain_add_validate_gate "$domain" || error "Geçersiz domain adı: ${domain}"
     domain_exists "$domain" && error "Domain zaten mevcut: ${domain}"
     php_version_exists "$php_version" || error "PHP ${php_version} kurulu değil. Önce kurun."
     rate_profile="$(rate_profile_resolve "$rate_profile")"
+    resource_profile="$(resource_profile_resolve "$resource_profile")"
     # --framework BEYAZ LİSTE: CLI girdisi (meta'dan farklı olarak) doğrudan
     # kullanıcı tarafından verilir ama yine de serbest bırakılmaz — geçersiz
     # değer sessizce 'ci4'e düşmez, açıkça reddedilir (kullanıcı hatası erken yakalanır).
@@ -1067,6 +1311,9 @@ _domain_add() {
     fi
     local _cert_preexisted=0
     [[ -d "/etc/letsencrypt/live/${domain}" ]] && _cert_preexisted=1
+
+    # ─── GÖREV 3: kapasite planlayıcı — ENGELLEMEZ, sadece uyarır ───
+    _domain_capacity_check "$resource_profile"
 
     header "Yeni Domain: ${domain}"
 
@@ -1227,14 +1474,22 @@ _domain_add() {
 
     # ─── 4. PHP-FPM Pool (chroot) ───
     current=$((current + 1))
-    step "${current}/${total}" "PHP-FPM pool (chroot jail)..."
+    step "${current}/${total}" "PHP-FPM pool (chroot jail, kaynak profili: ${resource_profile})..."
 
+    # GÖREV 2: kaynak profili buradan itibaren PM_* token'larını besler
+    # (RES_* değişkenleri resource_profile_load ile doldu — bkz. yukarısı).
+    resource_profile_load "$resource_profile"
     render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
         "SAFE_NAME=${sname}" \
         "DOMAIN=${domain}" \
         "WEB_USER=${web_user}" \
         "WEB_ROOT=${WEB_ROOT}" \
         "PHP_VERSION=${php_version}" \
+        "PM_MODE=${RES_PM_MODE}" "PM_MAX_CHILDREN=${RES_MAX_CHILDREN}" \
+        "PM_START_SERVERS=${RES_PM_START_SERVERS}" \
+        "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
+        "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
+        "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
         > "/etc/php/${php_version}/fpm/pool.d/${sname}.conf"
 
     systemctl reload "php${php_version}-fpm" 2>/dev/null || \
@@ -1248,6 +1503,12 @@ _domain_add() {
     write_meta "$domain" "RATE_PROFILE" "$rate_profile"
     write_meta "$domain" "SENSITIVE_PATHS" "$sensitive_paths"
     write_meta "$domain" "FRAMEWORK" "$framework"
+    # GÖREV 2: RESOURCE_PROFILE zaten resource_profile_resolve ile whitelist'ten
+    # geçirildi — write_meta'ya doğrulanmamış ham CLI girdisi ASLA gitmez.
+    # RAPOR: lib/security.sh:_meta_known_keys whitelist'ine RESOURCE_PROFILE
+    # eklenmesi gerekir (o dosya bu görevin kapsamı dışında) — aksi halde
+    # 'harden-fs --apply' bu satırı SESSİZCE atar (bkz. _meta_rewrite_whitelist).
+    write_meta "$domain" "RESOURCE_PROFILE" "$resource_profile"
 
     _domain_write_vhost "$domain" "$php_version" "$rate_profile" http
 
@@ -1357,10 +1618,14 @@ SQL
     # 1) '&*' → 'resetchannels &${sname}:*': eski satır TÜM pub/sub kanallarına
     #    izin veriyordu; domain A, domain B'nin Laravel broadcasting/Horizon/
     #    queue event kanallarına SUBSCRIBE/PUBLISH yapabiliyordu (domainler
-    #    arası veri sızıntısı + mesaj enjeksiyonu). 'resetchannels', Redis
-    #    sürümüne göre değişen 'acl-pubsub-default' varsayılanından (6.x'te
-    #    allchannels, 7.x'te resetchannels) bağımsız olarak kanalları önce
-    #    sıfırlayıp yalnız kendi prefix'ini ekler.
+    #    arası veri sızıntısı + mesaj enjeksiyonu). 'resetchannels', kanalları
+    #    önce sıfırlayıp yalnız kendi prefix'ini ekler — AMA bu iki token
+    #    SÜRÜM KOŞULLUDUR (bkz. core.sh:_redis_channel_isolation_mode üstündeki
+    #    kaynak referanslı gerekçe): Redis 6.2.0'da eklendi, 6.0.x'in kendi
+    #    parser'ında (src/acl.c) HİÇ TANIMLI DEĞİL — koşulsuz eklenirse ACL
+    #    dosyası "Syntax error" ile REDDEDİLİR ve Redis HİÇ BAŞLAMAZ (Ubuntu
+    #    22.04 = redis-server 6.0.16'da gerçek VM'de gözlemlendi). Redis <6.2
+    #    ya da sürüm belirlenemezse token'lar ATLANIR + operatör UYARILIR.
     # 2) scripting: SÜRÜM KOŞULLU (bkz. _domain_redis_scripting_mode üstündeki
     #    ayrıntılı gerekçe) — Redis 7+'ta '+@scripting' (script içi ACL
     #    enforcement garantili, Laravel queue/Horizon çalışır), <7'de veya
@@ -1373,12 +1638,13 @@ SQL
     #    metrik/monitoring ekranını kırardı. INFO yalnız sunucu-geneli agregat
     #    istatistik döndürür (başka domainin key adı/değerini sızdırmaz), bu
     #    yüzden geri açıldı — Horizon dashboard'u çalışmaya devam eder.
-    local redis_major scripting_flag scripting_status
-    redis_major=$(_redis_major_version) || redis_major=""
+    local redis_major="" redis_minor="" scripting_flag scripting_status channel_status
+    read -r redis_major redis_minor <<< "$(_redis_version_pair)"
     read -r scripting_flag scripting_status <<< "$(_domain_redis_scripting_mode "$redis_major")"
+    channel_status=$(_redis_channel_isolation_mode "$redis_major" "$redis_minor")
 
     local acl_line
-    acl_line=$(_domain_build_redis_acl_line "$redis_user" "$redis_pass" "$sname" "$scripting_flag")
+    acl_line=$(_domain_build_redis_acl_line "$redis_user" "$redis_pass" "$sname" "$scripting_flag" "$channel_status")
     echo "$acl_line" >> /etc/redis/users.acl
 
     # ACL'i yeniden yükle
@@ -1410,6 +1676,22 @@ SQL
             ;;
     esac
 
+    # Kanal (pub/sub) izolasyon durumunu meta'ya yaz ve desteklenmiyorsa/
+    # belirsizse operatörü AÇIKÇA uyar — sessiz izolasyonsuzluk YOK: operatör
+    # komşu kiracıların pub/sub kanallarını görebildiğini bilmeli.
+    write_meta "$domain" "REDIS_CHANNEL_ISOLATION" "$channel_status"
+    case "$channel_status" in
+        supported)
+            success "Redis ACL: ${redis_user} → kanal izolasyonu AÇIK (Redis ${redis_major}.${redis_minor} ≥ 6.2, yalnız ${sname}:* kanalları)"
+            ;;
+        unsupported)
+            warn "Redis ${redis_major}.${redis_minor} tespit edildi (6.2 altı) — pub/sub KANAL izolasyonu ACL ile YAPILAMIYOR: bu domain diğer domainlerin pub/sub kanallarını görebilir/yayın yapabilir. İzolasyon için Redis'i 6.2+'a yükseltin ya da domain başına ayrı Redis instance'ı kullanın."
+            ;;
+        *)
+            warn "Redis sürümü tespit edilemedi — fail-closed: pub/sub KANAL izolasyon token'ları ACL'e EKLENMEDİ (izolasyonsuz ama çalışan Redis, hiç başlamayan Redis'e tercih edildi). 'redis-cli ACL GETUSER ${redis_user}' ile doğrulayın."
+            ;;
+    esac
+
     # ─── 10. Logrotate ───
     current=$((current + 1))
     step "${current}/${total}" "Logrotate yapılandırılıyor..."
@@ -1423,7 +1705,7 @@ SQL
 
     success "Logrotate aktif"
     # ─── 11. cgroups slice + seccomp (Faz 1) ───
-    _apply_cgroups_slice "${domain}" "${sname}"
+    _apply_cgroups_slice "${domain}" "${sname}" "${resource_profile}"
     _apply_seccomp_hardening "${php_version}"
     success "cgroups slice + seccomp uygulandı"
 
@@ -1454,6 +1736,13 @@ INDEXPHP
     trap - EXIT INT TERM
     _DOMAIN_ADD_ROLLBACK_DONE=1
     unset -f _domain_add_rollback 2>/dev/null || true
+
+    # ─── GÖREV 1: per-domain FPM izolasyonuna otomatik geçiş (Seçenek C) ───
+    # Trap TEMİZLENDİKTEN SONRA çağrılır: domain bu noktada zaten TAM
+    # kurulu ve çalışır durumda (paylaşılan pool üzerinde) — migrasyon
+    # başarısız olsa bile 'domain add' rollback'i TEKRAR TETİKLEMEZ ve
+    # BAŞARISIZ SAYILMAZ (bkz. _domain_migrate_to_isolated_fpm).
+    _domain_migrate_to_isolated_fpm "$domain"
 
     # ─── Sonuç ───
     header "✅ Domain başarıyla eklendi: ${domain}"
@@ -1783,6 +2072,22 @@ _domain_info() {
                 echo -e "  Redis Scripting: ${YELLOW}⚠️  bilinmiyor${NC} (henüz belirlenmedi — 'srvctl domain repair ${domain}' çalıştırın)"
                 ;;
         esac
+        # Kanal (pub/sub) izolasyon durumu — operatör komşu kiracıların
+        # pub/sub kanallarını neden görebildiğini (ya da göremediğini)
+        # buradan anlayabilir (bkz. core.sh:_redis_channel_isolation_mode).
+        local channel_status
+        channel_status=$(_domain_read_redis_channel_status "$domain")
+        case "$channel_status" in
+            supported)
+                echo -e "  Redis Kanal İzolasyonu: ${GREEN}✅ açık${NC} (Redis 6.2+ — yalnız ${sname}:* kanalları)"
+                ;;
+            unsupported)
+                echo -e "  Redis Kanal İzolasyonu: ${YELLOW}⚠️  yok${NC} (Redis <6.2 — pub/sub kanalları ACL ile kısıtlanamıyor, kiracılar birbirinin kanallarını görebilir; Redis 6.2+ ya da domain başına ayrı Redis instance gerekir)"
+                ;;
+            *)
+                echo -e "  Redis Kanal İzolasyonu: ${YELLOW}⚠️  bilinmiyor${NC} (henüz belirlenmedi — 'srvctl domain repair ${domain}' çalıştırın)"
+                ;;
+        esac
     else
         warn "Credentials dosyası bulunamadı: ${base}/.credentials"
     fi
@@ -1859,34 +2164,35 @@ _domain_info() {
 # ═══════════════════════════════════════════════════════════════
 
 # ───────────────────────────────────────────────────────────────
-#  TEK KAYNAK: cgroups slice bellek/görev limitleri formülü.
-#  pool.conf.tpl: pm.max_children=16, php_admin_value[memory_limit]=256M →
-#  teorik tepe talep = 16 * 256M = 4096M. MEMORY_HIGH bu tepe değere
-#  eşitlenir (throttle sınırı); MEMORY_MAX'a %12 pay eklenir (4096*1.12≈4587,
-#  4608M'e yuvarlandı) ki throttle ile hard OOM-kill arasında nefes payı
-#  olsun. Eski MemorySwapMax=0 grace VERMİYORDU — iki eşzamanlı ağır istek
-#  pool'u doğrudan OOM-kill ediyordu; 512M grace eklendi. TASKS_MAX 100→200
-#  (16 FPM worker + per-domain queue/scheduler süreçleri için pay, bkz.
-#  'domain worker'/'domain scheduler').
-#  NOT: Bu değerler conf/srvctl.conf'a TAŞINAMADI — lib/core.sh ve conf/
-#  bu modülün (lib/domain.sh) dosyası değil. pool.conf.tpl'deki
-#  pm.max_children/memory_limit değişirse BU FONKSİYON YENİDEN HESAPLANMALI
-#  (formülün TEK doğruluk kaynağı burasıdır — _domain_resources da bunu kullanır).
+#  ARTIK SABİT DEĞİL — profil tabanlı (GÖREV 2, kapasite planlama).
+#  TEK türetme kaynağı lib/core.sh:resource_profile_load'dur (conf/
+#  resource-profiles.conf sözleşmesi: profil:pm_mode:max_children:
+#  memory_limit_mb:tasks_max). Burada BAĞIMSIZ bir sabit/formül YOKTUR —
+#  eskiden "4096M 4608M 512M 200" hardcoded'dı ve pool.conf.tpl'nin
+#  hardcoded pm.max_children=16/memory_limit=256M değerleriyle ELLE
+#  senkronize tutuluyordu (bugünkü drift'in kök nedeni tam olarak buydu).
+#  Argüman: kaynak profili adı (ör. "ecommerce"); verilmezse/boşsa/tanınmaz
+#  ise resource_profile_load kendi içinde 'standard'a düşer.
+#  Çıktı: "MEM_HIGH MEM_MAX MEM_SWAP_MAX TASKS_MAX" (M sonekli, sabit sıra —
+#  eski çağıranlarla (_apply_cgroups_slice/_domain_resources) AYNI sözleşme).
 # ───────────────────────────────────────────────────────────────
 _domain_cgroups_defaults() {
-    # Çıktı: "MEM_HIGH MEM_MAX MEM_SWAP_MAX TASKS_MAX" (boşlukla ayrık, sabit sıra)
-    echo "4096M 4608M 512M 200"
+    local profile="${1:-standard}"
+    resource_profile_load "$profile"
+    echo "${RES_MEMORY_HIGH} ${RES_MEMORY_MAX} ${RES_MEMORY_SWAP} ${RES_TASKS_MAX}"
 }
 
 # ───────────────────────────────────────────────────────────────
 #  Helper: Per-domain cgroups v2 slice oluştur (Faz 1)
 #  systemd "srvctl-<sname>.slice" otomatik olarak srvctl.slice altına girer.
+#  3. argüman (profile) OPSİYONELDİR — verilmezse 'standard' (geriye uyumlu
+#  varsayılan; mevcut 2-argümanlı çağıranların davranışı değişmez).
 # ───────────────────────────────────────────────────────────────
 _apply_cgroups_slice() {
-    local domain="$1" sname="$2"
+    local domain="$1" sname="$2" profile="${3:-standard}"
     local slice_file="/etc/systemd/system/srvctl-${sname}.slice"
     local mem_high mem_max mem_swap tasks_max
-    read -r mem_high mem_max mem_swap tasks_max <<< "$(_domain_cgroups_defaults)"
+    read -r mem_high mem_max mem_swap tasks_max <<< "$(_domain_cgroups_defaults "$profile")"
 
     # Template varsa kullan, yoksa güvenli varsayılanlarla üret.
     if [[ -f "${SRVCTL_TEMPLATES}/cgroups/domain.slice.tpl" ]]; then
@@ -2197,8 +2503,11 @@ _domain_resources() {
     # sertleştirmeyi geri alıyordu). Artık _apply_cgroups_slice ile AYNI
     # template render edilir; yalnız verilen bayraklar üzerine yazılır, geri
     # kalan anahtarlar mevcut dosyadan (yoksa _domain_cgroups_defaults'tan) korunur.
+    # Varsayılan artık domain'in KENDİ kaynak profilinden (.srvctl-meta
+    # RESOURCE_PROFILE) gelir — sabit değil (GÖREV 2).
+    local resources_profile; resources_profile=$(_domain_read_resource_profile "$domain")
     local mem_high_def mem_max_def mem_swap_def tasks_def
-    read -r mem_high_def mem_max_def mem_swap_def tasks_def <<< "$(_domain_cgroups_defaults)"
+    read -r mem_high_def mem_max_def mem_swap_def tasks_def <<< "$(_domain_cgroups_defaults "$resources_profile")"
 
     local cur_mem_max cur_mem_high cur_swap cur_tasks cur_cpu cur_io
     cur_mem_max=$(grep -m1  '^MemoryMax='      "$slice_path" 2>/dev/null | cut -d= -f2)

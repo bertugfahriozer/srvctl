@@ -1,9 +1,15 @@
 # TOKENS: DOMAIN CPU_QUOTA MEMORY_MAX MEMORY_HIGH MEMORY_SWAP_MAX IO_WEIGHT
 #         IO_READ_MAX IO_WRITE_MAX TASKS_MAX
-# Besleyen: lib/domain.sh — _apply_cgroups_slice (satır ~1815, domain add
-# yolu) ve resource-güncelleme fonksiyonu (satır ~2148, 'domain resources'
-# komutu). IO_READ_MAX/IO_WRITE_MAX bilinçli olarak BOŞ string ile beslenir
-# (device path olmadan IOReadBandwidthMax= geçersiz olur) — render SONRASI
+# Besleyen: lib/domain.sh — _apply_cgroups_slice (satır ~1885, domain add
+# yolu) ve resource-güncelleme fonksiyonu (satır ~2199, 'domain resources'
+# komutu). İkisi de bugün SABİT '_domain_cgroups_defaults()' çıktısını
+# (4096M/4608M/512M/200) kullanıyor — DALGA 5 (100-domain e-ticaret ölçeği)
+# bunu conf/resource-profiles.conf'tan profil-türetilmiş değerlere taşımayı
+# gerektiriyor (bkz. o dosyanın başlık yorumu ve MEMORY_HIGH/MEMORY_MAX/
+# MEMORY_SWAP_MAX formülleri altta); '_domain_cgroups_defaults' bir PROFİL
+# argümanı almalı (henüz yapılmadı — bkz. ops-infra raporu). IO_READ_MAX/
+# IO_WRITE_MAX bilinçli olarak BOŞ string ile beslenir (device path olmadan
+# IOReadBandwidthMax= geçersiz olur) — render SONRASI
 # 'grep -vE IO(Read|Write)BandwidthMax=\s*$' ile bu boş satırlar temizlenir;
 # yani bu iki token her zaman render_template'e verilir ama çıktı dosyasında
 # GÖRÜNMEYEBİLİR (bu kasıtlıdır, eksik besleme değildir).
@@ -18,15 +24,20 @@ CPUQuota={{CPU_QUOTA}}
 CPUWeight=100
 
 # ─── Bellek Limitleri ───
-# NOT (Faz 1 bulgusu): pool.conf.tpl pm.max_children=16 x memory_limit=256M
-# ile teorik tepe talep 4096M'dir; MemoryMax bunun ALTINDAYSA swap grace'i
-# olmadan (MemorySwapMax=0) iki eşzamanlı ağır istek OOM-kill'e yol açar.
-# MEMORY_MAX/MEMORY_HIGH değerlerini bu çarpımla TUTARLI seçin (bkz. rapor:
-# "cgroups slice limitleri" önerisi). MemorySwapMax artık TOKEN'laştırıldı —
-# 0 yerine küçük bir grace payı (ör. 256M) önerilir; render_template bu
-# değeri BOŞ bırakmaz, çağıran KEY=value ile MEMORY_SWAP_MAX sağlamalıdır
-# (aksi halde render edilen dosyada literal '{{MEMORY_SWAP_MAX}}' kalır ve
-# systemd unit'i bozuk değerle reddedebilir).
+# TEK KAYNAK artık conf/resource-profiles.conf (pm_mode:max_children:
+# memory_limit_mb:tasks_max) — pool.conf.tpl'deki pm.max_children/
+# memory_limit ile BURADAKİ MemoryHigh/MemoryMax AYNI profil satırından
+# türediği için ARTIK YAPISAL OLARAK senkron kalır (iki ayrı elle-senkron
+# sabit yerine): MemoryHigh = max_children × memory_limit_mb; MemoryMax =
+# round(MemoryHigh × 1.125) (%12,5 OOM payı); MemorySwapMax =
+# max(256, round(MemoryHigh × 0.125)) (0 DEĞİL — MemorySwapMax=0 iken iki
+# eşzamanlı ağır istek OOM-kill'e yol açtığı DOĞRULANMIŞTI). Bu üçü
+# BAŞKA HİÇBİR YERDE SAKLANMAZ, besleyen fonksiyon her çağrıda yeniden
+# hesaplamalı — sabit sayı gömersen drift kaçınılmaz geri gelir.
+# render_template bu değerleri BOŞ bırakmaz, çağıran KEY=value ile
+# MEMORY_MAX/MEMORY_HIGH/MEMORY_SWAP_MAX sağlamalıdır (aksi halde render
+# edilen dosyada literal '{{...}}' kalır ve systemd unit'i reddedebilir —
+# bkz. lib/domain.sh:_domain_assert_no_leftover_tokens).
 MemoryMax={{MEMORY_MAX}}
 MemoryHigh={{MEMORY_HIGH}}
 MemorySwapMax={{MEMORY_SWAP_MAX}}

@@ -8,6 +8,7 @@ cd "$REPO_ROOT"
 
 # Saf yardımcılar repo içindeki conf/template'leri kullansın
 export SRVCTL_RATE_PROFILES="${REPO_ROOT}/conf/rate-profiles.conf"
+export SRVCTL_RESOURCE_PROFILES="${REPO_ROOT}/conf/resource-profiles.conf"
 
 total_fail=0
 for tf in tests/test_*.sh; do

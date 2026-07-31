@@ -1,7 +1,17 @@
-; TOKENS: SAFE_NAME DOMAIN WEB_USER WEB_ROOT PHP_VERSION
-; Besleyen: lib/domain.sh — _domain_render_fpm_unit (satır ~518),
-; _domain_repair (satır ~190) ve domain add akışının pool render'ı
-; (satır ~1227) — üçü de aynı 5 token'ı verir.
+; TOKENS: SAFE_NAME DOMAIN WEB_USER WEB_ROOT PHP_VERSION PM_MODE
+;         PM_MAX_CHILDREN PM_START_SERVERS PM_MIN_SPARE_SERVERS
+;         PM_MAX_SPARE_SERVERS MEMORY_LIMIT
+; Besleyen: lib/domain.sh — _domain_render_fpm_unit, _domain_repair ve
+; domain add akışının pool render'ı (üç çağrı noktası). GÖREV 2 sözleşmesi
+; (ops-infra ↔ bash-developer, KESİNLEŞTİ — bkz. lib/domain.sh
+; _domain_render_fpm_unit başlık yorumu): PM_MODE=RES_PM_MODE,
+; PM_MAX_CHILDREN=RES_MAX_CHILDREN, MEMORY_LIMIT=RES_MEMORY_LIMIT_MB+'M',
+; PM_START_SERVERS/PM_MIN_SPARE_SERVERS/PM_MAX_SPARE_SERVERS=RES_PM_*
+; (max_children'dan formülle, resource_profile_load/core.sh içinde
+; türetilir). pm.process_idle_timeout BİLİNÇLİ OLARAK token DEĞİL — sabit
+; '10s' aşağıda gömülü (yalnız pm=ondemand'ta anlamlı, profile göre
+; değişmiyor); resource_profile_load bunun için bir RES_* değişken
+; ÜRETMEMELİDİR/BESLEMEMELİDİR.
 [{{SAFE_NAME}}]
 ; ═══════════════════════════════════════════════
 ;  PHP-FPM Pool: {{DOMAIN}}
@@ -17,12 +27,37 @@ listen.group = www-data
 listen.mode = 0660
 
 ; ─── Process Yönetimi ───
-pm = ondemand
-pm.max_children = 16
-pm.start_servers = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 4
+; DALGA 5 (100-domain e-ticaret ölçeği): pm/max_children/memory_limit artık
+; SABİT DEĞİL — conf/resource-profiles.conf'taki profilden TÜRETİLİR (bkz. o
+; dosyanın başlık yorumu — micro/standard/ecommerce/heavy). 'dynamic' modu
+; pm.start_servers/min_spare_servers/max_spare_servers'ı ZORUNLU kılar,
+; 'ondemand' bunları YOK SAYAR (php-fpm hata VERMEZ); ondemand ise
+; pm.process_idle_timeout kullanır, 'dynamic' bunu yok sayar. render_template
+; koşullu blok ÜRETEMEZ ve çok satırlı token DEĞERİNİ zaten REDDEDER
+; (CRLF/config-enjeksiyon koruması, core.sh) — bu yüzden EN BASİT VE GÜVENLİ
+; çözüm: HER İKİ modun anahtarlarını HER ZAMAN, KOŞULSUZ basmak. Bu, Ubuntu
+; 22.04/php8.1 VE 24.04/php8.3'te GERÇEK 'php-fpm -t' ile doğrulandı: pm=
+; ondemand + dynamic-only anahtarlar birlikte VE pm=dynamic + ondemand-only
+; process_idle_timeout birlikte, HER İKİSİ DE exit=0, uyarı YOK (Docker,
+; bkz. rapor). start_servers/min_spare/max_spare BU DOSYADA SAKLANMAZ;
+; besleyen fonksiyon max_children'dan TEK bir monoton formülle türetir
+; (min ≤ start ≤ max ≤ max_children — php-fpm'in 'dynamic' doğrulaması TAM
+; BUNU ister, sağlanmazsa 'status=78/CONFIG' ile başlangıçta ölür). GERÇEK
+; KAYNAK lib/core.sh:resource_profile_load'dur (tamsayı bölme + clamp):
+;   min_spare_servers = max(1, max_children / 8)
+;   start_servers      = max(1, max_children / 4)
+;   max_spare_servers  = clamp(max_children / 2, start_servers, max_children)
+; ör. ecommerce (max_children=16) → min=2 start=4 max=8; heavy (32) →
+; min=4 start=8 max=16.
+pm = {{PM_MODE}}
+pm.max_children = {{PM_MAX_CHILDREN}}
+pm.start_servers = {{PM_START_SERVERS}}
+pm.min_spare_servers = {{PM_MIN_SPARE_SERVERS}}
+pm.max_spare_servers = {{PM_MAX_SPARE_SERVERS}}
 pm.max_requests = 1000
+; process_idle_timeout SABİT (token değil, lib/core.sh yorumuyla uyumlu) —
+; yalnız pm=ondemand'ta anlamlı, 'dynamic'te yok sayılır (zararsız — gerçek
+; 'php-fpm -t' ile Ubuntu 22.04/php8.1 VE 24.04/php8.3'te doğrulandı).
 pm.process_idle_timeout = 10s
 
 ; ─── CHROOT JAİL (EN KRİTİK GÜVENLİK KATMANI) ───
@@ -71,7 +106,18 @@ php_admin_value[session.name] = __Secure_SID
 php_admin_value[session.gc_maxlifetime] = 3600
 
 ; ─── Kaynak Limitleri ───
-php_admin_value[memory_limit] = 256M
+; memory_limit artık profil-türetilmiş (bkz. yukarı 'Process Yönetimi').
+; max_execution_time/max_input_time/upload limitleri BİLİNÇLİ OLARAK sabit
+; kaldı — "uzun istekler" ekseni bu turda kapsam dışı (bkz. rapor: mevcut
+; conf/resource-profiles.conf sözleşmesi yalnız pm_mode/max_children/
+; memory_limit_mb/tasks_max alanlarını kapsıyor, genişletmedik).
+php_admin_value[memory_limit] = {{MEMORY_LIMIT}}
+; ↑ TOKEN ADI 'MEMORY_LIMIT' (PM_ önekSİZ, çünkü php_admin_value[memory_limit]
+; bir 'pm.*' pool-manager ayarı değil, doğrudan php.ini ayarıdır). NOT: bu
+; isim lib/domain.sh tarafında bu oturumda BİRDEN ÇOK KEZ 'MEMORY_LIMIT' ↔
+; 'PM_MEMORY_LIMIT' arasında salındı (canlı eşzamanlı geliştirme yarışı —
+; bkz. rapor). Bu şablondaki GÜNCEL/NİHAİ ad budur: besleyen kod bununla
+; BİREBİR eşleşmeli, aksi halde render 'beslenmeyen token' hatasıyla durur.
 php_admin_value[max_execution_time] = 60
 php_admin_value[max_input_time] = 60
 php_admin_value[max_input_vars] = 5000
