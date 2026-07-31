@@ -105,6 +105,28 @@ php_admin_value[error_log] = /logs/php-error.log
 ; shell_exec, system, passthru, proc_open, popen, pcntl_exec, pcntl_fork)
 ; FRAMEWORK FARK ETMEKSİZİN aşağıda HER ZAMAN kapalı — putenv tek başına bir
 ; sömürü zincirini TAMAMLAYAMAZ.
+;
+; GÜVENLİK DENETİMİ EKİ (2. TUR — HOST ÖLÇÜMÜYLE DÜZELTİLDİ): yukarıdaki
+; "tek başına" iddiası bir istisnayı atlıyordu — mail() C seviyesinde
+; popen(sendmail_path) çağırır ve bu iç popen() üstteki 'popen' girişinden
+; bağımsızdır. putenv ile LD_PRELOAD ayarlanmış bir domainde mail()
+; çağrılırsa yeni spawn edilen süreç onu miras alabilirdi. AYRICA mail() TEK
+; BAŞINA yeterli değildi: mbstring'in mb_send_mail()'i ve imap eklentisinin
+; imap_mail()'i AYNI dahili popen yolunu kullanır ve disable_functions'taki
+; 'mail' girişinden ETKİLENMEZ — HOST'ta (Ubuntu 22.04, PHP 8.3) doğrulandı:
+; 'mail' kapalıyken bile mb_send_mail() GERÇEKTEN spawn etti. Bu yüzden
+; 'mail'/'mb_send_mail'/'imap_mail' üçü de — putenv'in aksine framework
+; istisnası OLMADAN, HER framework için — aşağıya eklendi (lib/domain.sh
+; besleyen fonksiyonun 'base'i üzerinden).
+;
+; BU LİSTE BEST-EFFORT'TUR, TEK/YETERLİ KATMAN DEĞİL: "chroot'ta sendmail/sh
+; yok, o yüzden zaten kırık" savunması TEK BAŞINA güvenilmezdir — HOST
+; mutasyon testi, chroot'a elle bir /bin/sh + sendmail yerleştirilse BİLE
+; zinciri fiilen kesenin AppArmor'ın exec deny'i olduğunu gösterdi (tam kanıt
+; ve error_log'un neden disable_functions'a EKLENMEDİĞİ:
+; lib/domain.sh:_domain_disable_functions_for başlık yorumu). Yani bu satır
+; yalnız BİLİNEN mail-ailesi PHP fonksiyonlarını kapatır; error_log gibi
+; kapatılamayan bir yol için gerçek/tek savunma yine AppArmor'dur.
 php_admin_value[disable_functions] = {{DISABLE_FUNCTIONS}}
 
 ; ─── Güvenlik Ayarları ───
@@ -156,6 +178,15 @@ clear_env = yes
 ; NOT: access.log ve slowlog POOL direktifleridir; php-fpm MASTER (chroot DIŞI)
 ; tarafından açılır → GERÇEK yol olmalı (chroot-relative /logs master'da bulunamaz).
 ; mail.log php_admin_value'dur (worker/chroot içi) → chroot-relative kalır.
+; GÜVENLİK DENETİMİ EKİ (DÜZELTME — bu satırı "artık etkisiz" sanma):
+; yukarıdaki disable_functions mail()/mb_send_mail()/imap_mail()'i kapatır
+; AMA error_log($msg, 1, $to) (message_type=1) BUNLARDAN BAĞIMSIZ, AYNI
+; dahili sendmail yolunu kullanarak mail.log'a YAZABİLİR — HOST'ta doğrulandı
+; (bkz. lib/domain.sh:_domain_disable_functions_for başlık yorumu, "error_log
+; KASITLI OLARAK EKLENMEDİ" bölümü: error_log Laravel/CI4/Monolog'un temel
+; loglamasına gömülü olduğundan disable_functions'a EKLENEMEZ). Yani bu satır
+; HÂLÂ AKTİF bir yazma yolu olabilir; kaldırılması AYRI bir karardır ve bu
+; turda yapılmadı.
 php_admin_value[mail.log] = /logs/php-mail.log
 access.log = {{WEB_ROOT}}/{{DOMAIN}}/logs/php-access.log
 access.format = "%R - %u %t \"%m %r\" %s %f %{mili}d %{kilo}M %C%%"

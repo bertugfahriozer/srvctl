@@ -58,7 +58,26 @@ unset -f command
 src=$(cat "${REPO_ROOT}/lib/deploy.sh")
 assert_not_contains "$src" 'DOMAIN="$domain" bash "$hook_file"' "hook'un çıplak root çağrısı kaldırıldı"
 assert_contains     "$src" '_deploy_privdrop "$web_user"'       "hook privdrop üzerinden çalışıyor"
-assert_contains     "$src" 'composer install --working-dir'     "composer privdrop uyumlu çağrılıyor"
+
+# ── 7) Composer: privdrop KORUNUYOR (root olarak çalışmıyor) VE domain'in
+#    PHP CLI'ıyla (php_bin) çağrılıyor — HOST'un varsayılan PHP'sine değil.
+#    (bkz. gerçek VM bug'ı: composer eskiden çıplak 'composer' adıyla
+#    çağrıldığından kendi shebang'ı üzerinden HOST'un varsayılan php'sini
+#    seçiyordu; domain PHP 8.3'teyken host'ta php8.4 de kuruluysa composer
+#    YANLIŞ sürümle platform kontrolünü geçiyor, iki adım sonra 'artisan
+#    config:cache' domain'in gerçek php8.3'üyle patlıyordu.)
+#    Gerçek çağrı _deploy_composer_install() içinde yaşıyor (_deploy_run'dan
+#    ÇIKARILDI, bkz. tests/test_deploy_composer_php.sh); sadece o
+#    fonksiyonun gövdesine bakılır — dosyanın geri kalanındaki 'composer
+#    install' geçen yorumlar (ör. kök-neden anlatımı) bu assert'leri
+#    YANLIŞLIKLA geçirmesin diye.
+composer_block=$(awk '/^_deploy_composer_install\(\) \{/{flag=1} flag{print} /^\}/{if (flag) exit}' "${REPO_ROOT}/lib/deploy.sh")
+assert_contains     "$composer_block" '_deploy_privdrop "$web_user"' \
+    "composer web_user olarak (privdrop ile) çalıştırılıyor — root DEĞİL"
+assert_contains     "$composer_block" '"$php_bin" "$composer_bin" install --working-dir=' \
+    "composer domain'in PHP CLI'ıyla (php_bin) çağrılıyor"
+assert_not_contains "$composer_block" $'\n            composer install' \
+    "composer artık ÇIPLAK 'composer' komutuyla (php_bin'siz/HOST'un varsayılanıyla) çağrılmıyor"
 
 rm -rf "$WEB_ROOT"
 test_summary

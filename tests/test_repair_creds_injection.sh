@@ -36,6 +36,15 @@ log_action() { :; }
 mysql() { return 0; }
 systemctl() { return 0; }
 redis-cli() { return 0; }
+# GÜVENLİK DENETİMİ EKİ: '_domain_repair' artık hayalet/kalıntı domain
+# tespiti yapıyor (bkz. lib/domain.sh:_domain_repair_is_ghost — 'web_<sname>'
+# Linux kullanıcısının VARLIĞINA bakar, yoksa 'error' ile reddeder). Bu
+# testin fixture'ları ('_setup_and_repair') gerçek bir sistem kullanıcısı
+# OLUŞTURMUYOR; bu testin konusu K3 parola-enjeksiyonu savunması, hayalet
+# tespiti DEĞİL — 'id' burada NÖTRLENİR (her zaman "kullanıcı var" der) ki
+# test domain'leri hayalet sayılıp reddedilmesin. Hayalet tespiti kendi
+# testinde (test_domain_repair_reporting.sh) ayrıca doğrulanıyor.
+id() { return 0; }
 source "${REPO_ROOT}/lib/domain.sh"
 
 if ! declare -F _domain_repair >/dev/null 2>&1; then

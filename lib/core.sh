@@ -927,25 +927,60 @@ resource_profile_load() {
 #     AÇIKÇA bildirilmelidir (bkz. çağıran taraflardaki warn metinleri:
 #     lib/domain.sh per-domain, lib/init.sh sunucu-geneli — BİR KEZ).
 
-# Redis sunucu (MAJOR, MINOR) sürüm ÇİFTİNİ tespit eder. Önce
-# 'redis-server --version' (host'ta paket kuruluysa her zaman mevcuttur,
-# auth gerekmez), yoksa 'redis-cli INFO server' düşer (parola argv'ye değil
-# REDISCLI_AUTH env'e gider — çağıran taraf gerekirse onu set etmeli).
-# Belirlenemezse 1 döner (stdout boş) — çağıran fail-closed davranmalı.
+# Redis sunucu (MAJOR, MINOR) sürüm ÇİFTİNİ tespit eder.
+#
+# BUG 1 DÜZELTMESİ (GERÇEK Ubuntu 22.04 VM'de coordinator tarafından
+# ÖLÇÜLEREK bulundu — 2026-07-31): bu fonksiyon ESKİDEN ÖNCE 'redis-server
+# --version' (KURULU BINARY'nin sürümü) okuyordu, yalnız o başarısızsa
+# 'redis-cli INFO server' (ÇALIŞAN SÜRECİN sürümü) düşüyordu. Bu YANLIŞTI:
+# ACL sözdizimi kararını (ör. '&*' kanal token'ı 6.2+ gerektirir) hangi
+# SÜRECİN yorumlayacağı sorusuna binary sürümü CEVAP VERMEZ — yalnız ÇALIŞAN
+# süreç verir. GERÇEK VM'de birebir gözlemlendi: 'apt-get install
+# redis-server' binary'yi 6.0.16'dan 7.4.10'a yükseltti ama redis-server
+# SÜRECİNİ yeniden BAŞLATMADI (systemd/dpkg bunu garanti etmez — bkz.
+# lib/init.sh _install_redis'teki BUG 2 düzeltmesi); 'redis-server --version'
+# 7.4.10 derken 'redis-cli INFO server' hâlâ 'redis_version:6.0.16'
+# (process_id/uptime de ESKİ süreci doğruluyordu) diyordu. Eski kod BİRİNCİ
+# (yanlış, binary) kaynağı ÖNCELİKLİ okuduğundan srvctl "6.2+ destekleniyor"
+# sanıp ACL dosyasına '&*'/'resetchannels' yazdı — ama bunu YORUMLAMASI
+# gereken süreç HÂLÂ 6.0.16 olduğundan Redis'in KENDİSİ 'ACL LOAD'ı
+# "ERR ... Syntax error" ile reddetti (bkz. BUG 3 / _redis_acl_load).
+#
+# YENİ DAVRANIŞ: YALNIZ ÇALIŞAN sunucuya sorulur ('redis-cli INFO server' —
+# 'redis_version:' alanı). Admin parolası biliniyorsa (SRVCTL_CONF'tan
+# GÜVENLİ biçimde okunur — source DEĞİL, grep+cut; lib/domain.sh'taki AYNI
+# desen) 'REDISCLI_AUTH' env'e (argv'ye DEĞİL — 'ps' çıktısında görünmez)
+# konur ve '--user admin' ile bağlanılır — ACL zaten kilitliyse (default
+# kullanıcı 'off'/'-@all') parolasız bağlantı NOAUTH ile reddedilir. Parola
+# henüz YOKSA (ör. ilk kurulumda, ACL yazılmadan ÖNCE) parolasız denenir —
+# o an çalışan stok config'te ACL kısıtı yoktur, bu yeterlidir.
+#
+# FAIL-CLOSED FALLBACK (BİLEREK KALDIRILAN eski 'redis-server --version'
+# dalı): çalışan sunucu SORULAMIYORSA (redis-cli yok, bağlantı reddedildi,
+# parola yanlış) bu fonksiyon 1 döner (stdout boş) — 'redis-server --version'
+# okuyup "büyük ihtimalle bu sürüm çalışıyordur" diye TAHMİN ETMEZ. Çağıran
+# taraf bunu 'unknown' sayıp kanal token'ını ACL'e HİÇ YAZMAMALI (mevcut
+# fail-closed sözleşmesi — bkz. _redis_channel_isolation_mode): başlamayan/
+# izolasyonsuz ama en azından TUTARLI bir Redis, canlı kural kümesiyle
+# UYUŞMAYAN bir ACL dosyasından kesinlikle iyidir.
+#
 # NEDEN çift (yalnız major değil): kanal (pub/sub) ACL izolasyonu kararı
 # major=6 içinde İKİYE bölünür — 6.0'da 'resetchannels'/'&pattern' token'ları
 # PARSER'DA HİÇ TANIMLI DEĞİL (bkz. yukarıdaki kaynak referanslı gerekçe),
 # 6.2+'da tanımlı. Yalnız major bilgisiyle bu ayrım yapılamaz.
 _redis_version_pair() {
-    local out
-    if command -v redis-server >/dev/null 2>&1; then
-        out=$(redis-server --version 2>/dev/null)
-        if [[ "$out" =~ v=([0-9]+)\.([0-9]+)\. ]]; then
-            echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
-            return 0
-        fi
+    local out redis_admin_pass=""
+    command -v redis-cli >/dev/null 2>&1 || return 1
+
+    if [[ -n "${SRVCTL_CONF:-}" && -f "${SRVCTL_CONF}" ]]; then
+        redis_admin_pass=$(grep "^REDIS_ADMIN_PASS=" "${SRVCTL_CONF}" 2>/dev/null | cut -d= -f2)
     fi
-    out=$(redis-cli INFO server 2>/dev/null | grep -m1 '^redis_version:')
+
+    if [[ -n "$redis_admin_pass" ]]; then
+        out=$(REDISCLI_AUTH="$redis_admin_pass" redis-cli --user admin --no-auth-warning INFO server 2>/dev/null | grep -m1 '^redis_version:')
+    else
+        out=$(redis-cli INFO server 2>/dev/null | grep -m1 '^redis_version:')
+    fi
     if [[ "$out" =~ redis_version:([0-9]+)\.([0-9]+)\. ]]; then
         echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
         return 0
@@ -986,6 +1021,68 @@ _redis_channel_isolation_mode() {
     else
         echo "unknown"
     fi
+}
+
+# ═══════════════════════════════════════════════
+#  _redis_acl_load — 'ACL LOAD' sarmalayıcısı, FAIL-CLOSED (BUG 3 düzeltmesi)
+# ═══════════════════════════════════════════════
+# NEDEN VAR (GERÇEK Ubuntu 22.04 VM'de coordinator tarafından bulundu —
+# 2026-07-31, EN CİDDİ bulgu): lib/domain.sh:655 ve :2385 şu deseni
+# kullanıyordu:
+#   REDISCLI_AUTH="$pass" redis-cli --user admin --no-auth-warning ACL LOAD \
+#       2>/dev/null || systemctl restart redis-server
+# Bu, 'redis-cli'nin PROCESS exit kodunun ACL LOAD'ın SUNUCU TARAFINDAKİ
+# başarısını yansıttığını VARSAYAR — YANLIŞ VARSAYIM. 'redis-cli', sunucuya
+# bağlanıp komutu gönderip HERHANGİ bir yanıt aldığı sürece (yanıt bir HATA
+# mesajı OLSA BİLE) genellikle 0 ile çıkar; yalnız BAĞLANTI düzeyinde bir
+# sorunda (sunucuya ulaşılamadı, timeout) non-zero döner. GERÇEK VM'de elle
+# çalıştırıldığında Redis ACL LOAD'a şu yanıtı verdi:
+#     ERR /etc/redis/users.acl:5: Syntax error. /etc/redis/users.acl:6: ...
+#     WARNING: ACL errors detected, no change to the previously active ACL
+#     rules was performed
+# yani Redis'in KENDİSİ "hiçbir değişiklik yapılmadı" diyordu — ACL dosyası
+# ile CANLI kural kümesi TAMAMEN AYRIŞMIŞTI. Buna rağmen eski desen bunu
+# YUTUYORDU: '|| systemctl restart redis-server' fallback'i ÇALIŞMIYORDU
+# (çünkü '||' yalnız SOL taraf non-zero dönerse tetiklenir; redis-cli'nin
+# kendisi burada 0 ile çıkmış olabilir), çağıran (_domain_repair/_domain_add)
+# bu satırın dönüş değerini hiç kontrol ETMEDEN devam ediyor, EXIT=0 ve
+# "Domain onarıldı" raporluyordu — bir güvenlik kontrolü (kanal ACL'i) HİÇ
+# UYGULANMAMIŞKEN operatör başarı görüyordu.
+#
+# BU SARMALAYICI: hem dönüş kodunu HEM ÇIKTIYI kontrol eder — 'ACL LOAD'
+# yalnız TAM olarak 'OK' basıp 0 döndüğünde başarılı sayılır (Redis'in
+# başarılı 'ACL LOAD' yanıtı budur — '+OK' simple string). Başarısızlıkta
+# Redis'in kendi teşhis metnini (ör. yukarıdaki "no change..." satırı — bu
+# zaten en iyi teşhistir) stderr'e basar ve 1 döner. ÇAĞIRAN TARAF bu dönüş
+# değerini KONTROL ETMEDEN "başarılı"/"onarıldı" RAPORLAMAMALI.
+#
+# KAPSAM NOTU: bu fonksiyonun ÇAĞRI SİTELERİ (lib/domain.sh:655, :2385)
+# BAŞKA bir agent'ın eşzamanlı çalıştığı dosyada olduğundan BURADAN
+# değiştirilmedi — yalnız paylaşılan sarmalayıcı core.sh'a eklendi; domain.sh
+# sahibi çağrı sitelerini '_redis_acl_load "$redis_admin_pass" || <fallback>'
+# şeklinde buna bağlayabilir (dönüş değerini KONTROL ETMESİ ve başarısızlıkta
+# 'repair'/'add' sonucunu da başarısız SAYMASI gerekir — aksi halde BUG 3
+# yarı yarıya düzeltilmiş olur).
+#
+# Kullanım: _redis_acl_load <admin_parolası>
+# Dönüş: 0 = ACL GERÇEKTEN yüklendi (canlı kural kümesi dosyayla eşleşiyor).
+#        1 = başarısız — teşhis metni ZATEN stderr'e basıldı, çağıran bunu
+#            YUTMADAN kendi hata yoluna (warn/error/exit≠0) YAYMALI.
+_redis_acl_load() {
+    local admin_pass="$1"
+    local out rc
+    out=$(REDISCLI_AUTH="$admin_pass" redis-cli --user admin --no-auth-warning ACL LOAD 2>&1)
+    rc=$?
+    # rc'ye TEK BAŞINA GÜVENİLMEZ (yukarıdaki NEDEN VAR notuna bkz.) — çıktı
+    # da 'OK' değilse başarısız sayılır. 'tr -d' ile CR (\r) ÖNCE atılır
+    # (redis-cli bazı terminal/pty bağlamlarında CRLF basabilir), SONRA
+    # 'xargs' ile baştaki/sondaki boşluk/newline kırpılır.
+    if [[ $rc -ne 0 ]] || [[ "$(echo "$out" | tr -d '\r' | xargs 2>/dev/null)" != "OK" ]]; then
+        echo "GÜVENLİK: Redis ACL LOAD BAŞARISIZ — önceki ACL kuralları hâlâ yürürlükte, YENİ kurallar UYGULANMADI. Redis'in kendi çıktısı:" >&2
+        echo "$out" >&2
+        return 1
+    fi
+    return 0
 }
 
 # ─── Per-Domain Meta (sır değil) ───

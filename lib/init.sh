@@ -658,6 +658,28 @@ _install_php() {
         #
         # Buradaki liste ile _domain_disable_functions_for()'daki 'base' BİREBİR
         # AYNI olmalı; sapmayı tests/test_disable_functions_sync.sh yakalar.
+        #
+        # GÜVENLİK DENETİMİ EKİ (2. TUR — HOST ÖLÇÜMÜYLE DÜZELTİLDİ): mail-
+        # ailesi fonksiyonlar + LD_PRELOAD zinciri. 'mail' TEK BAŞINA yeterli
+        # DEĞİLDİR — mbstring'in mb_send_mail()'i ve imap eklentisinin
+        # imap_mail()'i mail() ile AYNI dahili popen(sendmail_path) yolunu
+        # kullanır ve disable_functions'taki 'mail' girişinden ETKİLENMEZ
+        # (ayrı fonksiyon tablosu girdileri). HOST'ta (srvctl-jammy, Ubuntu
+        # 22.04, PHP 8.3) doğrulandı: 'mail' bu listedeyken bile
+        # mb_send_mail() GERÇEKTEN sendmail_path'e spawn etti. Bu yüzden
+        # 'mb_send_mail' ve 'imap_mail' de (eklenti kurulu olmasa bile —
+        # disable_functions'ta var olmayan fonksiyon adı hataya YOL AÇMAZ)
+        # 'mail' ile AYNI şekilde istisnasız TABANA eklendi.
+        #
+        # ÖNEMLİ DÜZELTME: bu listenin "zinciri kapattığı" iddiası TEK BAŞINA
+        # yanlış güvencedir — HOST mutasyon testi, chroot'a elle /bin/sh +
+        # sendmail yerleştirilse BİLE zinciri fiilen kesenin AppArmor'ın exec
+        # deny'i olduğunu gösterdi (bkz. lib/domain.sh:
+        # _domain_disable_functions_for başlık yorumu — tam kanıt ve
+        # error_log'un KASITLI OLARAK neden eklenmediği orada). Bu
+        # disable_functions listesi yalnız BİLİNEN mail-ailesi PHP
+        # fonksiyonlarını kapatan BEST-EFFORT bir katmandır; error_log gibi
+        # kapatılamayan kalıcı bir yol için TEK savunma AppArmor'dur.
         cat > "/etc/php/${ver}/fpm/conf.d/99-srvctl-security.ini" << 'PHPINI'
 expose_php = Off
 display_errors = Off
@@ -667,8 +689,15 @@ error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
 ; disable_functions: GLOBAL TABAN. 'putenv' bilerek YOK — global'de silinirse
 ; pool geri açamaz (tek yönlüdür) ve CodeIgniter 4 boot edemez. Sıkılaştırma
 ; pool'da: lib/domain.sh:_domain_disable_functions_for() ci4 dışındaki tüm
-; framework'lerin php_admin_value'una 'putenv'i ekler.
-disable_functions = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,show_source,highlight_file
+; framework'lerin php_admin_value'una 'putenv'i ekler. 'mail'/'mb_send_mail'/
+; 'imap_mail' ise putenv'in AKSİNE hiçbir framework için istisna edilmez —
+; HER ZAMAN kapalı (üçü de aynı dahili popen(sendmail_path) yolunu kullanır,
+; disable_functions'taki 'popen' girişini atlarlar). 'error_log' KASITLI
+; OLARAK bu listede YOK — Laravel/CI4/Monolog'un temel loglamasını kırar;
+; error_log($msg,1,...) üzerinden AYNI sınıf spawn HÂLÂ mümkündür, onu
+; durduran katman AppArmor'dur, disable_functions DEĞİL (tam gerekçe:
+; lib/domain.sh:_domain_disable_functions_for başlık yorumu).
+disable_functions = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,show_source,highlight_file,mail,mb_send_mail,imap_mail
 file_uploads = On
 upload_max_filesize = 50M
 post_max_size = 55M
@@ -851,9 +880,350 @@ MYCNF
     info "MariaDB root şifresi: /root/.my.cnf"
 }
 
+# ───────────────────────────────────────────────────────────────
+#  Redis 7.x YÜKSELTMESİ — packages.redis.io resmi APT deposu
+#
+#  NEDEN: Ubuntu 22.04 (jammy) dağıtım deposu redis-server 6.0.16 verir;
+#  6.2 ÖNCESİ Redis'te pub/sub kanal ACL'i ('resetchannels'/'&pattern')
+#  parser'da HİÇ TANIMLI DEĞİL (bkz. core.sh _redis_channel_isolation_mode
+#  başlığındaki kaynak referanslı gerekçe) — yani 22.04'te TÜM domainler
+#  birbirinin pub/sub kanallarını dinleyebilir/yayın yapabilir; 100
+#  e-ticaret domaini barındıran çok-kiracılı bir kurulumda bu kabul
+#  EDİLEMEZ. Ubuntu 24.04 (noble) zaten 7.0.15 verdiğinden bu fonksiyon
+#  orada bir şey YAPMAZ (aşağıdaki ilk kontrol 'supported' ise apt'a hiç
+#  dokunmadan hemen döner).
+#
+#  GÜVENLİK (üçüncü taraf APT deposu eklemek bir tedarik zinciri yüzeyidir):
+#    1. GPG anahtarı YALNIZ HTTPS üzerinden (--proto '=https' --tlsv1.2)
+#       indirilir; 'apt-key' KULLANILMAZ (kullanımdan kaldırıldı VE anahtarı
+#       sisteme eklenmiş TÜM depolara güvenilir kılar — bu depoya özgü
+#       değildir). Anahtar /etc/apt/keyrings/ altına 0644 (apt/_apt kullanıcısı
+#       okuyabilsin, parola/sır İÇERMEZ) yazılır; sources girdisi 'signed-by='
+#       ile YALNIZ bu dosyaya bağlanır (başka hiçbir anahtar bu depo için
+#       kabul edilmez).
+#    2. APT PINNING (/etc/apt/preferences.d) — İKİ AYRI stanza, çünkü
+#       apt_preferences(5) TEK bir 'Pin:' satırında 'origin' VE 'version'
+#       koşulunu AYNI ANDA belirtmeye İZİN VERMEZ (yalnızca release/origin/
+#       version türlerinden BİRİ):
+#         (a) 'Package: *' + 'Pin: origin packages.redis.io' + Priority -1 —
+#             bu origin'den GELEN HER ŞEY (paket adı fark etmeksizin, hangi
+#             sürüm olursa olsun) varsayılan olarak ENGELLENİR (apt_preferences(5):
+#             negatif öncelik o sürümün ELLE bile kurulmasını engeller).
+#             'origin' değeri nokta içerdiğinden (packages.redis.io) apt bunu
+#             Release dosyasındaki 'Origin:' alanı yerine İNDİRME HOST'U olarak
+#             eşler — üçüncü taraf depoları tek pakete kısıtlamak için Debian/
+#             Google Chrome depo dokümantasyonlarında yıllardır kullanılan
+#             DOĞRULANMIŞ bir desendir (bkz. Debian Wiki "AptPreferences" →
+#             "Pin: origin dl.google.com" örneği).
+#         (b) 'Package: redis-server redis-tools' + 'Pin: version 6:7.*' +
+#             Priority 600 — YALNIZ bizim kurduğumuz iki paket adı, YALNIZ
+#             7.x sürüm serisi (bkz. madde 3 — epoch'un NEDEN sabit yazıldığı
+#             ve bunun BİLİNEN bir kırılganlık olduğu orada açıklanıyor)
+#             dağıtımın varsayılanından (500) yüksek öncelik alır.
+#             ÇÖZÜMLEME MODELİ (GERÇEK Ubuntu 22.04 VM'de üç varyant
+#             karşılaştırılarak ÖLÇÜLDÜ — bkz. madde 3): apt bir adaya
+#             uygulanacak önceliği "Package-glob'u VE Pin-koşulu (origin/
+#             version) TUTAN TÜM stanza'lar arasındaki EN YÜKSEK (max)
+#             Pin-Priority" olarak seçiyor — "daha spesifik Package glob'u
+#             kazanır" gibi bir kural DEĞİL (bu, ilk turda YANLIŞ varsayılan
+#             bir genelleme İDİ, gerçek ölçümle DÜZELTİLDİ). Örnek: 8.x bir
+#             aday için (a) koşulu tutar (-1), (b)'nin sürüm koşulu ('6:7.*')
+#             TUTMAZ (8.x bu önekle BAŞLAMIYOR) → yalnız -1 uygulanabilir →
+#             max(-1) = -1 → ENGELLENİR. 7.x bir aday için HEM (a) HEM (b)
+#             tutar (-1 VE 600) → max(-1, 600) = 600 → İZİN VERİLİR. Bu
+#             model 'memtier-benchmark' (yalnız (a) tutar, isim (b)'ye hiç
+#             uymaz → -1 → engelli) durumunu da doğru açıklıyor.
+#    3. MAJÖR SÜRÜM KİLİDİ (7.x, 8.x DEĞİL) — BİLİNÇLİ bir kapsam sınırı,
+#       eksiklik DEĞİL: packages.redis.io yalnızca 7.x sunmuyor, 8.x'i de
+#       (hatta memtier-benchmark gibi redis-DIŞI paketleri de) sunuyor —
+#       GERÇEK Ubuntu 22.04 VM'de doğrulandı: depo eklenip 'apt-get update'
+#       sonrası 'apt-cache policy redis-server' candidate'ı '6:8.10.0-...'
+#       idi (madde 2 versiyon kısıtı OLMADAN önce). Bu srvctl sürümünün
+#       kullanıcı onayı AÇIKÇA Redis 7 üzerineydi (7'nin pub/sub kanal ACL'i
+#       6.2+'ta zaten yeterli — bkz. fonksiyon başı NEDEN); 8'e (majör
+#       sıçrama, olası davranış/uyumluluk farkları, henüz bu sürüm için ayrı
+#       bir onay/test turu YOK) BİLİNÇLİ olarak GEÇİLMİYOR.
+#
+#       SÜRÜM DESENİ '6:7.*' — EPOCH SABİT YAZILDI, BU BİLİNEN BİR
+#       KIRILGANLIK, "epoch'tan bağımsız" DEĞİL (ilk turda '*:7.*' ile
+#       tam tersi iddia edilmişti — bu YANLIŞTI ve GERÇEK apt ile
+#       ÖLÇÜLEREK düzeltildi): APT'nin 'Pin: version' alanı BAŞTA joker
+#       DESTEKLEMEZ, yalnızca (sonda '*' varsa) SABİT bir ÖNEK eşleştirir.
+#       '*:7.*' deseni bu yüzden GERÇEKTE hiçbir sürümle eşleşmiyordu
+#       (GERÇEK VM'de ÖLÇÜLDÜ: bu desenle redis-server candidate'ı
+#       dağıtımın 6.0.16'sı kalıyordu, 7.x girdilerinin TÜMÜ de -1
+#       alıyordu) — "epoch'tan bağımsız kılmak" niyeti DOĞRUYDU ama bu
+#       sözdizimi bunu SAĞLAMIYORDU. Doğru biçim, upstream'in GÜNCEL
+#       epoch'unu (GERÇEK VM'de görülen: '6:7.4.10-1rl1~jammy1' →
+#       epoch=6) SABİT ÖNEK olarak yazmaktır: '6:7.*'. Bunun bilinen
+#       riski: upstream repo epoch'unu gelecekte DEĞİŞTİRİRSE (ör. 7:7.x
+#       gibi) bu pin ARTIK HİÇBİR SÜRÜMLE eşleşmez ve yükseltme SESSİZCE
+#       durur — hata VERMEZ, apt sadece dağıtımın 6.0.16'sında kalır
+#       (GERÇEK VM'de epoch bilerek '9:7.*' yapılarak DOĞRULANDI: candidate
+#       sessizce '5:6.0.16-1ubuntu1.1'ye düştü). Bu SESSİZ olduğundan
+#       '_install_redis'teki ACL/kanal tespiti bloğu bunu AYRICA teşhis
+#       eder (bkz. o bloktaki "resmi depo eklendi ama yükseltme
+#       gerçekleşmedi" uyarısı) — operatör bunu bir ağ/GPG hatasından
+#       AYIRT edebilsin. 7.4.x İÇİNDEKİ YAMA sürümleri (ör. güvenlik
+#       düzeltmeleri, epoch DEĞİŞMEDİĞİ sürece) hâlâ otomatik alınır: her
+#       'srvctl init'/'--force' çalıştırıldığında 'redis-server'/
+#       'redis-tools' HİÇ versiyon belirtmeden kurulur (_apt_install
+#       çağrısına bkz.) — apt priority-600 adaylar arasından (hepsi 7.x)
+#       EN YENİSİNİ seçer; yalnız MAJÖR sıçrama (7→8) engellenir. 8'e
+#       geçmek — istenirse — AYRI, bilinçli bir karar olmalıdır (bu pin
+#       desenini güncellemek yeterlidir); bir sonraki geliştirici bunu
+#       "eksik/unutulmuş kısıtlama" sanıp SESSİZCE gevşetmemeli — bu
+#       yüzden bu gerekçe buraya yazıldı.
+#       (NEDEN 'apt-get install redis-server=<sürüm>' YERİNE APT PIN: pin,
+#       apt/unattended-upgrades/manuel 'apt upgrade' dahil TÜM yollar için
+#       kalıcı bir sistem-geneli kısıtlamadır; sabit bir sürüm string'i
+#       yalnız BU ANDAKİ 'srvctl init' çağrısını etkiler, sonraki bir
+#       'apt upgrade' yine de 8.x'e SIÇRAYABİLİRDİ. Ayrıca madison çıktısını
+#       ayrıştırıp "en yeni 7.x" sürüm string'ini bulmak için ekstra bash
+#       regex koduna gerek KALMIYOR — apt'ın kendi candidate seçimi zaten
+#       "priority 600'daki en yüksek sürüm" kuralıyla bunu YAPIYOR.)
+#    4. FAIL-SAFE: anahtar indirme/dearmor veya 'apt-get update' başarısız
+#       olursa eklenen 3 dosya (anahtar/sources/pin) GERİ ALINIR — yarım
+#       kalmış/doğrulanamamış bir depo asla sistemde bırakılmaz (aksi halde
+#       sonraki HERHANGİ bir 'apt-get update', ör. PHP PPA adımı, bu bozuk
+#       kaynak yüzünden başarısız olabilirdi). Yalnız SON 'redis-server'
+#       kurulum adımı başarısız olursa depo KALDIRILMAZ (o noktada repo
+#       'apt-get update' ile zaten doğrulanmış/güvenilir durumdadır — sorun
+#       kotadan/tutulu paketten kaynaklanıyor olabilir; bir sonraki
+#       'srvctl init --force' yalnız kurulumu yeniden dener). Bu fonksiyonun
+#       HİÇBİR başarısızlık dalı 'srvctl init'i ÇÖKERTMEZ — çağıran
+#       (_install_redis) '|| true' ile çağırır, dağıtımın mevcut Redis'i ile
+#       devam edilir ve mevcut '&*' koşullu ACL uyarı mekanizması bunu zaten
+#       doğru ele alır.
+#    5. İDEMPOTENT: 3 dosya da HER ZAMAN atomik biçimde ÜZERİNE YAZILIR
+#       (append değil) — ikinci çalıştırma ('srvctl init --force') hata
+#       VERMEZ. Zaten 6.2+'a yükseltilmişse fonksiyon apt'a hiç dokunmadan
+#       erken döner (bkz. madde 1).
+# ───────────────────────────────────────────────────────────────
+
+# Ubuntu codename (jammy/noble) — YALNIZ bu fonksiyon için; core.sh'taki
+# paylaşılan _os_version_id/_os_id'ye DOKUNMADAN aynı katı grep+cut deseni
+# (source DEĞİL: /etc/os-release root'a ait olsa da parse alışkanlığı).
+# Test-seam: SRVCTL_OS_RELEASE_FILE (varsayılan /etc/os-release) — macOS'ta
+# gerçek dosya olmadığından testler burayı bir tmp dosyasına yönlendirir.
+_redis_upstream_repo_codename() {
+    local os_release_file="${SRVCTL_OS_RELEASE_FILE:-/etc/os-release}"
+    [[ -r "$os_release_file" ]] || { echo ""; return 0; }
+    grep -m1 '^VERSION_CODENAME=' "$os_release_file" 2>/dev/null | cut -d= -f2 | tr -d '"'
+}
+
+_install_redis_upstream_repo() {
+    local major="" minor="" status
+    read -r major minor <<< "$(_redis_version_pair)"
+    status=$(_redis_channel_isolation_mode "$major" "$minor")
+    if [[ "$status" == "supported" ]]; then
+        # Zaten 6.2+ (ör. Ubuntu 24.04 dağıtım paketi 7.0.15) — apt'a HİÇ
+        # dokunma. Bu erken dönüş hem noble'da bu fonksiyonu tam bir no-op
+        # yapar hem de jammy'de başarılı bir yükseltmeden sonraki
+        # '--force' tekrarlarında gereksiz apt/network trafiğini önler.
+        return 0
+    fi
+
+    local codename
+    codename="$(_redis_upstream_repo_codename)"
+    if [[ -z "$codename" ]]; then
+        warn "Ubuntu codename tespit edilemedi (/etc/os-release'te VERSION_CODENAME yok) — Redis 7.x resmi deposu eklenemedi, dağıtımın mevcut Redis sürümüyle devam ediliyor"
+        return 1
+    fi
+
+    # Test-seam: SRVCTL_GPG_BIN (varsayılan 'gpg') — macOS'ta host'ta gpg
+    # kurulu OLABİLİR de OLMAYABİLİR de; testler 'gpg yok' dalını host
+    # durumundan BAĞIMSIZ deterministik tetiklemek için bunu var olmayan bir
+    # isme çeker (bkz. tests/test_redis_upstream_repo.sh).
+    local gpg_bin="${SRVCTL_GPG_BIN:-gpg}"
+    if ! command -v "$gpg_bin" &>/dev/null; then
+        warn "${gpg_bin} bulunamadı — Redis 7.x resmi deposunun GPG anahtarı doğrulanamaz, dağıtımın mevcut Redis sürümüyle devam ediliyor"
+        return 1
+    fi
+
+    local keyring_dir keyring_file sources_file pin_file
+    keyring_dir="${SRVCTL_APT_KEYRING_DIR:-/etc/apt/keyrings}"
+    keyring_file="${keyring_dir}/redis.gpg"
+    sources_file="${SRVCTL_APT_SOURCES_DIR:-/etc/apt/sources.list.d}/redis.list"
+    pin_file="${SRVCTL_APT_PREFS_DIR:-/etc/apt/preferences.d}/99-srvctl-redis.pref"
+
+    if ! mkdir -p "$keyring_dir" 2>/dev/null; then
+        warn "Anahtar dizini oluşturulamadı (${keyring_dir}) — Redis 7.x resmi deposu eklenemedi, dağıtımın mevcut Redis sürümüyle devam ediliyor"
+        return 1
+    fi
+    chmod 755 "$keyring_dir" 2>/dev/null || true
+
+    # Anahtar ATOMİK yazılır (tmp + mv): indirme yarıda kesilirse/başarısız
+    # olursa yarım bir anahtar dosyası ASLA kalıcı konumda görünmez.
+    local tmp_key
+    tmp_key="$(mktemp "${keyring_dir}/.redis-gpg.XXXXXX" 2>/dev/null)"
+    if [[ -z "$tmp_key" ]]; then
+        warn "Geçici GPG anahtar dosyası oluşturulamadı (${keyring_dir} yazılabilir mi?) — dağıtımın mevcut Redis sürümüyle devam ediliyor"
+        return 1
+    fi
+
+    if ! curl -fsSL --proto '=https' --tlsv1.2 https://packages.redis.io/gpg 2>/dev/null | "$gpg_bin" --dearmor > "$tmp_key" 2>/dev/null; then
+        rm -f "$tmp_key"
+        warn "Redis GPG anahtarı indirilemedi/dearmor edilemedi (packages.redis.io erişimi?) — GÜVENLİK NEDENİYLE depo eklenMEDİ, dağıtımın mevcut Redis sürümüyle devam ediliyor"
+        return 1
+    fi
+    if [[ ! -s "$tmp_key" ]]; then
+        rm -f "$tmp_key"
+        warn "Redis GPG anahtarı boş/geçersiz — GÜVENLİK NEDENİYLE depo eklenMEDİ, dağıtımın mevcut Redis sürümüyle devam ediliyor"
+        return 1
+    fi
+    chmod 644 "$tmp_key"
+    mv -f "$tmp_key" "$keyring_file"
+    chown root:root "$keyring_file" 2>/dev/null || true
+
+    cat > "$sources_file" << REDISSOURCES
+deb [signed-by=${keyring_file}] https://packages.redis.io/deb ${codename} main
+REDISSOURCES
+    chmod 644 "$sources_file"
+
+    # Bkz. yukarıdaki başlık yorumu madde 2 (origin+sürüm İKİ AYRI stanza olma
+    # gerekçesi VE GERÇEK apt ile ÖLÇÜLMÜŞ çözümleme modeli: "koşulu tutan
+    # TÜM stanza'lar arasında EN YÜKSEK öncelik") ve madde 3 (neden '6:7.*' —
+    # epoch'un SABİT yazılması BİLİNÇLİ kabul edilmiş bir kırılganlıktır,
+    # "epoch'tan bağımsız" DEĞİL — ilk turdaki '*:7.*' denemesi GERÇEK apt'ta
+    # HİÇBİR sürümle eşleşmiyordu, ÖLÇÜLEREK bulundu ve düzeltildi). ÖNEMLİ:
+    # bu iki stanza'nın SIRASI apt'ın sonucu için önemli DEĞİL (max-öncelik
+    # modeli sıraya değil koşulun tutup tutmadığına bakar) ama okunabilirlik
+    # için "geniş engelleme, sonra dar istisna" sırası korunuyor.
+    cat > "$pin_file" << REDISPIN
+Package: *
+Pin: origin packages.redis.io
+Pin-Priority: -1
+
+Package: redis-server redis-tools
+Pin: version 6:7.*
+Pin-Priority: 600
+REDISPIN
+    chmod 644 "$pin_file"
+
+    if ! apt-get update -qq -o DPkg::Lock::Timeout=300 2>/dev/null; then
+        rm -f "$keyring_file" "$sources_file" "$pin_file"
+        apt-get update -qq -o DPkg::Lock::Timeout=300 2>/dev/null || true
+        warn "Redis resmi deposu eklendikten sonra 'apt-get update' başarısız oldu (codename=${codename} desteklenmiyor olabilir) — depo GERİ ALINDI, dağıtımın mevcut Redis sürümüyle devam ediliyor"
+        return 1
+    fi
+
+    # NOT: '_init_apt_noninteractive' (cmd_init'in İLK işi) zaten
+    # UCF_FORCE_CONFOLD=1 + DEBIAN_FRONTEND=noninteractive export ediyor —
+    # redis-server paketi /etc/redis/redis.conf'u ucf ile yönettiğinden bu
+    # yükseltme sırasında (varsa) yerel değişiklikleri KORUR, interaktif
+    # conffile sorusu sormaz. Ekstra bir dpkg seçeneği eklemeye gerek yok.
+    if ! _apt_install redis-server redis-tools; then
+        warn "Redis 7.x resmi depodan KURULAMADI — depo yapılandırması korunuyor (zaten doğrulanmış durumda), dağıtımın mevcut Redis sürümüyle devam ediliyor. Elle deneyin: apt-get install redis-server redis-tools"
+        return 1
+    fi
+
+    return 0
+}
+
+# ───────────────────────────────────────────────────────────────
+#  BUG 2 DÜZELTMESİ (GERÇEK Ubuntu 22.04 VM'de coordinator tarafından
+#  ÖLÇÜLEREK bulundu — 2026-07-31): 'apt-get install redis-server' binary'yi
+#  yükseltir ama ÇALIŞAN süreci yeniden BAŞLATMAZ (systemd bunu garanti
+#  etmez — needrestart kurulu olsa bile redis gibi bazı servisler için
+#  otomatik tetiklenmeyebilir; GERÇEK VM'de birebir gözlemlendi: binary
+#  7.4.10'a yükseltildi, 'redis-server' süreci saatlerdir çalışan 6.0.16
+#  olarak kaldı). Bu, aşağıdaki ACL kararının YANLIŞ sürüme göre verilmesine
+#  yol açar (bkz. core.sh _redis_version_pair başlığındaki BUG 1 notu) —
+#  bu yüzden ACL kararından ÖNCE, binary ile ÇALIŞAN sürüm KARŞILAŞTIRILIR;
+#  farklıysa Redis burada (henüz kendi redis.conf/ACL'imizi YAZMADAN ÖNCE)
+#  yeniden başlatılır ki az sonraki '_redis_version_pair' çağrısı GERÇEĞİ
+#  görsün. Fonksiyonun SONUNDAKİ koşulsuz restart (yeni redis.conf/ACL'i
+#  uygulamak için) HÂLÂ AYRICA gereklidir — bu ikisi FARKLI amaçlara hizmet
+#  eder, biri kaldırılamaz.
+#
+#  OPERASYONEL ETKİ (BİLEREK KOŞULSUZ DEĞİL): Redis'i yeniden başlatmak
+#  CANLI bir sunucuda TÜM domainlerin bellek-içi durumunu (pub/sub
+#  abonelikleri, henüz kalıcı olmayan queue/cache anahtarları) bir an için
+#  KESER. Bu yüzden restart YALNIZ binary ile çalışan süreç GERÇEKTEN
+#  FARKLIYSA tetiklenir (ikisi aynıysa — ör. hiç yükseltme olmadıysa ya da
+#  bir şekilde zaten yeniden başlatılmışsa — dokunulmaz) VE operatöre
+#  ÖNCEDEN AÇIKÇA söylenir (bkz. 'warn' çağrısı) — sessizce olmaz.
+#  '_install_redis' yalnız 'srvctl init'in (ilk kurulum/--force) bir parçası
+#  olarak çağrıldığından bu normal akışta domain eklenmeden ÖNCE çalışır;
+#  '--force' ile canlı bir sunucuda tekrar çalıştırılırsa bu restart TEK
+#  seferlik ve gerekçeli bir kesintidir, sessiz bir yan etki DEĞİLDİR.
+# ───────────────────────────────────────────────────────────────
+
+# Kurulu Redis BINARY sürümü (ÇALIŞAN süreç DEĞİL) — SADECE restart kararı
+# için. ACL sözdizimi kararı için KULLANILMAZ (bu, tam olarak BUG 1'in kök
+# nedeniydi — core.sh _redis_version_pair'in NEDEN artık yalnız çalışan
+# sürece baktığına bkz.). YALNIZ init.sh'a özeldir (domain.sh'ın böyle bir
+# ihtiyacı YOK — o her zaman core.sh _redis_version_pair üzerinden ÇALIŞAN
+# sürece bakar).
+_redis_installed_binary_version_pair() {
+    local out
+    command -v redis-server >/dev/null 2>&1 || return 1
+    out=$(redis-server --version 2>/dev/null)
+    if [[ "$out" =~ v=([0-9]+)\.([0-9]+)\. ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+# Saf karar fonksiyonu — redis-server/redis-cli ÇAĞIRMAZ, macOS'ta argüman
+# enjeksiyonuyla unit-test edilebilir. Girdi: binary (major minor) + çalışan
+# (major minor) — dört ayrı argüman, biri boş string OLABİLİR (tespit
+# edilemedi). Çıktı: 'restart_needed' | 'no_restart_needed'.
+# KARAR: yalnız HER İKİSİ de bilinen (boş olmayan) VE FARKLI olduklarında
+# restart gerekir. Herhangi biri bilinmiyorsa 'no_restart_needed' döner —
+# fail-safe: belirsiz bir durumda GEREKSİZ yere Redis'i yeniden başlatıp
+# aktif bağlantıları KESMEYELİM; zaten fonksiyonun sonundaki koşulsuz
+# restart (redis.conf/ACL'i uygulamak için) her hâlükârda devreye girecek.
+_redis_restart_decision() {
+    local bin_major="$1" bin_minor="$2" run_major="$3" run_minor="$4"
+    if [[ -z "$bin_major" || -z "$run_major" ]]; then
+        echo "no_restart_needed"
+        return 0
+    fi
+    if [[ "$bin_major" == "$run_major" && "$bin_minor" == "$run_minor" ]]; then
+        echo "no_restart_needed"
+    else
+        echo "restart_needed"
+    fi
+}
+
 _install_redis() {
     if ! command -v redis-server &>/dev/null; then
         _apt_install_required "Redis" redis-server || return 1
+    fi
+
+    # Ubuntu 22.04'te dağıtım paketi 6.0.16 verir (6.2 altı = kanal ACL'i
+    # parser'da yok) — mümkünse packages.redis.io'dan 7.x'e yükselt.
+    #
+    # Dönüş değeri ARTIK YAKALANIYOR (çıplak '|| true' DEĞİL): başarısız olsa
+    # bile 'set -e' altında _install_redis'in geri kalanı (ACL/redis.conf/
+    # restart) ÇALIŞMAYA devam etmeli (fail-safe sözleşmesi korunuyor,
+    # aşağıdaki fonksiyon başlığına bkz.) — ama dönüş değeri aşağıdaki ACL/
+    # kanal tespiti bloğunda "depo/apt HATASIZ (rc=0) tamamlandı ama sürüm
+    # HÂLÂ 6.2 altında" SESSİZ durumunu ayırt etmek için gerekli: bu durum,
+    # pin deseninin ('version 6:7.*' — bkz. _install_redis_upstream_repo
+    # başlık yorumu madde 3) upstream'in GÜNCEL epoch'uyla eşleşmediğinin
+    # işaretidir ve normal "ağ/GPG hatası" uyarılarından FARKLI bir teşhis
+    # gerektirir (o hatalarda zaten kendi 'warn' mesajı vardı; BU durumda
+    # apt'ın kendisi hata VERMEZ, yalnızca sessizce hiçbir şey değişmez).
+    local upstream_repo_rc=0
+    _install_redis_upstream_repo || upstream_repo_rc=$?
+
+    # BUG 2 düzeltmesi — bkz. yukarıdaki başlık yorumu: binary ile ÇALIŞAN
+    # süreç FARKLIYSA (apt binary'yi güncelledi ama süreç yeniden
+    # başlatılmadı), ACL kararından ÖNCE burada yeniden başlatılır ki az
+    # sonraki '_redis_version_pair' (core.sh) GERÇEĞİ görsün.
+    local pre_bin_major="" pre_bin_minor="" pre_run_major="" pre_run_minor="" pre_restart_decision
+    read -r pre_bin_major pre_bin_minor <<< "$(_redis_installed_binary_version_pair)"
+    read -r pre_run_major pre_run_minor <<< "$(_redis_version_pair)"
+    pre_restart_decision=$(_redis_restart_decision "$pre_bin_major" "$pre_bin_minor" "$pre_run_major" "$pre_run_minor")
+    if [[ "$pre_restart_decision" == "restart_needed" ]]; then
+        warn "Redis ikili dosyası ${pre_bin_major}.${pre_bin_minor}'ya güncellendi ama ÇALIŞAN süreç hâlâ ${pre_run_major}.${pre_run_minor} — pub/sub kanal izolasyonunun doğru tespit edilebilmesi için Redis ŞİMDİ yeniden başlatılıyor (aktif bağlantılar/pub-sub abonelikleri bir an için kesilir; RDB/AOF'a göre kalıcı veri KORUNUR)."
+        if ! systemctl restart redis-server 2>/dev/null; then
+            warn "Redis ara adımda yeniden başlatılamadı — devam ediliyor, bu fonksiyonun SONUNDAKİ koşulsuz restart'ta tekrar denenecek"
+        fi
     fi
 
     local redis_admin_pass
@@ -927,6 +1297,7 @@ REDISCONF
     init_channel_status=$(_redis_channel_isolation_mode "$init_redis_major" "$init_redis_minor")
     if [[ "$init_channel_status" == "supported" ]]; then
         init_channel_suffix=" &*"
+        success "Redis ${init_redis_major}.${init_redis_minor} kuruldu — pub/sub kanal izolasyonu AKTİF (ACL kanal token'ı '&*' destekleniyor)"
     else
         # Redis 6.0'da pub/sub ACL denetimi KAVRAM OLARAK YOK — '&*'yi
         # atlamak bir kısıtlamayı GEVŞETMEZ (zaten yoktu), yalnızca Redis'i
@@ -937,6 +1308,22 @@ REDISCONF
             warn "Redis sürümü tespit edilemedi — fail-closed: pub/sub kanal ACL token'ı ('&*') ATLANDI. Gerçek durumu 'redis-server --version' ile doğrulayın."
         else
             warn "Redis ${init_redis_major}.${init_redis_minor} tespit edildi (6.2 altı) — pub/sub kanal ACL'i bu sürümde MÜMKÜN DEĞİL: TÜM kimliği doğrulanmış istemciler TÜM kanallara serbestçe abone olabilir/yayın yapabilir (bu, Redis'in KENDİ sınırlamasıdır, srvctl'in eksikliği değil). İzolasyon gerekiyorsa Redis'i 6.2+'a yükseltin (Ubuntu 24.04'te varsayılan sürüm zaten 6.2+'tır)."
+            # TEŞHİS (SESSİZ epoch uyuşmazlığı — bkz. _install_redis_upstream_repo
+            # başlık yorumu madde 3 ve yukarıdaki 'upstream_repo_rc' yorumu):
+            # '_install_redis_upstream_repo' HATASIZ (rc=0) döndüyse repo
+            # eklendi, 'apt-get update' VE 'apt-get install redis-server
+            # redis-tools' İKİSİ DE başarılı oldu (apt bir hata VERMEDİ) — ama
+            # sürüm hâlâ 6.2 altındaysa bu, GERÇEK Ubuntu 22.04 VM'de
+            # ÖLÇÜLEREK doğrulanmış bir senaryonun (epoch bilerek yanlış
+            # yazılınca candidate SESSİZCE dağıtımın 6.0.16'sına düşüyor,
+            # hata YOK) canlıda da yaşanmış olabileceğinin işaretidir: pin
+            # dosyasındaki 'version 6:7.*' önekindeki epoch (6) upstream'in
+            # GÜNCEL epoch'uyla artık eşleşmiyor olabilir. Operatör bunu
+            # yukarıdaki genel uyarıdan (ki ağ/GPG/apt hatası da gösterebilir)
+            # AYIRT edebilsin diye AYRI, TEŞHİS EDİCİ bir mesaj basılıyor.
+            if [[ "$upstream_repo_rc" -eq 0 ]]; then
+                warn "Redis resmi deposu (packages.redis.io) eklendi ve apt güncellemesi/kurulumu HATASIZ tamamlandı ama sürüm hâlâ yükseltilmedi — pin dosyasındaki (${SRVCTL_APT_PREFS_DIR:-/etc/apt/preferences.d}/99-srvctl-redis.pref) 'version 6:7.*' öneki upstream'in GÜNCEL epoch'uyla eşleşmiyor olabilir (APT'nin version pin'i baştan joker DESTEKLEMEZ, yalnız SABİT önek eşleşmesi yapar). 'apt-cache policy redis-server' ile gerçek candidate'ı/önceliği inceleyip gerekirse pin dosyasındaki epoch önekini güncelleyin."
+            fi
         fi
     fi
 

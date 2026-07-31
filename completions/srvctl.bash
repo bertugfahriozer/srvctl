@@ -27,6 +27,9 @@ _srvctl_completions() {
             elif [[ ${COMP_CWORD} -eq 3 ]]; then
                 # Domain adı tamamlama
                 _srvctl_complete_domains
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "add" ]]; then
+                # 'domain add' bayrak tamamlama (--redis-queue dahil)
+                COMPREPLY=($(compgen -W "--php= --rate= --sensitive= --framework= --resources= --no-ssl --redis-queue" -- "$cur"))
             fi
             ;;
         deploy)

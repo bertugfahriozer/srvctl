@@ -56,7 +56,21 @@ _srvctl() {
                         'worker:Kuyruk worker yönetimi'
                         'scheduler:Zamanlanmış görev yönetimi'
                     )
-                    _describe 'domain işlemi' domain_cmds
+                    if [[ "${words[2]:-}" == "add" && ${#words} -ge 4 ]]; then
+                        local -a add_flags
+                        add_flags=(
+                            '--php=:PHP versiyonu (ör. 8.3)'
+                            '--rate=:Rate-limit profili'
+                            '--sensitive=:Hassas path listesi'
+                            '--framework=:Framework (ci4|laravel|symfony)'
+                            '--resources=:Kaynak profili (micro|standard|ecommerce|heavy)'
+                            '--no-ssl:SSL kurulumunu atla'
+                            '--redis-queue:Redis EVAL/Lua scripting AÇIKÇA iste (Laravel kuyruk/Horizon; Redis 7+ gerekir, bayraksız HER ZAMAN kapalı)'
+                        )
+                        _describe 'domain add seçeneği' add_flags
+                    else
+                        _describe 'domain işlemi' domain_cmds
+                    fi
                     ;;
                 deploy)
                     local -a deploy_cmds

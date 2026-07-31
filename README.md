@@ -39,6 +39,23 @@
 
 ---
 
+## Desteklenen Platformlar
+
+**Ubuntu 22.04 LTS (jammy)** ve **Ubuntu 24.04 LTS (noble)** birinci sınıf desteklenir — 24.04 bir "gelecek hedefi" değil, bugün üretimde çalışacak şekilde tasarlanmış ve gerçek VM'lerde doğrulanmıştır; 22.04 desteği düşürülmemiştir. `install.sh` her ikisini de **sessizce** kabul eder; başka bir Ubuntu sürümünde (ör. 20.04, 25.04) **uyarı + `evet` onayı** ister (kilitlemez), Ubuntu olmayan bir dağıtımda da aynı şekilde uyarır.
+
+İki LTS arasındaki, srvctl'i doğrudan etkileyen davranış farkları:
+
+| Bileşen | 22.04 (jammy) | 24.04 (noble) | Etkisi |
+|---|---|---|---|
+| Redis (apt varsayılan) | 6.0.16 | 7.0.15 | **22.04'te pub/sub kanal (channel) ACL izolasyonu YOK**: Redis 6.2 altında `resetchannels`/`&pattern` token'ları parser'da tanımlı değildir, bu yüzden bir domain diğer domain'lerin Redis kanallarını dinleyebilir/yayın yapabilir (srvctl'in değil, Redis 6.0'ın kendi sınırlaması). `srvctl init` bunu tespit edip **açıkça uyarır** (bkz. `_redis_channel_isolation_mode`, `lib/core.sh`). Kanal izolasyonu şart olan yoğun çok-domain'li (ör. e-ticaret) kurulumlarda **24.04 tercih edilmeli** ya da Redis 6.2+'a elle yükseltilmelidir. |
+| PHP (apt varsayılan) | 8.1 | 8.3 — **8.2 varsayılan depoda YOK** | `srvctl domain add`/`init` eksik bir PHP sürümünü fail-open atlar (çökmez); 24.04'te PHP 8.1 veya 8.2 isteniyorsa Ondřej PPA (`ppa:ondrej/php`) gerekir. |
+| AppArmor parser | 3.0.4 | 4.0.1 | Fark **gözlemlenmedi**: her iki şablon (`templates/apparmor/profile.tpl`, `profile-cli.tpl`) her iki sürümde de `apparmor_parser -Q` ile 0 kalıntı token'la temiz parse ediyor. |
+| systemd | 249 | 255 | Detaylar için bkz. aşağıdaki geliştirici referansı. |
+
+> Geliştirici referansı (yetenek-tespiti kuralları, tam sürüm-farkı tablosu, kod yazarken uyulacak kurallar): [`.claude/ubuntu-compat.md`](.claude/ubuntu-compat.md).
+
+---
+
 ## Redis Scripting (Lua) Durumu
 
 Domain'de `REDIS_SCRIPTING=enabled` belirtilirse:

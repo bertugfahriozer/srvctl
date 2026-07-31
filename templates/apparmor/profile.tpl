@@ -176,22 +176,79 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   # statik/koşulsuz olarak dahil edilir (kullanılmayan yol = boş/no-op,
   # ek saldırı yüzeyi doğurmaz). Bkz. rapor: "Render escaping" notu.
   {{WEB_ROOT}}/{{DOMAIN}}/releases/**/storage/** rwk,
-  # NOT (kanıt: gerçek Ubuntu 22.04 VM, HTTP 500 + tempnam() hatası): 'srvctl
-  # deploy' HER release'de bootstrap/cache'i shared/bootstrap-cache'e
-  # symlink'ler (bkz. lib/deploy.sh:_deploy_link_shared, shared_pairs).
-  # AppArmor symlink'i ÇÖZER ve GERÇEK (shared) yolu denetler — bu yüzden
-  # aşağıdaki 'releases/**/bootstrap/cache/**' kuralı srvctl deploy ile
-  # yönetilen release'lerde ASLA eşleşmez (ölü kural). Yine de KORUNUYOR:
-  # operatör symlink'i kaldırıp bootstrap/cache'i GERÇEK bir dizin olarak
-  # kullanırsa (srvctl deploy dışı/manuel bir dağıtım) bu satır devreye
-  # girer; kullanılmıyorken boş/no-op olduğundan ek saldırı yüzeyi
-  # doğurmaz. Asıl çalışan kural bir alt satırdaki 'shared/bootstrap-cache/**'tir.
+  # DÜZELTME (lib/deploy.sh — HOST'ta ÖLÇÜLEN, Symfony var/cache ile AYNI
+  # SINIF bug): composer'ın post-autoload-dump'ı + 'artisan config:cache/
+  # route:cache/event:cache' bootstrap/cache/*.php'ye release'in MUTLAK
+  # yolunu gömer — bu yüzden 'bootstrap/cache:bootstrap-cache' PAYLAŞIMI
+  # lib/deploy.sh'tan TAMAMEN KALDIRILDI (shared_pairs, ~satır 1848-1852).
+  # Her release ARTIK KENDİ bootstrap/cache'ini kullanır: aşağıdaki
+  # 'releases/**/bootstrap/cache/**' kuralı BUNUN İÇİN artık GERÇEKTEN
+  # AKTİF (symlink YOK, release-yerel gerçek dizin — önceki sürümde bu
+  # satır "ölü kural" olarak belgelenmişti, ARTIK DEĞİL).
+  # 'shared/bootstrap-cache/**' (aşağıda) ARTIK YENİ deploy'lar tarafından
+  # oluşturulmuyor — DEPRECATED/LEGACY-COMPAT, bkz. o satırdaki NOT.
   {{WEB_ROOT}}/{{DOMAIN}}/releases/**/bootstrap/cache/** rwk,
   {{WEB_ROOT}}/{{DOMAIN}}/shared/storage/** rwk,
+  # ─── DEPRECATED/LEGACY-COMPAT: 'shared/bootstrap-cache/**' ───
+  # lib/deploy.sh ARTIK bunu üretmiyor (yukarıdaki NOT) — yeni deploy'lar
+  # bootstrap/cache'i release-yerel tutuyor, buraya symlink KURMUYOR.
+  # KALDIRILMADI, çünkü: bu şema değişikliğinden ÖNCE deploy edilmiş ve
+  # HENÜZ yeniden deploy EDİLMEMİŞ ('srvctl domain deploy' ile) bir
+  # Laravel sitesi, eski 'bootstrap/cache -> ../../../shared/bootstrap-cache'
+  # symlink'ini DİSKTE hâlâ TAŞIYOR OLABİLİR. AppArmor profili yeniden
+  # render edilip yüklendiği AN (ör. rutin bir 'srvctl domain repair'/paket
+  # yükseltmesi — YENİ BİR DEPLOY OLMADAN) bu satır kaldırılsaydı o
+  # sitenin bootstrap/cache YAZMALARI aniden REDDEDİLİRDİ: SESSİZ, deploy'
+  # dan BAĞIMSIZ bir fail-CLOSED kesinti (güvenlik açığı DEĞİL, ama
+  # beklenmedik). lib/deploy.sh'taki eşdeğer karar (ölü mutlak yol tespit
+  # edilince OTOMATİK SİLMEYİP yalnızca operatörü UYARMASI) ile TUTARLI:
+  # bu satır da operatör eski paylaşılan dizini ELLE temizleyip siteyi
+  # yeniden deploy EDENE KADAR kalır. AppArmor whitelist modeli olduğundan
+  # bu gerçek bir (küçük) fazladan yüzeydir — ele geçirilmiş bir release
+  # süreci artık kullanılmayan bu dizine de yazabilir — ama risk kabul
+  # edilebilir: (a) DAC zaten AYNI web_user'a bu dizini vermiş durumda,
+  # AppArmor yalnızca EK bir MAC katmanı; (b) erişim yalnız AYNI domain'in
+  # KENDİ sürecinden mümkün (başka domain'e sızma YOK); (c) buna karşılık
+  # kaldırmanın maliyeti geri dönüşü ZOR, deploy'dan bağımsız bir kesinti.
+  # GELECEK TEMİZLİK: tüm domainlerin yeni şemaya geçtiği (redeploy edildiği)
+  # doğrulanınca bu satır (ve profile-cli.tpl'deki eşi) kaldırılabilir —
+  # HOST'ta doğrulanacak madde, bkz. rapor.
   {{WEB_ROOT}}/{{DOMAIN}}/shared/bootstrap-cache/** rwk,
 
   # Symfony yazma yolları (var/cache, var/log, var/sessions vb.)
+  # DÜZELTME (HOST ölçümü — kanıt: shared/var/cache içinde 60 dosyada ÖLÜ/
+  # silinmiş bir release'in mutlak yolu bulundu, canlı site "Class
+  # Symfony\Bundle\DebugBundle\DebugBundle not found" ile 500 veriyordu —
+  # paylaşılan cache'te DEV ortamında derlenmiş bir container --no-dev
+  # kurulumunda arıyordu): Symfony'nin var/cache'i ARTIK PAYLAŞILMIYOR —
+  # her release KENDİ var/cache'ini kullanır (composer/console'un o release
+  # içinde derlediği, chroot-göreli gerçek dizin). Aşağıdaki
+  # 'releases/**/var/**' kuralı BU YÜZDEN gerçekten aktiftir — symlink'le
+  # ÇÖZÜLÜP başka bir yola YÖNLENMEZ (yalnız var/log ve var/sessions
+  # symlink'tir, bkz. altındaki NOT).
+  #
+  # Yalnızca 'var/log' ve 'var/sessions' PAYLAŞILIYOR (deploy'lar arası log
+  # tarihçesi / oturum sürekliliği için — ikisi de yalnız DÜZ VERİ içerir,
+  # release'in mutlak yolunu GÖMMEZ). lib/deploy.sh'ta 'var/log:var-log' ve
+  # 'var/sessions:var-sessions' (tire'li isimler — 'bootstrap-cache' ile
+  # AYNI kural: iç içe rel_path'te düz isim yerine belirtik önek, ileride
+  # yanlışlıkla bir 'cache' paylaşımı eklenirse isim ÇAKIŞMASIN). AppArmor
+  # symlink'i ÇÖZÜP GERÇEK (shared) yolu denetlediğinden bu iki alt yol için
+  # AYRI, AÇIK kurallar GEREKİR — 'releases/**/var/**' onları KAPSAMAZ
+  # (symlink hedefleri bu glob'un DIŞINDAKİ 'shared/var-log'/
+  # 'shared/var-sessions'a çözülür).
   {{WEB_ROOT}}/{{DOMAIN}}/releases/**/var/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/var-log/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/var-sessions/** rwk,
+  # ─── DEPRECATED/LEGACY-COMPAT: 'shared/var/**' ───
+  # ESKİ ('var:var') şemadan kalma — lib/deploy.sh ARTIK bunu üretmiyor
+  # (yukarıdaki NOT). Gerekçe 'shared/bootstrap-cache/**' NOTUYLA (yukarıda)
+  # BİREBİR AYNI: henüz yeniden deploy EDİLMEMİŞ eski bir Symfony sitesi bu
+  # dizine hâlâ symlink'li olabilir; kaldırmak deploy'dan BAĞIMSIZ, SESSİZ
+  # bir kesinti riski doğurur. lib/deploy.sh operatörü uyarıp OTOMATİK
+  # SİLMİYOR (ölü mutlak yol tespiti, shared/var/cache) — bu satır da aynı
+  # geçiş süresince KALIR; operatör elle temizleyip yeniden deploy edince
+  # (ve tüm domainler doğrulanınca) kaldırılabilir.
   {{WEB_ROOT}}/{{DOMAIN}}/shared/var/** rwk,
 
   # Log dizini (yazma)

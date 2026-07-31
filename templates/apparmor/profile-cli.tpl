@@ -102,16 +102,37 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
 
   # Laravel (queue:work: storage/logs, cache; schedule:run: bootstrap/cache)
   {{WEB_ROOT}}/{{DOMAIN}}/releases/**/storage/** rwk,
-  # bootstrap/cache: 'srvctl deploy' bunu shared/bootstrap-cache'e symlink'ler
-  # (bkz. profile.tpl'deki AYNI NOT ve lib/deploy.sh:_deploy_link_shared) —
-  # bu satır srvctl deploy release'lerinde ölü kural, manuel/srvctl-deploy-
-  # dışı dağıtımlar için korunuyor (no-op, ek saldırı yüzeyi doğurmaz).
+  # DÜZELTME (lib/deploy.sh — bkz. profile.tpl'deki AYNI NOT, birebir aynı
+  # gerekçe): bootstrap/cache ARTIK PAYLAŞILMIYOR (composer/artisan cache
+  # komutları release'in MUTLAK yolunu gömüyordu — Symfony var/cache ile
+  # AYNI sınıf bug, HOST'ta ölçüldü). Her release KENDİ bootstrap/cache'ini
+  # kullanır — bu yüzden aşağıdaki satır GERÇEKTEN aktif (symlink YOK,
+  # release-yerel gerçek dizin).
   {{WEB_ROOT}}/{{DOMAIN}}/releases/**/bootstrap/cache/** rwk,
   {{WEB_ROOT}}/{{DOMAIN}}/shared/storage/** rwk,
+  # DEPRECATED/LEGACY-COMPAT (bkz. profile.tpl'deki AYNI NOT — birebir aynı
+  # gerekçe): lib/deploy.sh ARTIK üretmiyor, ama henüz yeniden deploy
+  # EDİLMEMİŞ eski siteler hâlâ bu dizine symlink'li olabilir; kaldırmak
+  # deploy'dan BAĞIMSIZ, SESSİZ bir kesinti riski doğurur (lib/deploy.sh'ın
+  # "ölü yol tespit et, OTOMATİK SİLME" kararıyla tutarlı). Operatör elle
+  # temizleyip yeniden deploy edince kaldırılabilir.
   {{WEB_ROOT}}/{{DOMAIN}}/shared/bootstrap-cache/** rwk,
 
-  # Symfony (messenger:consume: var/cache, var/log)
+  # Symfony (messenger:consume: var/cache, var/log, var/sessions)
+  # var/cache ARTIK PAYLAŞILMIYOR (HOST ölçümü — bkz. profile.tpl'deki AYNI
+  # NOT: paylaşılan cache'te ölü release yolları birikip canlı siteyi
+  # bozuyordu); her release kendi var/cache'ini kullanır — aşağıdaki
+  # 'releases/**/var/**' bu yüzden GERÇEKTEN aktif. Yalnız 'var/log' ve
+  # 'var/sessions' PAYLAŞILIYOR (tire'li 'var-log'/'var-sessions' adlarıyla
+  # — bkz. profile.tpl'deki AYNI NOT, lib/deploy.sh 'shared_pairs'); AppArmor
+  # symlink'i çözüp gerçek shared yolu denetlediğinden bu ikisi için AYRI
+  # kurallar gerekir.
   {{WEB_ROOT}}/{{DOMAIN}}/releases/**/var/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/var-log/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/var-sessions/** rwk,
+  # DEPRECATED/LEGACY-COMPAT (bkz. profile.tpl'deki AYNI NOT — birebir aynı
+  # gerekçe: eski 'var:var' şemasından kalma, henüz yeniden deploy
+  # EDİLMEMİŞ siteler için geçiş süresince korunuyor, OTOMATİK SİLİNMİYOR).
   {{WEB_ROOT}}/{{DOMAIN}}/shared/var/** rwk,
 
   {{WEB_ROOT}}/{{DOMAIN}}/logs/** rwk,

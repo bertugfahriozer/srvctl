@@ -402,6 +402,145 @@ _deploy_discard_release() {
     warn "Başarısız release diskten kaldırıldı: $(basename "$rel_real")"
 }
 
+# ───────────────────────────────────────────────────────────────
+#  BUG C DÜZELTMESİ (gerçek VM bug'ı, koordinatör raporu, Symfony deploy'u,
+#  Ubuntu 22.04): sağlık kontrolü BAŞARISIZ olduğunda VE geri dönülecek
+#  gerçek bir ÖNCEKİ release YOKSA (ör. bu İLK deploy denemesiyse),
+#  _deploy_run adım 7'de 'public_html'/'current' ZATEN bu (şimdi silinen)
+#  release'e çevrilmişti — release silinince bu iki symlink KIRIK
+#  (dangling) kalıyor, domain KALICI 404/500'e düşüyordu. VM'de ölçülen son
+#  durum:
+#      current      -> releases/<id>   (KIRIK symlink)
+#      public_html  -> releases/<id>   (KIRIK symlink)
+#      releases/    -> BOŞ
+#      public_html.bak.<ts>/  (orijinal içerik BURADA duruyor, GERİ
+#                              YÜKLENMİYOR)
+#  Yani domain deploy ÖNCESİNDEN DAHA KÖTÜ bir durumda kalıyordu (deploy
+#  öncesi çalışan bir placeholder sayfası vardı; sonrasında kalıcı kırık
+#  symlink).
+#
+#  _deploy_run'dan AYRI bir fonksiyona ÇIKARILDI (bkz. _deploy_composer_
+#  install/_deploy_build ile AYNI desen) ki tests/ gerçek git clone/health-
+#  probe/systemctl OLMADAN, düz dosya sistemi fixture'larıyla bu kurtarma
+#  mantığını doğrudan çağırıp test edebilsin (bkz.
+#  tests/test_deploy_no_rollback_recover.sh).
+#
+#  BOŞLUK BULUNDU (koordinatör, HOST doğrulaması): yukarıdaki ilk sürüm
+#  'public_html_backup' (bu ÇALIŞMANIN izlediği yedek) yoksa yalnız KIRIK
+#  symlink'i kaldırıyordu — ama bu, 'public_html'i TAMAMEN YOK bırakıyordu
+#  (ne dizin, ne symlink). pool.conf.tpl'nin 'chdir = /public_html'
+#  direktifi bu yolun VAR OLMASINI ZORUNLU kılar (php-fpm config-test
+#  aşamasında doğrular); yokluk 'php-switch', 'security harden-fpm',
+#  'domain repair' dahil TÜM kurtarma yollarını FPM aktivasyon aşamasında
+#  çökertiyordu — domain elle müdahale olmadan KURTARILAMAZ hale geliyordu.
+#  Ayrıca VM'de gözlemlendi: bir ÖNCEKİ başarısız deploy'un bıraktığı
+#  'public_html.bak.<ts>' diskte DURUYORDU ama bu ÇALIŞMANIN kendi
+#  'public_html_backup' değişkeni onu bilmiyordu (yalnız AYNI çalışmada
+#  üretileni izliyordu) — o içerik görmezden geliniyordu.
+#
+#  Karar (ÜÇ kademeli, sırayla dene, ilk başarılı olan kazanır):
+#   1) 'public_html_backup' (adım 7'nin BU çalışmada ürettiği '.bak' yolu)
+#      varsa GERİ YÜKLE — en güvenilir kaynak (bu deploy'un başında
+#      public_html'in KESİN olarak ne olduğunu bilir).
+#   2) Yoksa, base'teki EN YENİ 'public_html.bak.*' dizinini (varsa, ÖNCEKİ
+#      bir başarısız deploy'dan kalmış olabilir) geri yükle. Bu içerik
+#      domain'e AİTTİR ve kaybı GERİ ALINAMAZ; bayat olma riski, kalıcı
+#      404/500 + TÜM kurtarma komutlarının çökmesi riskinden EHVENDİR.
+#      Hangi yedeğin ve ne zamanki olduğu operatöre AÇIKÇA söylenir (warn).
+#      Epoch sırası dizin ADINDAN (mtime'DAN DEĞİL) okunur: release id'lerin
+#      aksine (bkz. _deploy_is_release_id yorumu — releases/ web_user
+#      tarafından yazılabilir 750'dir) base/'in kendisi 'root:root 751'dir
+#      (T1 fs-ownership modeli) — web_user base İÇİNE YENİ bir '.bak.<epoch>'
+#      dizini YARATAMAZ, bu yüzden dizin adındaki epoch GÜVENİLİRDİR.
+#   3) İkisi de yoksa (hiç yedek bulunamadı) BOŞ bir 'public_html' dizini
+#      OLUŞTUR (doğru sahiplik/izin + ACL ile) — bu, pool.conf.tpl'nin
+#      'chdir' invariant'ını GARANTİ eder ve domaini en azından
+#      YÖNETİLEBİLİR (php-switch/harden-fpm/repair çalışabilir) bırakır.
+#
+#  'current' İÇİN AYRI bir yedek YOKTUR (ilk deploy'dan önce 'current' hiç
+#  VAR OLMAZ — bkz. lib/domain.sh:_domain_working_dir, yalnız bir YOL
+#  üretir, dosya/symlink OLUŞTURMAZ) — systemd WorkingDirectory'si için
+#  'current'ın VAR OLMASI ZORUNLU DEĞİLDİR (worker/scheduler unit'i yoksa
+#  hiç okunmaz); bu yüzden 'current' için tek doğru hareket, kırıksa
+#  KALDIRMAKTIR — public_html'deki gibi bir 'chdir' invariant'ı YOKTUR.
+#
+#  PREDİKAT DEĞİL — yan etkili bir düzeltme adımıdır, exit ETMEZ (çağıran
+#  _deploy_run kendi error()'unu ayrıca çağırır). FONKSİYON HER ZAMAN
+#  KOŞULSUZ 'return 0' ile biter (bkz. aşağıdaki yorum — dosya-geneli kural:
+#  '[[ ]] && cmd' bir ifadenin SONUCU olarak kullanıldığında koşul yanlışsa
+#  TÜM ifade başarısız sayılır; bu fonksiyon 'set -e' altında çıplak bir
+#  ifade olarak çağrılır, yanlışlıkla 1 dönerse TÜM deploy betiği SESSİZCE
+#  sonlanırdı — bkz. K2/H6 yorumları).
+# ───────────────────────────────────────────────────────────────
+_deploy_no_rollback_recover() {
+    local base="$1" public_dir="$2" public_html_backup="${3:-}" web_user="${4:-}"
+
+    # 'current' public_html kararından BAĞIMSIZDIR — en başta hallet.
+    if [[ -L "${base}/current" ]]; then
+        rm -f "${base}/current"
+    fi
+
+    # 1) Bu ÇALIŞMANIN izlediği yedek.
+    if [[ -n "$public_html_backup" && -d "$public_html_backup" ]]; then
+        rm -f "$public_dir"
+        mv "$public_html_backup" "$public_dir"
+        info "public_html deploy ÖNCESİNDEKİ (placeholder) haline geri yüklendi: ${public_html_backup}"
+        return 0
+    fi
+
+    # Kırık (dangling) symlink varsa kaldır — 2/3. kademeye geçmeden önce.
+    if [[ -L "$public_dir" ]]; then
+        rm -f "$public_dir"
+        warn "public_html KIRIK (dangling) symlink'ti — kaldırıldı (bu çalışmanın izlediği bir yedek yoktu)"
+    fi
+
+    # 2) Diskteki EN YENİ 'public_html.bak.*' (ÖNCEKİ bir başarısız
+    #    deploy'dan kalmış olabilir — bkz. yukarıdaki BOŞLUK notu).
+    if [[ ! -e "$public_dir" ]]; then
+        local newest_epoch="" newest_bak="" epoch
+        while IFS= read -r epoch; do
+            [[ -z "$epoch" ]] && continue
+            newest_epoch="$epoch"
+        done < <(find "$base" -maxdepth 1 -type d -name 'public_html.bak.*' 2>/dev/null \
+                     | sed 's#.*/public_html\.bak\.##' \
+                     | grep -E '^[0-9]+$' \
+                     | sort -n)
+        if [[ -n "$newest_epoch" ]]; then
+            newest_bak="${base}/public_html.bak.${newest_epoch}"
+            if [[ -d "$newest_bak" && ! -L "$newest_bak" ]]; then
+                local bak_human
+                bak_human=$(date -r "$newest_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+                    || date -d "@${newest_epoch}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+                    || echo "epoch ${newest_epoch}")
+                mv "$newest_bak" "$public_dir"
+                warn "public_html YOKTU — diskte bulunan ÖNCEKİ bir yedek geri yüklendi: $(basename "$newest_bak") (tarih: ${bak_human}). Bu içerik BAYAT olabilir, kontrol edin."
+            fi
+        fi
+    fi
+
+    # 3) Hâlâ yoksa (hiç yedek bulunamadı): BOŞ bir public_html oluştur —
+    #    php-fpm pool'unun 'chdir = /public_html' invariant'ı bu yolun VAR
+    #    OLMASINI ZORUNLU kılar (yoksa config-test çöker, TÜM kurtarma
+    #    komutları — php-switch/harden-fpm/repair — FPM aktivasyonunda
+    #    başarısız olur). Sahiplik/izin komşu release/.bak dizinleriyle
+    #    TUTARLI (web_user:web_user 750 + www-data ACL, bkz. adım 3 —
+    #    _deploy_run'daki İzinler bloğu).
+    if [[ ! -e "$public_dir" ]]; then
+        mkdir -p "$public_dir"
+        if [[ -n "$web_user" ]] && id "$web_user" &>/dev/null; then
+            chown "${web_user}:${web_user}" "$public_dir" 2>/dev/null || true
+        fi
+        chmod 750 "$public_dir" 2>/dev/null || true
+        if command -v setfacl &>/dev/null; then
+            setfacl -m "u:www-data:rx" "$public_dir" 2>/dev/null || true
+            setfacl -d -m "u:www-data:rx" "$public_dir" 2>/dev/null || true
+        fi
+        warn "public_html YOKTU ve geri yüklenecek bir yedek bulunamadı — BOŞ bir public_html oluşturuldu (PHP-FPM 'chdir' invariant'ı için ZORUNLU; aksi halde domain php-switch/harden-fpm/repair dahil HİÇBİR komutla kurtarılamaz)."
+    fi
+
+    return 0
+}
+
 # Per-domain deploy kilidi (flock). Aynı domain'e eş zamanlı iki deploy
 # aynı release_dir adını üretebilir, birbirinin symlink'ini ezebilir ve
 # birinin prune'u diğerinin doldurmakta olduğu dizini silebilir.
@@ -476,6 +615,36 @@ _deploy_read_framework() {
     echo "$fw"
 }
 
+# PREDİKAT (0=operatör framework'ü AÇIKÇA beyan etmiş VE bu beyan
+# 'expected' ile eşleşiyor; 1=beyan yok/okunamıyor/farklı). lib/domain.sh'ın
+# '_domain_framework_declared' KONTRATINI kullanır (aynı çapraz-modül,
+# fail-soft desen — bkz. _deploy_read_framework yukarısı): O fonksiyon
+# "beyan yok" ile "beyan=ci4" durumlarını AYIRT EDER (ikisinde de
+# _deploy_read_framework/_domain_read_framework 'ci4' döndürür — bu yüzden
+# bu ayrım İÇİN AYRI bir okuyucu şart).
+#
+# GERÇEK VM BUG'I (BUG B, koordinatör raporu, Symfony deploy'u): domain
+# '--framework=symfony' ile AÇIKÇA kurulmuştu ama composer/build zinciri
+# kırıldığından release'de 'bin/console' YOKTU; _deploy_build bunu sadece
+# 'info' ile atlıyordu — kırık bir framework build'i "framework'süz normal
+# bir PHP app" ile AYIRT EDİLEMİYORDU, deploy SESSİZCE "başarılı" görünüyordu
+# (health probe 200/302 dönerse). _deploy_build artık bu predikatı kullanıp
+# YALNIZ AÇIKÇA beyan edilmiş bir framework'ün entry dosyası eksikse
+# error() ile durur; beyan yoksa (varsayılan/ci4'e düşülmüş) ESKİ yumuşak
+# davranış (info+atla) KORUNUR — çünkü o durumda bunun gerçekten kırık bir
+# framework mi yoksa framework KULLANMAYAN sıradan bir PHP uygulaması mı
+# olduğunu BİLEMEYİZ (bkz. dosya-geneli kural: bir güvenlik/doğrulama
+# kararını SIKILAŞTIRMAK AÇIK BEYAN ister, "beyan yok/okunamadı" HER ZAMAN
+# yumuşak/varsayılan tarafa düşer).
+_deploy_framework_declared() {
+    local domain="$1" expected="$2"
+    local declared=""
+    if source "${SRVCTL_ROOT}/lib/domain.sh" 2>/dev/null && command -v _domain_framework_declared &>/dev/null; then
+        declared=$(_domain_framework_declared "$domain" 2>/dev/null) || declared=""
+    fi
+    [[ -n "$declared" && "$declared" == "$expected" ]]
+}
+
 # Release içeriğinden framework TESPİTİ — SADECE raporlama/uyarı içindir.
 # İzin/izolasyon kararları operatörün 'srvctl domain add --framework' ile
 # beyan ettiği (.srvctl-meta FRAMEWORK) değere göre alınır; ele geçirilmiş
@@ -530,6 +699,187 @@ _deploy_shared_rel() {
 # rc=$?' içinde 'echo sonra' HER ZAMAN çalışır). Yani bu fonksiyonun içindeki
 # HİÇBİR komut errexit'e güvenemez — her potansiyel başarısızlık AÇIKÇA
 # '|| error'/kontrol edilmelidir; aşağıdaki her adım bunu yapar.
+
+# ───────────────────────────────────────────────────────────────
+#  shared/.env koruması ve mükerrer-anahtar teşhisi — GERÇEK VM BUG'I
+#  (koordinatör raporu, symfony/demo + PHP 8.4, tam commit'lenmiş repo,
+#  Ubuntu 22.04):
+#
+#      [4/9] Composer install ...
+#      Script cache:clear returned with error code 255
+#      !! Uncaught Error: Class "Symfony\Bundle\DebugBundle\DebugBundle" not found
+#      ✗ Composer install başarısız — deploy durduruldu
+#
+#  Kök neden ESKİDEN release/.env'in shared/.env'e SYMLINK olmasıydı (aşağı
+#  bkz. _deploy_run adım 2) — composer/symfony-flex'in "henüz uygulanmamış"
+#  sandığı bir recipe .env'e YAZINCA (flex'in configurator adımı, KENDİ
+#  başına ZARARSIZ bir davranış) bu yazı SYMLINK ÜZERİNDEN doğrudan KALICI
+#  shared/.env'e SIZIYORDU:
+#      ###> symfony/framework-bundle ###
+#      APP_ENV=dev
+#      APP_SECRET=
+#      ###< symfony/framework-bundle ###
+#  Dotenv (Symfony/Laravel) dosya İÇİNDE SON tanımın KAZANDIĞI kurala göre
+#  çalıştığından, bu blok dosyanın SONUNA eklenince ÜRETİMDE GEÇERLİ olan
+#  değerler 'APP_ENV=dev' ve BOŞ 'APP_SECRET' oluyordu — KALICI (shared/
+#  deploy'lar arası yaşar), her SONRAKİ deploy bozuk dosyayı DEVRALIYORDU.
+#  APP_ENV=dev üretimde profiler/web-debug-toolbar'ı VE tam stack trace'leri
+#  (dosya yolları, sorgu detayları) açığa çıkarır; boş APP_SECRET CSRF token
+#  üretimi/imzalı URI'ler/"remember me" çerezleri için kullanılan anahtarın
+#  BOŞ olması demektir — SESSİZCE, hiçbir uyarı ÜRETMEDEN.
+# ───────────────────────────────────────────────────────────────
+
+# shared/.env içinde MÜKERRER (aynı KEY= birden fazla kez) anahtar var mı?
+# Varsa HER biri için 'KEY:satır1,satır2,...' biçiminde bir satır YAZAR
+# (yorum '#' ve boş satırlar hariç). GNU awk'a ÖZGÜ 3-argümanlı match()
+# KULLANILMAZ (macOS'un /usr/bin/awk'ında — one-true-awk — YOK; bkz.
+# _deploy_composer_php_constraint'in AYNI kısıtı) — split+gsub ile portable
+# yazılmıştır.
+_deploy_env_duplicate_keys() {
+    local env_file="$1"
+    [[ -f "$env_file" ]] || return 0
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (line !~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=/) next
+            n = split(line, parts, "=")
+            key = parts[1]
+            gsub(/[[:space:]]+$/, "", key)
+            count[key]++
+            if (lines[key] == "") { lines[key] = NR } else { lines[key] = lines[key] "," NR }
+        }
+        END {
+            for (k in count) if (count[k] > 1) print k ":" lines[k]
+        }
+    ' "$env_file" 2>/dev/null
+}
+
+# Bir .env anahtarı GÜVENLİK-KRİTİK mi? (mükerrer olduğunda operatöre
+# ESKALASYON edilir — koordinatörün özellikle adlandırdığı APP_ENV/
+# APP_DEBUG/APP_SECRET dahil, makul bir genelleme ile).
+_deploy_env_key_is_critical() {
+    case "$1" in
+        APP_ENV|APP_DEBUG|APP_SECRET|APP_KEY|DB_PASSWORD|DB_PASS|REDIS_PASSWORD|REDIS_PASS|JWT_SECRET_KEY|JWT_PASSPHRASE)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Bir .env anahtarının DEĞERİ log/uyarı çıktısına yazılabilir mi? (0=YAZMA,
+# yalnız anahtar adı+satır numarası göster). PAROLA/SIR ASLA mesaja
+# konulmaz (bkz. _deploy_notify yorumu — AYNI disiplin). APP_ENV/APP_DEBUG
+# gibi bayraklar SIR DEĞİLDİR (yalnız prod/dev, true/false) — bunların
+# değeri GÖSTERİLİR (operatöre somut teşhis için gereklidir).
+_deploy_env_key_is_secret() {
+    case "$1" in
+        *SECRET*|*PASSWORD*|*PASS|*_KEY|*TOKEN*|*DSN*|*PASSPHRASE*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# shared/.env'de tespit edilen HER mükerrer anahtarı operatöre AÇIKÇA
+# bildirir (bkz. yukarıdaki BUG özeti). OTOMATİK SİLME YAPMAZ — mükerrer
+# blok operatörün BİLİNÇLİ bir eklemesi olabilir; karar operatöre bırakılır.
+# 'warn' kullanılır (deploy'u BLOKE ETMEZ — composer/build zaten adım 4/6'da
+# kendi bağımsız kapılarından geçer, bkz. _deploy_composer_install/
+# _deploy_build_env_overrides; bu fonksiyon yalnız TEŞHİS/GÖRÜNÜRLÜK
+# katmanıdır).
+_deploy_env_check_duplicates() {
+    local env_file="$1"
+    [[ -f "$env_file" ]] || return 0
+    local line key lines_str last_line level val
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        key="${line%%:*}"
+        lines_str="${line#*:}"
+        last_line="${lines_str##*,}"
+        level="bilgi"
+        _deploy_env_key_is_critical "$key" && level="GÜVENLİK-KRİTİK"
+        if _deploy_env_key_is_secret "$key"; then
+            val="(gizli değer — log'a yazılmadı)"
+        else
+            val=$(sed -n "${last_line}p" "$env_file" 2>/dev/null | sed -E 's/^[^=]*=//')
+        fi
+        warn "shared/.env içinde MÜKERRER anahtar [${level}]: '${key}' satır(lar) ${lines_str}'da tekrarlanmış — dosya-yükleyicide (Dotenv vb.) GEÇERLİ olan SON tanımdır: satır ${last_line} ('${key}=${val}'). srvctl OTOMATİK SİLME YAPMAZ — muhtemelen bir composer/flex reçetesinin eklediği fazlalık bloğu ELLE kaldırın: ${env_file}"
+    done < <(_deploy_env_duplicate_keys "$env_file")
+}
+
+# release/.env'i shared/.env'e BAĞLAR — KOPYALAR, symlink DEĞİL (bkz.
+# fonksiyon üstü GERÇEK VM BUG'I özeti). ESKİDEN 'ln -sf' kullanılıyordu:
+# composer/flex/npm gibi web_user olarak çalışan HERHANGİ bir sürecin
+# .env'e yaptığı yazı doğrudan KALICI shared/.env'e SIZIYORDU (symfony/
+# flex'in bir recipe'i "uygulanmamış" sanıp APP_ENV=dev + boş APP_SECRET
+# eklemesi gibi) — 'shared/' deploy'lar arası YAŞADIĞINDAN bu bozulma
+# KALICIYDI, her sonraki deploy bozuk dosyayı DEVRALIYORDU. Kopya bu sınıf
+# açığı TAMAMEN kapatır: release içinden yapılan yazılar yalnız bu
+# DİSPOSABLE kopyayı etkiler (release prune'da silinir), KALICI shared/.env
+# HİÇBİR ZAMAN açılıp yazılmaz.
+#
+# ALTERNATİF DEĞERLENDİRİLDİ VE REDDEDİLDİ (composer boyunca shared/.env'i
+# salt-okunur yapmak): (a) exit ile ölen error() yollarında izinleri GERİ
+# ALMAK için trap gerektirir (ek karmaşıklık/kırılma riski — bir bug
+# izinleri kalıcı salt-okunur bırakabilir, TÜM gelecek deploy'ları/manuel
+# .env düzenlemelerini kırar), (b) chmod yalnız dosyanın KENDİSİNİ korur —
+# shared/ dizini web_user için yazılabilirse bir araç dosyayı unlink+yeniden
+# yaratabilir (chmod'u TAMAMEN BYPASS EDER, directory permission dosya
+# permission'ından ÜSTÜNDÜR); kopya bu sınıf açığın TAMAMEN dışındadır
+# (release'in kopyası shared'e HİÇBİR ŞEKİLDE bağlı değildir, unlink+
+# yeniden yaratma release TARAFINDA olsa bile shared'i ETKİLEMEZ).
+#
+# _deploy_run'dan (adım 2) AYRI bir fonksiyona ÇIKARILDI ki (bkz. diğer
+# _deploy_* extraction'ları ile AYNI desen) tests/ doğrudan çağırıp test
+# edebilsin. Dönüş: 0=kopyalandı, 1=shared/.env symlink/güvensiz (reddedildi)
+# ya da kopyalama başarısız, 2=shared/.env yok (atlanır, hata değil).
+_deploy_env_link() {
+    local shared_dir="$1" release_dir="$2"
+    if [[ -e "${shared_dir}/.env" ]] && _deploy_assert_safe_shared "${shared_dir}/.env"; then
+        if cp -- "${shared_dir}/.env" "${release_dir}/.env"; then
+            success ".env kopyalandı (shared/.env korunuyor — release içi yazılar kalıcı dosyayı etkilemez)"
+            return 0
+        fi
+        warn ".env kopyalanamadı: ${shared_dir}/.env -> ${release_dir}/.env"
+        return 1
+    elif [[ -L "${shared_dir}/.env" ]]; then
+        warn "shared/.env bir symlink — güvenlik nedeniyle atlandı"
+        return 1
+    fi
+    warn ".env bulunamadı: ${shared_dir}/.env"
+    return 2
+}
+
+# Symfony'nin ESKİ 'var:var' paylaşım şemasından (bkz. yukarıdaki shared_pairs
+# yorumu — GERÇEK VM bug'ı: paylaşılan var/cache ölü bir release'in mutlak
+# yolunu kalıcı olarak taşıyıp sonraki HER deploy'u ve hatta CANLI siteyi
+# zehirliyordu) kalma bir 'shared/var/cache' varsa VE içinde 'releases/'
+# geçen (muhtemelen ÖLÜ bir release'e ait) bir yol bulunuyorsa operatöre
+# AÇIKÇA bildirir.
+#
+# OTOMATİK SİLME YAPMAZ — bilinçli karar: 'var/cache' TANIMI GEREĞİ yeniden
+# üretilebilir olduğundan silmek TEK BAŞINA savunulabilir olurdu, ama ESKİ
+# şemada 'shared/var/' aynı çatı altında (varsa) operatörün DEĞERLİ 'var/log'
+# ve 'var/sessions' TARİHÇESİNİ de barındırıyor olabilir (yeni şema bunları
+# AYRI 'shared/var-log'/'shared/var-sessions' adlarına taşıdı, ama ESKİ
+# kurulumlarda hâlâ 'shared/var/log' altında olabilirler). Kör bir
+# 'rm -rf shared/var/cache' BİLE (yalnız 'cache' alt dizinini hedeflese de)
+# operatörün BEKLEMEDİĞİ bir otomasyonun kendi shared/ içeriğine dokunması
+# anlamına gelir — bu projenin GENEL disiplini (bkz. _deploy_env_check_
+# duplicates/_deploy_no_rollback_recover) paylaşılan/kalıcı veri söz konusu
+# olduğunda TEŞHİS+YÖNLENDİRME'yi, OTOMATİK SİLMEYE HER ZAMAN tercih eder.
+#
+# PREDİKAT DEĞİL — yan etkisi YOK (yalnız warn), exit ETMEZ.
+_deploy_symfony_detect_poisoned_shared_var() {
+    local shared_dir="$1"
+    local legacy_cache_dir="${shared_dir}/var/cache"
+    [[ -d "$legacy_cache_dir" ]] || return 0
+    local hit
+    hit=$(grep -rl "releases/" -- "$legacy_cache_dir" 2>/dev/null | head -1)
+    [[ -n "$hit" ]] || return 0
+    warn "shared/var/cache içinde ESKİ (muhtemelen ÖLÜ bir release'e ait) mutlak yol(lar) bulundu — ör. ${hit}. Bu, srvctl'in ARTIK KULLANMADIĞI 'var:var' paylaşım şemasından kalma bir kalıntıdır (bkz. deploy adım 2 yorumu) ve 'MappingException'/'Class DebugBundle not found' sınıfı hatalara yol açabilir. srvctl bunu OTOMATİK SİLMEZ (shared/var/ içinde değerli var/log ya da var/sessions tarihçesi de OLABİLİR). ÖNERİ: değerli bir tarihçe varsa 'shared/var/log' ve 'shared/var/sessions' içeriğini ELLE 'shared/var-log' ve 'shared/var-sessions'a taşıyın, SONRA 'rm -rf ${legacy_cache_dir}' (ya da tamamı için 'rm -rf ${shared_dir}/var') ile eski, artık hiçbir release'e bağlı OLMAYAN paylaşılan cache'i temizleyin."
+}
+
 _deploy_link_shared() {
     local release_dir="$1" shared_dir="$2" rel_path="$3" shared_subdir="$4"
     local shared_target="${shared_dir}/${shared_subdir}"
@@ -664,14 +1014,20 @@ _deploy_chroot_active() {
 #
 # 5. parametre 'chroot_active' (bkz. _deploy_chroot_active): "true" ise,
 # yukarıdaki cache adımlarının HOST'ta ürettiği ve mutlak HOST yolu gömen
-# Laravel 'bootstrap/cache/*.php' (ve hipotez olarak Symfony
+# Laravel 'bootstrap/cache/*.php' (ve VM'DE AYRICA DOĞRULANAN Symfony
 # 'var/cache/<env>') artefaktları build SONUNDA silinir — framework onları
 # ÇALIŞMA ZAMANINDA, chroot İÇİNDE (bu kez doğru yollarla) yeniden üretir.
-# CI4 bu sınıftan ETKİLENMEZ (gerçek deploy'da HTTP 200, open_basedir hatası
-# sıfır — bkz. rapor) — CI4 dalına KASITLI olarak dokunulmadı.
+# Her iki artefakt da (bootstrap/cache, var/cache) ARTIK release-yerel bir
+# dizindir (bkz. _deploy_run'daki shared_pairs yorumu — eskiden ikisi de
+# shared/'e symlink'ti ve bu silme fiilen PAYLAŞILAN dizini boşaltıyordu;
+# bu, canlı-site-bozulması + ölü-release-yolu-kalıcılığı sınıfı bug'lara yol
+# açtığından PAYLAŞIMDAN ÇIKARILDI) — bu yüzden bu satır artık YALNIZ
+# ÇAĞRILAN release'i etkiler. CI4 bu sınıftan ETKİLENMEZ (gerçek deploy'da
+# HTTP 200, open_basedir hatası sıfır — bkz. rapor) — CI4 dalına KASITLI
+# olarak dokunulmadı.
 _deploy_build() {
     local framework="$1" release_dir="$2" web_user="$3" php_bin="$4"
-    local chroot_active="${5:-true}"
+    local chroot_active="${5:-true}" framework_declared="${6:-false}"
 
     # GÜVENLİK: release_dir boş/yok İSE aşağıdaki 'rm -rf --
     # "${release_dir}/var/cache/prod/"*' gibi temizlik satırları
@@ -683,15 +1039,38 @@ _deploy_build() {
     [[ -n "$release_dir" && -d "$release_dir" ]] \
         || { warn "_deploy_build: release_dir geçersiz/boş — build atlandı: '${release_dir}'"; return 1; }
 
+    # GÜVENLİK DÜZELTMESİ (bkz. _deploy_build_env_overrides yorumu — gerçek
+    # VM bug'ı, symfony/demo + PHP 8.4): artisan/console çağrılarına da AYNI
+    # GERÇEK ortam değişkeni zorlaması uygulanır — yalnız composer'ın KENDİ
+    # çağrısını değil, _deploy_build'in AYRICA çalıştırdığı cache:clear/
+    # config:cache gibi build adımlarını da shared/.env'in (ÖNCEDEN bozulmuş
+    # olsa BİLE) etkilemesinden korur.
+    local -a fw_env=()
+    local _fw_env_kv
+    while IFS= read -r _fw_env_kv; do
+        [[ -n "$_fw_env_kv" ]] && fw_env+=("$_fw_env_kv")
+    done < <(_deploy_build_env_overrides "$framework")
+
     case "$framework" in
         laravel)
             if [[ ! -f "${release_dir}/artisan" ]]; then
+                # BUG B (bkz. _deploy_framework_declared yorumu, gerçek VM
+                # bulgusu): domain AÇIKÇA 'laravel' beyan edilmişse entry
+                # dosyasının eksikliği NORMAL bir durum DEĞİL — kırık bir
+                # composer/build zincirinin (ör. BUG A: composer.json
+                # gereksinimleri çözülemedi) kanıtıdır; sessizce 'info'
+                # ile atlanıp deploy'un "başarılı" görünmesine izin
+                # VERİLMEZ. Beyan yoksa (framework varsayılan/ci4'e
+                # düşülmüşse) eski yumuşak davranış korunur.
+                if [[ "$framework_declared" == "true" ]]; then
+                    error "Domain 'laravel' framework'üyle AÇIKÇA beyan edilmiş ama release'de 'artisan' YOK — deploy durduruldu (kırık bir build canlıya alınmaz). Composer install çıktısını ve repo'yu kontrol edin: ${release_dir}"
+                fi
                 info "artisan bulunamadı — Laravel build adımları atlanıyor"
             else
                 local step_name
                 for step_name in config:cache route:cache view:cache event:cache; do
                     _deploy_privdrop "$web_user" \
-                        env HOME="$release_dir" "$php_bin" "${release_dir}/artisan" "$step_name" --no-interaction \
+                        env HOME="$release_dir" ${fw_env[@]+"${fw_env[@]}"} "$php_bin" "${release_dir}/artisan" "$step_name" --no-interaction \
                         || error "artisan ${step_name} başarısız — deploy durduruldu (bozuk önbellek canlıya alınmaz)"
                 done
 
@@ -712,6 +1091,14 @@ _deploy_build() {
                 # Chroot AKTİF DEĞİLSE dokunulmaz: o zaman 'config:cache' zaten
                 # HOST ile AYNI ortamda servis edildiğinden ürettiği yol doğrudur
                 # ve gerçek bir performans kazancıdır — körlemesine kaldırılmaz.
+                # GÜNCELLEME (bkz. _deploy_run'daki shared_pairs yorumu):
+                # 'bootstrap/cache' ARTIK PAYLAŞILMIYOR (eskiden
+                # 'bootstrap/cache:bootstrap-cache' ile shared/bootstrap-
+                # cache'e symlink'ti — bu, YENİ release'in build'i henüz
+                # CANLI olmadan shared'i kendi mutlak yoluyla ezip AYNI ANDA
+                # CANLI olan ESKİ release'i de bozabiliyordu). Bu satır artık
+                # YALNIZ bu release'in KENDİ yerel dizinini temizler —
+                # başka bir release'e/paylaşılan bir dizine ASLA dokunmaz.
                 if [[ "$chroot_active" == "true" ]]; then
                     rm -f -- "${release_dir}/bootstrap/cache/"*.php 2>/dev/null || true
                     info "Chroot aktif — bootstrap/cache manifest'leri temizlendi (framework chroot içinde yeniden üretecek)"
@@ -720,12 +1107,16 @@ _deploy_build() {
                 # storage:link: public/storage -> storage/app/public. HER release
                 # yeni bir dizin olduğundan bu symlink HER seferinde yeniden kurulmalı.
                 _deploy_privdrop "$web_user" \
-                    env HOME="$release_dir" "$php_bin" "${release_dir}/artisan" storage:link --no-interaction \
+                    env HOME="$release_dir" ${fw_env[@]+"${fw_env[@]}"} "$php_bin" "${release_dir}/artisan" storage:link --no-interaction \
                     || warn "artisan storage:link başarısız — public/storage bağlanmamış olabilir (devam ediliyor)"
             fi
             ;;
         ci4)
             if [[ ! -f "${release_dir}/spark" ]]; then
+                # BUG B — bkz. laravel dalındaki AYNI gerekçe.
+                if [[ "$framework_declared" == "true" ]]; then
+                    error "Domain 'ci4' framework'üyle AÇIKÇA beyan edilmiş ama release'de 'spark' YOK — deploy durduruldu (kırık bir build canlıya alınmaz). Composer install çıktısını ve repo'yu kontrol edin: ${release_dir}"
+                fi
                 info "spark bulunamadı — CI4 build adımları atlanıyor"
             else
                 _deploy_privdrop "$web_user" \
@@ -735,34 +1126,61 @@ _deploy_build() {
             ;;
         symfony)
             if [[ ! -f "${release_dir}/bin/console" ]]; then
+                # BUG B — bkz. laravel dalındaki AYNI gerekçe. VM'DE
+                # DOĞRULANDI (Symfony deploy'u): 'bin/console' aslında
+                # symfony/skeleton'ın git deposunda DEĞİL, symfony/flex'in
+                # 'composer install' SIRASINDA recipe olarak ürettiği bir
+                # dosyadır — composer'ın kendisi 'başarılı' (çıkış kodu 0)
+                # görünse bile flex'in İÇ 'composer update'i güvenlik
+                # danışmanlığı (advisory) engeliyle çökerse bu recipe hiç
+                # UYGULANMAZ ve 'bin/console' asla oluşmaz (bkz. BUG A /
+                # _deploy_composer_install). Yani bu dal genelde BUG A'nın
+                # DOĞRUDAN sonucudur; yine de framework build'in KENDİ
+                # başına da bunu yakalaması gerekir (savunma-derinliği —
+                # composer'ın kendi kontrolünü BYPASS eden başka bir yol
+                # bulunursa).
+                if [[ "$framework_declared" == "true" ]]; then
+                    error "Domain 'symfony' framework'üyle AÇIKÇA beyan edilmiş ama release'de 'bin/console' YOK — deploy durduruldu (kırık bir build canlıya alınmaz). Composer install çıktısını ve repo'yu kontrol edin: ${release_dir}"
+                fi
                 info "bin/console bulunamadı — Symfony build adımları atlanıyor"
             else
                 _deploy_privdrop "$web_user" \
-                    env HOME="$release_dir" "$php_bin" "${release_dir}/bin/console" cache:clear --env=prod --no-interaction \
+                    env HOME="$release_dir" ${fw_env[@]+"${fw_env[@]}"} "$php_bin" "${release_dir}/bin/console" cache:clear --env=prod --no-interaction \
                     || error "bin/console cache:clear başarısız — deploy durduruldu (bozuk önbellek canlıya alınmaz)"
                 _deploy_privdrop "$web_user" \
-                    env HOME="$release_dir" "$php_bin" "${release_dir}/bin/console" cache:warmup --env=prod --no-interaction \
+                    env HOME="$release_dir" ${fw_env[@]+"${fw_env[@]}"} "$php_bin" "${release_dir}/bin/console" cache:warmup --env=prod --no-interaction \
                     || warn "bin/console cache:warmup başarısız (devam ediliyor)"
 
-                # HİPOTEZ — VM'DE DOĞRULANMADI (Laravel dalının aksine bu proje
-                # gerçek bir Symfony deploy'unda HENÜZ ölçülmedi; HOST'ta
-                # doğrulanmalı). Aynı kök neden BEKLENİYOR: Symfony'nin
-                # derlenmiş DI container'ı (var/cache/<env>/...Container.php)
-                # 'kernel.project_dir' parametresini BUILD ANINDA (Kernel
-                # sınıfının ReflectionObject ile bulunan dosya yolundan)
-                # hesaplayıp mutlak HOST yolu olarak container'a GÖMER —
-                # Laravel'in bootstrap/cache'iyle AYNI sınıf hata (chroot'lu
-                # FPM bu HOST yolunu asla çözemez). Aynı savunma-derinliği:
-                # chroot aktifse derlenmiş cache SİLİNİR; Symfony prod'da
-                # container eksikse HATA VERMEZ, ilk istekte lazily (bu kez
-                # chroot İÇİNDE, doğru yollarla) yeniden derler.
+                # HİPOTEZ VM'DE DOĞRULANDI (bkz. _deploy_run'daki shared_pairs
+                # yorumu — gerçek koordinatör raporu): Symfony'nin derlenmiş
+                # DI container'ı (var/cache/prod/App_KernelProdContainer.php),
+                # route eşleyici ve Doctrine mapping meta'sı BUILD ANINDA
+                # release'in MUTLAK yolunu gömer — Laravel'in bootstrap/
+                # cache'iyle AYNI sınıf hata (chroot'lu FPM bu HOST yolunu
+                # asla çözemez). Aynı savunma-derinliği: chroot aktifse
+                # derlenmiş cache SİLİNİR; Symfony prod'da container eksikse
+                # HATA VERMEZ, ilk istekte lazily (bu kez chroot İÇİNDE,
+                # doğru yollarla) yeniden derler.
+                #
+                # GÜNCELLEME: 'var/cache' ARTIK PAYLAŞILMIYOR (eskiden
+                # 'var:var' ile shared/var'a symlink'ti — bu satır o zaman
+                # aslında PAYLAŞILAN dizini temizliyordu, ama bu temizlik
+                # YENİ release'in build'i shared'i EZDİKTEN SONRA çalıştığı
+                # için ARADA bir pencere kalıyordu VE bazı ortamlarda
+                # chroot_active'ın YANLIŞ tespit edilmesi/edilmemesi bu
+                # temizliğin hiç çalışmamasına yol açabiliyordu — VM'de
+                # tam olarak bu şekilde ölü bir release'in yolu shared cache'te
+                # KALICI olarak bulundu; bu da CANLI SİTEYİ "Class DebugBundle
+                # not found" ile bozdu). Artık release-yerel bir dizin
+                # olduğundan bu satır YALNIZ bu release'i etkiler — yapısal
+                # olarak başka bir release'e/canlı siteye SIZMA İMKANSIZ.
                 if [[ "$chroot_active" == "true" ]]; then
                     rm -rf -- "${release_dir}/var/cache/prod/"* 2>/dev/null || true
-                    info "Chroot aktif — Symfony var/cache/prod temizlendi (HİPOTEZ, HOST'ta doğrulanmalı — bkz. _deploy_chroot_active yorumu)"
+                    info "Chroot aktif — Symfony var/cache/prod temizlendi (framework chroot içinde yeniden üretecek)"
                 fi
 
                 _deploy_privdrop "$web_user" \
-                    env HOME="$release_dir" "$php_bin" "${release_dir}/bin/console" assets:install --no-interaction "${release_dir}/public" \
+                    env HOME="$release_dir" ${fw_env[@]+"${fw_env[@]}"} "$php_bin" "${release_dir}/bin/console" assets:install --no-interaction "${release_dir}/public" \
                     || warn "bin/console assets:install başarısız (devam ediliyor)"
             fi
             ;;
@@ -813,6 +1231,456 @@ _deploy_restart_workers() {
 }
 
 # ───────────────────────────────────────────────────────────────
+#  Composer PHP sürüm uyumluluğu — ERKEN ön kontrol (bkz. gerçek VM bug'ı,
+#  koordinatör raporu: Laravel 13.x >=8.4.1 gerektiriyordu, domain PHP
+#  8.3'teydi, host'ta php8.4 de kuruluydu; composer HOST'un php8.4'üyle
+#  platform kontrolünü YANLIŞLIKLA geçti, İKİ ADIM SONRA 'artisan
+#  config:cache' domain'in php8.3'üyle patladı — kök neden operatöre
+#  GÖRÜNMEDİ, bkz. iki adım aşağıdaki _deploy_run adım 4 yorumu). Aşağıdaki
+#  iki fonksiyon composer'dan ÖNCE, ${release_dir} ZATEN klonlanmışken
+#  çalışır: composer.json'daki 'require.php' kısıtını okur ve domain'in
+#  PHP sürümüyle KABACA karşılaştırır.
+# ───────────────────────────────────────────────────────────────
+
+# composer.json içindeki 'require' bloğundan 'php' kısıtını çıkarır.
+# jq VARSA onu kullanır (en güvenilir — CLAUDE.md gereği jq bir BAĞIMLILIK
+# olarak EKLENMEZ, yalnız zaten kuruluysa TERCİH edilir); YOKSA satır-tabanlı
+# bir awk ile 'require' bloğunun açılışı ile ilk kapanan '}' arasında
+# '"php": "..."' arar. Bulunamazsa/ayrıştırılamazsa BOŞ string döner (çağıran
+# bunu "kısıt yok/bilinmiyor" sayıp kontrolü sessizce atlar — jq'suz ortamda
+# minified/tek-satır composer.json bu awk'ın kaçırabileceği nadir bir
+# biçimdir; bu KABUL EDİLEBİLİR bir sınırlamadır, tam bir JSON parser
+# YAZILMAZ; composer'ın kendisi zaten dosyayı asıl doğru şekilde ayrıştırıp
+# gerekirse kendi hatasını verecektir — burası yalnız ERKEN UYARI katmanıdır).
+_deploy_composer_php_constraint() {
+    local composer_json="$1"
+    [[ -f "$composer_json" ]] || return 0
+    if command -v jq &>/dev/null; then
+        jq -r '.require.php // empty' "$composer_json" 2>/dev/null
+        return 0
+    fi
+    awk '
+        /"require"[[:space:]]*:[[:space:]]*\{/ && !done { in_req=1; next }
+        in_req && /^[[:space:]]*\}/ { in_req=0 }
+        in_req && match($0, /"php"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+            s = substr($0, RSTART, RLENGTH)
+            sub(/^"php"[[:space:]]*:[[:space:]]*"/, "", s)
+            sub(/"$/, "", s)
+            print s
+            done = 1
+            exit
+        }
+    ' "$composer_json" 2>/dev/null
+}
+
+# Tek bir kısıt token'ını (>=8.4.1, ^8.2, ~8.2, 8.2.*, 8.2 gibi) ayrıştırır.
+# Sonucu GLOBAL 'reply_*' değişkenlerine yazar (bash 3.2 uyumluluğu için —
+# macOS'un sevk ettiği /bin/bash 3.2'de 'local -n'/nameref YOK; bu proje
+# macOS'ta test edilir, bkz. CLAUDE.md). DÖNÜŞ: 0=token TANINDI, 1=TANINMADI.
+_deploy_php_parse_token() {
+    local tok="$1" ver
+    reply_op="" reply_vmaj="" reply_vmin="" reply_wildcard=0
+    if [[ "$tok" =~ ^\>=(.+)$ ]]; then reply_op=">="; ver="${BASH_REMATCH[1]}"
+    elif [[ "$tok" =~ ^\<=(.+)$ ]]; then reply_op="<="; ver="${BASH_REMATCH[1]}"
+    elif [[ "$tok" =~ ^\>(.+)$ ]]; then reply_op=">"; ver="${BASH_REMATCH[1]}"
+    elif [[ "$tok" =~ ^\<(.+)$ ]]; then reply_op="<"; ver="${BASH_REMATCH[1]}"
+    elif [[ "$tok" =~ ^\^(.+)$ ]]; then reply_op="^"; ver="${BASH_REMATCH[1]}"
+    elif [[ "$tok" =~ ^~(.+)$ ]]; then reply_op="~"; ver="${BASH_REMATCH[1]}"
+    elif [[ "$tok" =~ ^([0-9]+)(\.([0-9]+|\*))?(\.(\*|[0-9]+))?$ ]]; then
+        reply_op="=="; ver="$tok"
+    else
+        return 1
+    fi
+
+    local vmaj vmin
+    IFS='.' read -r vmaj vmin _ <<<"$ver"
+    [[ "$vmaj" =~ ^[0-9]+$ ]] || return 1
+    if [[ -z "${vmin:-}" || "$vmin" == "*" ]]; then
+        reply_wildcard=1; vmin=0
+    elif [[ ! "$vmin" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    reply_vmaj=$((10#$vmaj))
+    reply_vmin=$((10#$vmin))
+    return 0
+}
+
+# Tek bir AND grubundaki (boşluk/virgülle ayrılmış token'lar) kısıtların
+# TÜMÜNÜN domain PHP sürümüyle (major*1000+minor biçiminde 'dmm') uyumlu
+# olup olmadığını değerlendirir. DÖNÜŞ: 0=uyumlu, 1=KESİN uyumsuz,
+# 2=belirsiz (tanınmayan/ayrıştırılamayan bir token — çağıran bunu hataya
+# DEĞİL uyarıya çevirir, bkz. _deploy_php_satisfies).
+#
+# İKİ GEÇİŞLİ değerlendirme ZORUNLU (bkz. rapor): hyphen-range gibi kısmen
+# tanınan bir ifadede (ör. '5.6 - 7.0' -> token'lar '5.6', '-', '7.0') TEK
+# GEÇİŞLİ bir değerlendirme '5.6' token'ını TEK BAŞINA geçerli bir "çıplak
+# sürüm" sanıp domain'le KARŞILAŞTIRABİLİR ve '-' token'ına hiç ULAŞMADAN
+# erken 'KESİN uyumsuz' (1) dönebilirdi — oysa bu ifadenin BÜTÜNÜ (bir
+# ARALIK) yanlış yorumlanmıştır ve BELİRSİZ (2) sayılması gerekir. Bu yüzden
+# ÖNCE tüm token'ların tanınırlığı kontrol edilir (birinin bile tanınmaması
+# TÜM grubu belirsiz yapar), SONRA (ve YALNIZ hepsi tanınıyorsa) gerçek
+# karşılaştırma yapılır.
+_deploy_php_constraint_group_ok() {
+    local dmm="$1" dmaj_n="$2" group="$3" tok
+
+    for tok in $group; do
+        [[ -z "$tok" ]] && continue
+        _deploy_php_parse_token "$tok" || return 2
+    done
+
+    for tok in $group; do
+        [[ -z "$tok" ]] && continue
+        _deploy_php_parse_token "$tok" || return 2
+        local vmm=$(( reply_vmaj * 1000 + reply_vmin ))
+        case "$reply_op" in
+            ">=") (( dmm >= vmm )) || return 1 ;;
+            ">")  (( dmm >  vmm )) || return 1 ;;
+            "<=") (( dmm <= vmm )) || return 1 ;;
+            "<")  (( dmm <  vmm )) || return 1 ;;
+            "^")
+                (( dmaj_n == reply_vmaj )) || return 1
+                (( dmm >= vmm )) || return 1
+                ;;
+            "~")
+                if [[ "$reply_wildcard" == "1" ]]; then
+                    (( dmaj_n == reply_vmaj )) || return 1
+                else
+                    (( dmm == vmm )) || return 1
+                fi
+                ;;
+            "==")
+                if [[ "$reply_wildcard" == "1" ]]; then
+                    (( dmaj_n == reply_vmaj )) || return 1
+                else
+                    (( dmm == vmm )) || return 1
+                fi
+                ;;
+        esac
+    done
+    return 0
+}
+
+# composer.json 'require.php' kısıtını (ör. '>=8.4.1', '^8.2', '>=8.1 <9.0',
+# '8.2.*') domain'in PHP sürümüyle KABACA karşılaştırır. Yalnız major.minor
+# ÇÖZÜNÜRLÜĞÜNDE çalışır — _derive_php zaten bundan FAZLASINI bilmiyor (ör.
+# domain "8.3" olarak /etc/php/8.3'e karşılık gelir, gerçek patch sürümü
+# host'ta neyse odur); bu yüzden kısıtlardaki patch bileşeni (ör. '8.4.1'
+# içindeki '.1') KIRPILIR. TAM bir semver çözücü DEĞİLDİR: '||' (OR) ve
+# boşluk/virgülle AND edilmiş yaygın biçimleri kapsar; hyphen-range
+# ('5.6 - 7.0' gibi) ve dev-branch takma adları gibi nadir biçimler
+# TANINMAZ.
+#
+# DÖNÜŞ: 0=uyumlu (kısıt yok/'*' dahil), 1=KESİN uyumsuz, 2=belirsiz (en az
+# bir OR grubu tanınmadı VE hiçbir grup KESİN uyumlu bulunamadı). Çağıran
+# (bkz. _deploy_run adım 4a) 1'i error (deploy composer'dan ÖNCE durur),
+# 2'yi warn+devam olarak ele alır — belirsizlikte kısıt SESSİZCE "uyumlu"
+# SAYILMAZ (fail-open değil, görünür bir uyarı bırakılır), ama sağlam bir
+# deploy'u yanlış-pozitifle BLOKE de ETMEZ.
+_deploy_php_satisfies() {
+    local domain_php="$1" constraint="$2"
+    constraint="$(printf '%s' "$constraint" | tr -d '\r\n')"
+    constraint="${constraint#"${constraint%%[![:space:]]*}"}"
+    constraint="${constraint%"${constraint##*[![:space:]]}"}"
+    [[ -z "$constraint" || "$constraint" == "*" ]] && return 0
+
+    local dmaj dmin
+    IFS='.' read -r dmaj dmin _ <<<"$domain_php"
+    [[ "$dmaj" =~ ^[0-9]+$ ]] || return 2
+    [[ "$dmin" =~ ^[0-9]+$ ]] || dmin=0
+    local dmm=$((10#$dmaj * 1000 + 10#$dmin))
+    local dmaj_n=$((10#$dmaj))
+
+    # '||' (OR) üzerinden GRUPLARA ayır. NOT: bash 3.2'de (macOS'un sevk
+    # ettiği /bin/bash — bu proje macOS'ta test edilir, bkz. CLAUDE.md)
+    # 'IFS=$'\x01' read -ra arr <<<"$x"' biçimi kontrol karakteriyle
+    # GÜVENİLİR ÇALIŞMIYOR (ölçüldü: dizi HİÇ bölünmüyor) — bu yüzden saf
+    # parametre genişletmesiyle (sentinel/IFS'siz) elle bölünür.
+    local rest="$constraint" group rc uncertain=0
+    while [[ "$rest" == *"||"* ]]; do
+        group="${rest%%||*}"
+        rest="${rest#*||}"
+        group="${group//,/ }"
+        rc=0
+        _deploy_php_constraint_group_ok "$dmm" "$dmaj_n" "$group" || rc=$?
+        [[ "$rc" == "0" ]] && return 0
+        [[ "$rc" == "2" ]] && uncertain=1
+    done
+    group="${rest//,/ }"
+    rc=0
+    _deploy_php_constraint_group_ok "$dmm" "$dmaj_n" "$group" || rc=$?
+    [[ "$rc" == "0" ]] && return 0
+    [[ "$rc" == "2" ]] && uncertain=1
+
+    [[ "$uncertain" == "1" ]] && return 2
+    return 1
+}
+
+# composer ikili dosyasının bir PHP betiği/phar mı yoksa başka bir tür
+# sarmalayıcı (shell script, native binary) mı olduğunu tahmin eder.
+# PREDİKAT: 0=PHP betiği/phar (güvenle "${php_bin} ${bin}" olarak
+# çağrılabilir), 1=değil/emin değil.
+#
+# ARAŞTIRMA (koordinatör VM ölçümü, Ubuntu 22.04, srvctl-jammy):
+#   composer yolu       : /usr/local/bin/composer
+#   composer türü       : "a /usr/bin/env php script executable"
+#   ilk satır           : #!/usr/bin/env php
+#   doğrulanan çağrı    : 'php8.3 /usr/local/bin/composer --version' ÇALIŞIYOR
+# Yani composer (get.composer.org kurulumu VE Ubuntu/Debian 'composer'
+# paketi ikisi de) ÇIPLAK bir PHP phar'ıdır; PHP CLI bir dosyayı
+# çalıştırırken başında '#!' varsa o satırı YORUM sayıp atlar (CGI/shebang
+# ile aynı davranış), yani '"$php_bin" "$composer_bin"' shebang'daki
+# 'env php' çözümlemesini TAMAMEN BY-PASS EDER ve İSTENEN sürümü zorlar —
+# bu, getcomposer.org'un resmi olarak belgelediği "farklı bir PHP sürümüyle
+# çalıştırma" biçimidir.
+#
+# Composer BİR ŞEKİLDE (nadir; bu VM'de GÖZLEMLENMEDİ) php-olmayan bir
+# sarmalayıcı (ör. bir dağıtımın 'update-alternatives' shell script'i)
+# olarak paketlenmişse bu fonksiyon 1 döner; çağıran (_deploy_run adım 4)
+# o durumda PATH'e ${php_bin}'e işaret eden bir 'php' shim'i koyup composer'ı
+# KENDİ adıyla çalıştırır (sarmalayıcı içeride PATH'ten 'php' arıyorsa bizim
+# sürümü bulur).
+_deploy_composer_is_php_script() {
+    local bin="$1" head
+    [[ -r "$bin" ]] || return 1
+    head=$(head -c 256 -- "$bin" 2>/dev/null) || return 1
+    [[ "$head" == '<?php'* ]] && return 0
+    if [[ "$head" == '#!'* ]]; then
+        local first_line="${head%%$'\n'*}"
+        [[ "$first_line" == *php* ]] && return 0
+    fi
+    return 1
+}
+
+# Beyan edilmiş framework başına, composer'ın GERÇEKTEN kurmuş OLMASI
+# gereken paket dizinini döndürür (boş = bu framework için bilinen bir
+# işaretçi yok, kontrol atlanır). BUG A (bkz. _deploy_composer_install
+# yorumu) için: 'vendor/autoload.php var mı' sorusu YETERSİZ — composer bir
+# ALT bağımlılığı (ör. symfony/flex) kurup KENDİ İÇ 'composer update'i
+# başarısız olduğunda bile autoload.php ÜRETİLMİŞ olabilir. Paket adları
+# framework BEYANINDAN türetilir, repo içeriğinden TAHMİN EDİLMEZ (deploy'un
+# genel sözleşmesiyle tutarlı, bkz. _deploy_link_shared/_deploy_build).
+_deploy_composer_expected_vendor_pkg() {
+    case "$1" in
+        laravel) echo "laravel/framework" ;;
+        symfony) echo "symfony/framework-bundle" ;;
+        ci4)     echo "codeigniter4/framework" ;;
+        *)       echo "" ;;
+    esac
+}
+
+# Framework'e özgü, BUILD ZAMANI (composer install + artisan/console
+# çağrıları) için GERÇEK ortam değişkeni olarak zorlanacak APP_ENV/
+# APP_DEBUG çiftini satır satır YAZAR (boşsa hiçbir şey yazmaz). Her satır
+# 'KEY=VALUE' biçimindedir; çağıran bunu bir diziye okuyup 'env' çağrısına
+# ekler.
+#
+# GERÇEK VM BUG'I (bkz. _deploy_env_check_duplicates yorumu — symfony/demo,
+# PHP 8.4): shared/.env symfony/flex tarafından bozulup 'APP_ENV=dev' kazanınca
+# composer'ın KENDİ 'post-install-cmd' hook'u (flex'in dahili
+# 'cache:clear'i) dev-only bir bundle (DebugBundle) arayıp ÇÖKTÜ. Symfony'nin
+# Dotenv'i (ve Laravel'in vlucas/phpdotenv'i) ZATEN VAR OLAN bir GERÇEK
+# ortam değişkenini .env'deki değerle ASLA EZMEZ — yani burada 'env
+# APP_ENV=prod APP_DEBUG=0 composer install ...' biçiminde GERÇEK ortam
+# değişkeni olarak geçirilirse, .env'İN İÇERİĞİ NE OLURSA OLSUN (bozuk/
+# mükerrer olsa BİLE) bu değerler KAZANIR. Bu, Symfony'nin resmi deploy
+# dokümantasyonunun BİREBİR ÖNERDİĞİ biçimdir ('APP_ENV=prod APP_DEBUG=0
+# composer install --no-dev --optimize-autoloader'); Laravel'in karşılığı
+# ('APP_ENV=production') aynı sebeple (vlucas/phpdotenv de ayNI şekilde
+# ZATEN-VAR-OLAN gerçek env'i EZMEZ) uygulanır — savunma-derinliği, Laravel'de
+# flex-benzeri bir .env-yazan recipe sistemi OLMASA da bu ZARARSIZ ve UCUZ
+# bir ek güvencedir.
+#
+# CI4'e KASITLI OLARAK dokunulmadı: flex-tarzı bir "recipe .env'e otomatik
+# yazar" mekanizması YOK (koordinatör taramasında ci4.local ETKİLENMEDİ);
+# CI4'ün .env okuma biçimi de (putenv, farklı bir kural seti) FARKLI —
+# test edilmemiş/gereksiz bir davranış EKLEMEMEK için bilinen bug'ın
+# kapsamı dışına ÇIKILMADI.
+_deploy_build_env_overrides() {
+    case "$1" in
+        laravel) printf '%s\n%s\n' "APP_ENV=production" "APP_DEBUG=false" ;;
+        symfony) printf '%s\n%s\n' "APP_ENV=prod" "APP_DEBUG=0" ;;
+        *) : ;;
+    esac
+}
+
+# ───────────────────────────────────────────────────────────────
+#  Composer'ı DAİMA domain'in PHP sürümüyle (${php_bin}), web_user olarak
+#  (root DEĞİL) kurar. composer.json repodan gelir; root çalıştırmak kötü
+#  niyetli bir lifecycle script'ine root verirdi. _deploy_run'dan (adım 4)
+#  ayrı bir fonksiyona ÇIKARILDI ki (bkz. _deploy_build/_deploy_link_shared
+#  ile AYNI desen) tests/ gerçek git clone/network OLMADAN, sahte bir
+#  composer/php ikili dosyasıyla bu mantığı doğrudan çağırıp test edebilsin.
+#
+#  KÖK NEDEN DÜZELTMESİ (gerçek VM bug'ı, Laravel 13.x, Ubuntu 22.04):
+#  composer ÇIPLAK 'composer' adıyla çağrıldığında kendi shebang'ı
+#  ('#!/usr/bin/env php') üzerinden HOST'un PATH'indeki VARSAYILAN php'yi
+#  seçiyordu — domain'in FPM'de kullandığı sürümle (ör. 8.3) DEĞİL. VM'de
+#  host'ta php8.4 de kuruluyken bu composer'ın 8.4'ün platform kontrolünü
+#  sessizce geçmesine yol açıyordu ('✓ Composer paketleri yüklendi'); İKİ
+#  ADIM SONRA (framework build) 'artisan config:cache' domain'in GERÇEK
+#  php8.3'üyle "Composer detected issues in your platform: ... PHP version
+#  '>= 8.4.1' ... You are running 8.3.33" hatasıyla patlıyordu — operatöre
+#  görünen hata kök nedenden iki adım geride ve YANILTICIYDI. VM'de
+#  composer'ın çıplak bir PHP betiği/phar olduğu doğrulandı (bkz.
+#  _deploy_composer_is_php_script yorumu) — bu yüzden composer artık açıkça
+#  ${php_bin} ile çağrılır.
+#
+#  Argümanlar: release_dir web_user php_bin php_version domain composer_home
+#                                                                 framework
+#  error() ile exit eder (uyumsuz PHP kısıtı / composer eksik / kurulum
+#  başarısız / composer 'başarılı' ama beklenen framework paketi eksik) —
+#  çağıran (_deploy_run) bunu ZATEN error-exit-eden komşu adımlarla (ör.
+#  _deploy_link_shared) AYNI şekilde ele alır.
+#
+#  BUG A (gerçek VM bug'ı, koordinatör raporu, Symfony 7.3 skeleton, Ubuntu
+#  22.04): 'composer install' ÖNCE yalnız symfony/flex'i kurup (rc=0) SONRA
+#  flex'in KENDİ İÇ 'composer update'ini tetikliyor; bu ikinci adım composer
+#  2.10'un 'policy.advisories.block' davranışı yüzünden ("Your requirements
+#  could not be resolved to an installable set of packages ... affected by
+#  security advisories") ÇÖKÜYOR — ama flex zaten kurulduğundan
+#  'vendor/autoload.php' VARDI ve eski guard bunu "başarılı" sayıyordu
+#  ('✓ Composer paketleri yüklendi' yazdırıp devam ediyordu). Bu yüzden
+#  autoload.php kontrolüne İKİ bağımsız katman eklendi (aşağıda): (1)
+#  composer'ın kendi çıktısında bilinen "could not be resolved" ifadesi
+#  aranır — bulunursa KOŞULSUZ hata (composer'ın KENDİ ifadesi, en güvenilir
+#  sinyal); (2) framework BEYANINA göre beklenen bir vendor paketinin
+#  (ör. symfony/framework-bundle) GERÇEKTEN kurulu olup olmadığı doğrulanır.
+#  srvctl composer'ın güvenlik-danışmanlığı politikasını KENDİLİĞİNDEN
+#  GEVŞETMEZ (advisory'li bir paketi sessizce kurmak bu projenin tehdit
+#  modeline aykırıdır) — yalnız durumu NET bir Türkçe mesajla yüzeye çıkarır,
+#  kararı operatöre bırakır.
+# ───────────────────────────────────────────────────────────────
+_deploy_composer_install() {
+    local release_dir="$1" web_user="$2" php_bin="$3" php_version="$4" \
+          domain="$5" composer_home="$6" framework="${7:-}"
+
+    # 4a. ERKEN ön kontrol: composer.json'daki 'require.php' kısıtı domain'in
+    #     PHP sürümüyle KESİN uyumsuzsa deploy BURADA durur — composer'ın
+    #     YANLIŞ PHP'yle sessizce "başarılı" görünüp asıl patlamanın
+    #     framework build adımında geç ve belirsiz bir mesajla üretilmesi
+    #     ENGELLENİR (bkz. yukarıdaki kök-neden notu).
+    local php_constraint; php_constraint=$(_deploy_composer_php_constraint "${release_dir}/composer.json")
+    if [[ -n "$php_constraint" ]]; then
+        local php_req_rc=0
+        _deploy_php_satisfies "$php_version" "$php_constraint" || php_req_rc=$?
+        case "$php_req_rc" in
+            0) : ;;
+            1) error "composer.json PHP ${php_constraint} istiyor, domain PHP ${php_version} kullanıyor — 'srvctl domain php-switch ${domain} <sürüm>' ile uygun PHP sürümüne geçin (deploy composer'dan ÖNCE durduruldu)" ;;
+            *) warn "composer.json PHP kısıtı ('${php_constraint}') otomatik doğrulanamadı (karmaşık/tanınmayan ifade) — domain PHP ${php_version} ile devam ediliyor. Composer/artisan sonradan bir platform hatası verirse composer.json 'require.php' kısıtını elle kontrol edin." ;;
+        esac
+    fi
+
+    local composer_bin
+    composer_bin=$(command -v composer) \
+        || error "composer.json var ama composer kurulu değil — deploy reddedildi (vendor/ olmadan release canlıya alınamaz)"
+
+    mkdir -p "${composer_home}/cache"
+    chown -R "${web_user}:${web_user}" "${composer_home}"
+
+    # composer'ın TAM çıktısı (stdout+stderr) 'tee' ile HEM operatöre CANLI
+    # gösterilir HEM de bir log dosyasına yakalanır — BUG A'nın "could not
+    # be resolved" imzasını aşağıda arayabilmek için (bkz. fonksiyon üstü
+    # yorum). mktemp başarısız olursa (nadir) /dev/null'a düşülür: canlı
+    # akış (tee'nin stdout'u) ETKİLENMEZ, yalnız programatik arama atlanır —
+    # asıl exit-kodu/vendor-paket kontrolleri BUNA bağımlı DEĞİLDİR (fail-open
+    # YOK). pipefail (bin/srvctl'de 'set -euo pipefail') sayesinde
+    # aşağıdaki 'if ! pipeline' composer'ın KENDİ çıkış kodunu yansıtır
+    # (tee neredeyse her zaman 0 döner).
+    local composer_log
+    composer_log=$(mktemp "${composer_home}/.composer-log.XXXXXX" 2>/dev/null) || composer_log="/dev/null"
+
+    # GÜVENLİK DÜZELTMESİ (bkz. _deploy_build_env_overrides yorumu — gerçek
+    # VM bug'ı, symfony/demo + PHP 8.4): APP_ENV/APP_DEBUG'ı GERÇEK ortam
+    # değişkeni olarak zorla — shared/.env (kopya olsa da, ÖNCEDEN bozulmuş
+    # olabilir) NE İÇERİRSE İÇERSİN composer'ın (ve onun flex gibi dahili
+    # 'post-install-cmd' hook'larının) her zaman doğru ortamda çalışması
+    # GARANTİ edilir. Dotenv ZATEN VAR olan bir gerçek env değişkenini ASLA
+    # EZMEZ (bkz. yorum) — bu yüzden .env'in içeriği burada ÖNEMSİZDİR.
+    local -a fw_env=()
+    local _fw_env_kv
+    while IFS= read -r _fw_env_kv; do
+        [[ -n "$_fw_env_kv" ]] && fw_env+=("$_fw_env_kv")
+    done < <(_deploy_build_env_overrides "$framework")
+
+    if _deploy_composer_is_php_script "$composer_bin"; then
+        if ! _deploy_privdrop "$web_user" \
+                env HOME="$composer_home" COMPOSER_HOME="$composer_home" \
+                    COMPOSER_CACHE_DIR="${composer_home}/cache" \
+                    ${fw_env[@]+"${fw_env[@]}"} \
+                "$php_bin" "$composer_bin" install --working-dir="${release_dir}" \
+                    --no-dev --optimize-autoloader --no-interaction --no-progress \
+                2>&1 | tee "$composer_log"
+        then
+            rm -f "$composer_log"
+            error "Composer install başarısız — deploy durduruldu (release canlıya alınmadı: ${release_dir})"
+        fi
+    else
+        # NADİR YOL (VM'de GÖZLEMLENMEDİ — composer orada çıplak phar'dı,
+        # bkz. _deploy_composer_is_php_script yorumu): composer tanınan bir
+        # PHP betiği/phar DEĞİLSE '"$php_bin" "$composer_bin"' çalışmayabilir
+        # (ör. bash sarmalayıcıyı PHP olarak yorumlamaya çalışırdı). Böyle
+        # bir sarmalayıcı genelde KENDİ İÇİNDE PATH'ten 'php' arar — bu
+        # yüzden web_user'ın PATH'inin BAŞINA, yalnız bu çağrı için,
+        # ${php_bin}'e işaret eden bir 'php' sembolik bağlantısı (shim)
+        # koyulur.
+        warn "composer ikili dosyası tanınan bir PHP betiği/phar değil (${composer_bin}) — PHP sürümü PATH shim ile zorlanıyor"
+        local composer_shim
+        composer_shim=$(mktemp -d "${composer_home}/.php-shim.XXXXXX" 2>/dev/null) \
+            || error "Composer PHP-sürüm shim dizini oluşturulamadı"
+        ln -sf "$php_bin" "${composer_shim}/php"
+        chown -R "${web_user}:${web_user}" "$composer_shim"
+        if ! _deploy_privdrop "$web_user" \
+                env HOME="$composer_home" COMPOSER_HOME="$composer_home" \
+                    COMPOSER_CACHE_DIR="${composer_home}/cache" \
+                    PATH="${composer_shim}:${PATH}" \
+                    ${fw_env[@]+"${fw_env[@]}"} \
+                "$composer_bin" install --working-dir="${release_dir}" \
+                    --no-dev --optimize-autoloader --no-interaction --no-progress \
+                2>&1 | tee "$composer_log"
+        then
+            rm -rf -- "$composer_shim"
+            rm -f "$composer_log"
+            error "Composer install başarısız — deploy durduruldu (release canlıya alınmadı: ${release_dir})"
+        fi
+        rm -rf -- "$composer_shim"
+    fi
+
+    # BUG A (bkz. fonksiyon üstü yorum) — İKİ bağımsız doğrulama katmanı,
+    # 'vendor/autoload.php var mı' sorusundan DAHA GÜÇLÜ:
+    #
+    # (1) composer'ın KENDİ çıktısında bilinen başarısızlık imzası ara.
+    #     composer exit-kodu 0 döndürse BİLE (flex'in kurulumu gibi bir ALT
+    #     adım başarılı olduğundan) bu ifade varsa GERÇEK bağımlılık ağacı
+    #     ÇÖZÜLEMEMİŞTİR — composer'ın KENDİ ifadesi olduğundan en güvenilir
+    #     sinyal budur, KOŞULSUZ hataya çevrilir.
+    if grep -q "could not be resolved to an installable set of packages" "$composer_log" 2>/dev/null; then
+        rm -f "$composer_log"
+        error "Composer 'başarılı' göründü (çıkış kodu 0) ama kendi çıktısında 'could not be resolved' hatası var — composer.json bağımlılıkları GERÇEKTEN çözülemedi. Bu genellikle composer 2.10+'ın güvenlik-danışmanlığı (security advisory) politikasının ('policy.advisories.block') bir paket sürümünü KURULMASINI ENGELLEMESİNDEN kaynaklanır. srvctl bu politikayı KENDİLİĞİNDEN GEVŞETMEZ (danışmanlığı olan bir paketi sessizce kurmak bu projenin tehdit modeline aykırıdır) — composer.json/composer.lock'taki sürüm kısıtlarını güvenli bir sürüme güncelleyip tekrar deneyin. Deploy durduruldu, release canlıya alınmadı: ${release_dir}"
+    fi
+    rm -f "$composer_log"
+
+    [[ -f "${release_dir}/vendor/autoload.php" ]] \
+        || error "Composer çalıştı ama vendor/autoload.php üretilmedi — deploy durduruldu"
+
+    # (2) framework BEYANINA göre beklenen bir vendor paketinin GERÇEKTEN
+    #     kurulu olduğunu doğrula (bkz. _deploy_composer_expected_vendor_pkg).
+    #     VM'DE KANITLANDI (Symfony skeleton): symfony/flex yalnız 'kendisi'
+    #     kurulup KENDİ İÇ güncellemesi çökebiliyordu — bu durumda
+    #     'vendor/autoload.php' VAR ama 'vendor/symfony/framework-bundle'
+    #     YOKTU (çünkü flex'in normalde kuracağı asıl framework paketleri
+    #     hiç kurulmamıştı). Framework beyan EDİLMEMİŞSE (boş 'framework'
+    #     ya da bilinmeyen bir değer) bu kontrol ATLANIR — operatörün açıkça
+    #     bildirmediği bir varsayımla deploy'u durdurmak fail-closed'ın YANLIŞ
+    #     yönü olurdu (bkz. _deploy_framework_declared'daki AYNI disiplin).
+    local expected_pkg; expected_pkg=$(_deploy_composer_expected_vendor_pkg "$framework")
+    if [[ -n "$expected_pkg" && ! -d "${release_dir}/vendor/${expected_pkg}" ]]; then
+        error "Composer 'başarılı' göründü (çıkış kodu 0, vendor/autoload.php var) ama beklenen framework paketi eksik: vendor/${expected_pkg} (framework beyanı: '${framework}'). composer.json bağımlılıklarının GERÇEKTEN çözüldüğünü doğrulayın (composer.lock, composer install çıktısı). Deploy durduruldu, release canlıya alınmadı: ${release_dir}"
+    fi
+
+    success "Composer paketleri yüklendi (PHP ${php_version})"
+}
+
+# ───────────────────────────────────────────────────────────────
 #  deploy <domain> [branch] [--dry-run]
 # ───────────────────────────────────────────────────────────────
 _deploy_run() {
@@ -841,15 +1709,27 @@ _deploy_run() {
     local php_version; php_version=$(_derive_php "$domain" "${DEFAULT_PHP_VERSION}")
     local web_user="web_${sname}"
 
-    # Build/migration adımları için sürüm-doğru PHP CLI ikili dosyasını
-    # tercih et (Ondřej PPA 'php8.1'/'php8.3' gibi versiyonlu ikili sağlar;
-    # yoksa PATH'teki 'php'ye düş). Domain'in FPM'de kullandığı sürümle
-    # tutarsız bir CLI, "CLI'de çalışıyor ama FPM'de çalışmıyor" sınıfı
-    # sorunlara yol açabilir.
+    # Build/migration VE composer adımları için sürüm-doğru PHP CLI ikili
+    # dosyası ZORUNLUDUR (Ondřej PPA 'php8.1'/'php8.3' gibi versiyonlu ikili
+    # sağlar). ESKİDEN php${php_version} bulunamazsa PATH'teki genel 'php'ye
+    # (ya da o da yoksa çıplak "php" adına) SESSİZCE düşülüyordu.
+    #
+    # GERÇEK VM BUG'I (koordinatör raporu, Ubuntu 22.04, Laravel 13.x): host'ta
+    # hem php8.3 hem php8.4 kuruluyken, composer domain'in php8.3'ü YERİNE
+    # host'un varsayılan php8.4'üyle çalışıp platform kontrolünü YANLIŞLIKLA
+    # geçiyordu ('✓ Composer paketleri yüklendi'); İKİ ADIM SONRA 'artisan
+    # config:cache' domain'in GERÇEK php8.3'üyle "Composer detected issues in
+    # your platform: ... PHP version '>= 8.4.1' ... You are running 8.3.33"
+    # hatasıyla patlıyordu — operatöre görünen hata kök nedenden iki adım
+    # geride ve YANILTICIYDI. Composer artık AŞAĞIDA (adım 4) açıkça bu
+    # ${php_bin} ile çağrılıyor; bu yüzden ${php_bin}'in GERÇEKTEN domain'in
+    # sürümüne ait olduğu (host'un rastgele bir başka PHP'sine SESSİZCE
+    # düşülmediği) burada, en başta, GARANTİ edilmeli — aksi halde aynı sınıf
+    # hata composer çağrısında da tekrarlanırdı.
     local php_bin
     php_bin=$(command -v "php${php_version}" 2>/dev/null) || php_bin=""
-    [[ -z "$php_bin" ]] && php_bin=$(command -v php 2>/dev/null)
-    [[ -z "$php_bin" ]] && php_bin="php"
+    [[ -n "$php_bin" && -x "$php_bin" ]] \
+        || error "Domain PHP sürümü için CLI ikili dosyası bulunamadı: php${php_version} (kurulum: apt install php${php_version}-cli). Host'un varsayılan 'php'sine SESSİZCE düşülmüyor — composer/artisan'ın domain'den FARKLI bir PHP sürümüyle çalışmasını önlemek için bu kontrol ZORUNLUDUR."
 
     # Chroot'lu FPM ↔ chroot'suz build arasındaki yol uzayı çatışması (bkz.
     # _deploy_chroot_active yorumu): build adımı (composer/artisan) HER ZAMAN
@@ -868,6 +1748,12 @@ _deploy_run() {
     # kullan (aynı whitelist+tamper-gate _deploy_read_framework içinde fail-soft
     # olarak uygulanır, bkz. o fonksiyonun yorumu).
     local FRAMEWORK; FRAMEWORK=$(_deploy_read_framework "$domain")
+
+    # BUG B ön-koşulu (bkz. _deploy_framework_declared yorumu): framework
+    # AÇIKÇA beyan edilmiş mi (yalnızca bu durumda _deploy_build entry
+    # dosyası eksikliğini HATA sayar; beyan yoksa eski yumuşak davranış).
+    local framework_declared="false"
+    _deploy_framework_declared "$domain" "$FRAMEWORK" && framework_declared="true"
 
     local RUN_MIGRATIONS="" KEEP_GIT=""
     _deploy_read_meta "$domain" RUN_MIGRATIONS KEEP_GIT
@@ -893,11 +1779,77 @@ _deploy_run() {
     # Framework'e göre shared eşleştirmesi: 'release-yolu:shared-adı'.
     # KULLANICI BEYANINA (${FRAMEWORK}) göre — repodan TESPİT EDİLENE göre
     # DEĞİL (bkz. _deploy_detect_framework yorumu).
+    #
+    # GÜVENLİK/DOĞRULUK DÜZELTMESİ (gerçek VM bug'ı, koordinatör raporu,
+    # symfony/demo, Ubuntu 22.04): ESKİDEN symfony için TÜM 'var/' paylaşılıyordu
+    # ('var:var'). Symfony'nin derlenmiş DI container'ı (var/cache/prod/
+    # App_KernelProdContainer.php), route eşleyici ve Doctrine mapping meta'sı
+    # BUILD ANINDA release'in MUTLAK YOLUNU koda/meta'ya GÖMER (Laravel'in
+    # bootstrap/cache'iyle AYNI sınıf — bkz. _deploy_build/_deploy_chroot_
+    # active yorumu). 'var/cache' PAYLAŞILINCA bu sürekli bir zehirlenmeye
+    # dönüşüyordu: release N'in cache'i shared'e yazılıyor, release N+1'in
+    # build'i BAŞLAMADAN ÖNCE (henüz canlıya ALINMAMIŞKEN) o SHARED cache'i
+    # KENDİ (henüz canlı OLMAYAN) mutlak yoluyla EZİYORDU — ama release N HÂLÂ
+    # CANLIYSA ve AYNI shared/var'ı okuyorsa, bu ÇALIŞAN SİTEYİ deploy
+    # SIRASINDA bozabiliyordu (Laravel'in bootstrap/cache paylaşımından bile
+    # DAHA KÖTÜ bir risk — bkz. aşağıdaki laravel notu). VM'de KANITLANDI:
+    # release N silinince release N+1'in build'i "MappingException: [.../
+    # releases/<N>/src/Entity] seems to be incorrect" ile ÇÖKTÜ (ÖLÜ bir
+    # release'in yolu shared cache'te kalıcı olarak GÖMÜLÜYDÜ) ve CANLI site
+    # "Class DebugBundle not found" ile 500 veriyordu (paylaşılan cache'te
+    # DEV ortamında derlenmiş bir container --no-dev kurulumunda ARANAN
+    # DebugBundle'ı bulamıyordu).
+    #
+    # DÜZELTME: 'var/cache' ARTIK PAYLAŞILMAZ — her release KENDİ 'var/cache'ini
+    # (composer/console'un o release içinde ürettiği, chroot-göreli) kullanır;
+    # _deploy_build'deki mevcut 'chroot_active ise var/cache/prod/* sil'
+    # temizliği artık yalnız BU release'in KENDİ yerel dizinini etkiler,
+    # ASLA paylaşılan/başka bir release'in dizinini DEĞİL. Yalnız 'var/log'
+    # (deploy'lar arası tarihçe için) ve 'var/sessions' (Symfony flex
+    # iskeletinin varsayılan framework.yaml'ı session save_path'i
+    # '%kernel.project_dir%/var/sessions/%kernel.environment%' yapar —
+    # oturum SÜREKLİLİĞİ için paylaşılmalı) PAYLAŞILIR — ikisi de yalnız
+    # DÜZ VERİ (log satırları/serialize edilmiş oturum verisi) İÇERİR,
+    # release'in mutlak yolunu GÖMMEZ. shared_subdir'ler 'var-log'/
+    # 'var-sessions' (tire ile) OLARAK adlandırıldı — 'bootstrap-cache' ile
+    # AYNI kural (nested rel_path'lerde düz isim yerine belirtik önek) — ki
+    # gelecekte YANLIŞLIKLA bir 'cache' paylaşımı eklenirse isim ÇAKIŞMASIN.
+    #
+    # ARAŞTIRILDI (kod okumasıyla, HOST'ta ÇALIŞTIRILMADI — bkz. rapor):
+    # koordinatörün gözlemlediği 'var/dart-sass', 'var/sass', 'var/share'
+    # muhtemelen symfonycasts/sass-bundle (Symfony UX AssetMapper'ın Sass
+    # derleyicisi) tarafından üretiliyor — 'dart-sass' indirilen derleyici
+    # İKİLİ dosyasının önbelleği, 'sass' derlenmiş CSS çıktısı. İkisi de
+    # release'in mutlak yolunu GÖMMEZ (yalnız harici bir aracın önbelleği/
+    # derlenmiş STATİK dosya) — bu yüzden KASITLI OLARAK ne paylaşılıyor ne
+    # de dokunuluyor: eski 'var:var' şemasından kalma bu dizinler
+    # shared/var/ altında YETİM (artık hiçbir shared_pairs eşlemesinin
+    # hedeflemediği) kalacak, ama ZARARSIZDIR (release'e symlink OLMADIKLARI
+    # için sızma/zehirlenme riski YOK). Operatör isterse elle temizleyebilir.
+    #
+    # LARAVEL — AYNI SINIF BUG, KONTROL EDİLDİ: 'bootstrap/cache' de PAYLAŞIM
+    # LİSTESİNDEN ÇIKARILDI. Composer'ın post-autoload-dump'ı VE 'artisan
+    # config:cache/route:cache/event:cache' bootstrap/cache/*.php'ye
+    # release'in MUTLAK yolunu gömer (ör. config('filesystems.disks.local.root')
+    # gibi 'storage_path()' çağrıları BUILD ANINDA ÇÖZÜLÜP sonuç STRING
+    # olarak cache'e YAZILIR) — 'var/cache' ile TAMAMEN AYNI risk sınıfı.
+    # PAYLAŞILDIĞINDA risk Symfony'dekinden bile DAHA CİDDİYDİ: build adımı
+    # (composer/artisan) HER ZAMAN atomik switch'TEN ÖNCE (adım 6, switch
+    # adım 7'de) çalışır — yani YENİ release'in build'i shared/bootstrap-cache'i
+    # KENDİ (henüz canlı OLMAYAN) mutlak yoluyla EZERKEN, O ANDA CANLI OLAN
+    # ESKİ release de AYNI shared/bootstrap-cache'i okuyordu (ikisi de
+    # sembolik bağlıydı) — yani ÇALIŞAN SİTE deploy SIRASINDA, atomik switch'e
+    # ULAŞILMADAN bile bozulabiliyordu. 'storage:storage' PAYLAŞIMI KORUNDU
+    # (güvenli — storage/app kullanıcı yüklemeleri, storage/logs/storage/
+    # framework/sessions düz veri; storage/framework/views'ın önbellek
+    # ANAHTARI kaynak dosyanın mutlak yoluna bağlıdır ama bu yalnız zararsız
+    # bir cache-miss'e yol açar, Symfony'nin derlenmiş container'ı/Laravel'in
+    # config cache'i gibi FONKSİYONEL bir çökmeye DEĞİL).
     local shared_pairs=()
     case "$FRAMEWORK" in
         ci4)     shared_pairs=("writable:writable") ;;
-        laravel) shared_pairs=("storage:storage" "bootstrap/cache:bootstrap-cache") ;;
-        symfony) shared_pairs=("var:var") ;;
+        laravel) shared_pairs=("storage:storage") ;;
+        symfony) shared_pairs=("var/log:var-log" "var/sessions:var-sessions") ;;
     esac
 
     # Önceki sürüm: doğrulama için mutlak yol, geri dönüş için GÖRELİ symlink
@@ -1037,13 +1989,20 @@ _deploy_run() {
     #    composer'dan ÖNCE bağlanmalı.
     step "2/9" "Shared dosyalar bağlanıyor (framework: ${FRAMEWORK})..."
     mkdir -p "${shared_dir}"
-    if [[ -e "${shared_dir}/.env" ]] && _deploy_assert_safe_shared "${shared_dir}/.env"; then
-        ln -sf "../../shared/.env" "${release_dir}/.env"
-        success ".env bağlandı"
-    elif [[ -L "${shared_dir}/.env" ]]; then
-        warn "shared/.env bir symlink — güvenlik nedeniyle atlandı"
-    else
-        warn ".env bulunamadı: ${shared_dir}/.env"
+    # GÜVENLİK DÜZELTMESİ — bkz. _deploy_env_link yorumu: release/.env artık
+    # shared/.env'e SYMLINK DEĞİL, bir KOPYADIR.
+    _deploy_env_link "$shared_dir" "$release_dir" || true
+    # GÜVENLİK: shared/.env'de (ÖNCEKİ bir bozulmadan kalma) MÜKERRER bir
+    # anahtar varsa operatöre AÇIKÇA bildir — kopya yeni yazılmayı
+    # ENGELLESE de, ZATEN BOZULMUŞ kurulumlarda dosya hâlâ bozuk kalabilir
+    # (bu fonksiyon TEŞHİS içindir, otomatik düzeltme YAPMAZ).
+    _deploy_env_check_duplicates "${shared_dir}/.env"
+    # DOĞRULUK: Symfony'de ESKİ 'var:var' paylaşım şemasından (bkz.
+    # yukarıdaki shared_pairs yorumu) kalma ZEHİRLENMİŞ bir 'shared/var/cache'
+    # varsa operatöre AÇIKÇA bildir (bu fonksiyon da TEŞHİS içindir, otomatik
+    # SİLME yapmaz).
+    if [[ "$FRAMEWORK" == "symfony" ]]; then
+        _deploy_symfony_detect_poisoned_shared_var "$shared_dir"
     fi
 
     local pair rel_path shared_subdir rc
@@ -1097,24 +2056,12 @@ _deploy_run() {
     done
     success "İzinler ayarlandı"
 
-    # 4. Composer — web_user olarak (root DEĞİL). composer.json repodan gelir;
-    #    root çalıştırmak kötü niyetli bir lifecycle script'ine root verirdi.
-    step "4/9" "Composer install (kullanıcı: ${web_user})..."
+    # 4. Composer — DAİMA domain'in PHP sürümüyle (${php_bin}), web_user
+    #    olarak (root DEĞİL). Mantığın tamamı _deploy_composer_install'da
+    #    (bkz. o fonksiyonun yorumu: kök-neden, VM bulgusu, shim düşüş yolu).
+    step "4/9" "Composer install (kullanıcı: ${web_user}, PHP: ${php_version})..."
     if [[ -f "${release_dir}/composer.json" ]]; then
-        command -v composer &>/dev/null \
-            || error "composer.json var ama composer kurulu değil — deploy reddedildi (vendor/ olmadan release canlıya alınamaz)"
-        local composer_home="${base}/tmp/composer"
-        mkdir -p "${composer_home}/cache"
-        chown -R "${web_user}:${web_user}" "${composer_home}"
-        _deploy_privdrop "$web_user" \
-            env HOME="$composer_home" COMPOSER_HOME="$composer_home" \
-                COMPOSER_CACHE_DIR="${composer_home}/cache" \
-            composer install --working-dir="${release_dir}" \
-                --no-dev --optimize-autoloader --no-interaction --no-progress \
-            || error "Composer install başarısız — deploy durduruldu (release canlıya alınmadı: ${release_dir})"
-        [[ -f "${release_dir}/vendor/autoload.php" ]] \
-            || error "Composer çalıştı ama vendor/autoload.php üretilmedi — deploy durduruldu"
-        success "Composer paketleri yüklendi"
+        _deploy_composer_install "$release_dir" "$web_user" "$php_bin" "$php_version" "$domain" "${base}/tmp/composer" "$FRAMEWORK"
     else
         info "composer.json yok — atlanıyor"
     fi
@@ -1125,7 +2072,7 @@ _deploy_run() {
 
     # 6. Framework build (cache/asset) — switch'ten ÖNCE, web_user olarak.
     step "6/9" "Framework build (${FRAMEWORK})..."
-    _deploy_build "$FRAMEWORK" "$release_dir" "$web_user" "$php_bin" "$chroot_active"
+    _deploy_build "$FRAMEWORK" "$release_dir" "$web_user" "$php_bin" "$chroot_active" "$framework_declared"
 
     # DRY-RUN: burada dur
     if [[ "$dry_run" == "1" ]]; then
@@ -1139,8 +2086,15 @@ _deploy_run() {
 
     # 7. Atomic switch
     step "7/9" "Atomic switch (zero-downtime)..."
+    # 'public_html_backup' KAYDEDİLİR (bkz. BUG C, adım 9): sağlık kontrolü
+    # BAŞARISIZ olur VE geri dönülecek gerçek bir önceki release YOKSA (ör.
+    # BU İLK deploy denemesiyse) bu orijinal içerik (domain.sh'ın kurduğu
+    # placeholder) GERİ YÜKLENEBİLSİN diye — aksi halde kalıcı olarak
+    # kaybolurdu.
+    local public_html_backup=""
     if [[ -d "$public_dir" && ! -L "$public_dir" ]]; then
-        mv "$public_dir" "${base}/public_html.bak.$(date +%s)" 2>/dev/null || true
+        public_html_backup="${base}/public_html.bak.$(date +%s)"
+        mv "$public_dir" "$public_html_backup" 2>/dev/null || public_html_backup=""
     fi
     local rel_id; rel_id=$(basename "${release_dir}")
     local new_link="releases/${rel_id}"
@@ -1273,6 +2227,14 @@ _deploy_run() {
             # Başarısız release'i diskte bırakma — aksi halde her başarısız
             # webhook deploy'u kalıcı olarak birikirdi.
             rm -rf "${release_dir}"
+
+            # BUG C DÜZELTMESİ — bkz. _deploy_no_rollback_recover yorumu:
+            # release YUKARIDA silindiği için adım 7'de ZATEN bu release'e
+            # çevrilmiş olan 'public_html'/'current' symlink'leri KIRIK
+            # (dangling) kalmasın diye ya deploy-öncesi haline GERİ YÜKLENİR
+            # ya da temizlenir.
+            _deploy_no_rollback_recover "$base" "$public_dir" "$public_html_backup" "$web_user"
+
             _deploy_notify "Deploy BAŞARISIZ: ${domain}" "Branch: ${branch}. Sağlık kontrolü başarısız (HTTP ${code}) ve geri alınacak önceki sürüm yok." "critical"
             error "Geri alınacak önceki sürüm yok (release temizlendi). Sağlık: HTTP ${code}"
         fi

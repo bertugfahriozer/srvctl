@@ -115,6 +115,65 @@ assert_eq "$(_domain_redis_scripting_mode "")" "-@scripting unknown"  "redis scr
 assert_eq "$(_domain_redis_scripting_mode "cop")" "-@scripting unknown" "redis scripting: çöp girdi -> unknown (fail-closed)"
 
 # ═══════════════════════════════════════════════════════════════
+#  _domain_redis_queue_gate — NİHAİ ACL/meta kararı: YETENEK (sürüm, bkz.
+#  _domain_redis_scripting_mode) VE TALEP (--redis-queue/repair'de önceki
+#  meta) BİRLİKTE gerekir. Çıktı: "<acl_bayrağı> <durum_kodu> <sebep_kodu>".
+#
+#  EN KRİTİK İKİ SATIR (koordinatörün az önceki düzeltmesi):
+#   1) Redis >=7 + bayrak YOK -> disabled (ÖNCEKİ davranıştan KASITLI sapma:
+#      sürüm yükseltmesi TEK BAŞINA hiçbir domaini sessizce açamaz).
+#   2) Redis <7 + bayrak VAR -> yine disabled (fail-closed garantisi bayrakla
+#      ASLA aşılamaz — komşu domainin anahtar alanına EVAL ile erişim riski).
+# ═══════════════════════════════════════════════════════════════
+
+# ── (1) KRİTİK: talep yok + yetenek VAR (Redis 7+) -> disabled/default ──
+# Bu, koordinatörün istediği DAVRANIŞ DEĞİŞİKLİĞİNİN ta kendisi: sessizce
+# geri dönerse (eskisi gibi 'enabled' ÜRETİRSE) KİMSE FARK ETMEZ.
+assert_eq "$(_domain_redis_queue_gate "+@scripting" "enabled" "false")" \
+    "-@scripting disabled default" \
+    "redis-queue KRİTİK: Redis>=7 + bayrak YOK -> disabled (otomatik açılma YOK)"
+assert_eq "$(_domain_redis_queue_gate "+@scripting" "enabled" "")" \
+    "-@scripting disabled default" \
+    "redis-queue: requested boş (çağıran geçirmemiş) -> yine disabled (güvenli varsayılan)"
+
+# ── Talep yok + yetenek zaten YOK (Redis <7/unknown) -> davranış DEĞİŞMEDİ ──
+assert_eq "$(_domain_redis_queue_gate "-@scripting" "disabled" "false")" \
+    "-@scripting disabled default" \
+    "redis-queue: Redis<7 + bayrak YOK -> disabled (zaten kısıtlıydı, değişmedi)"
+assert_eq "$(_domain_redis_queue_gate "-@scripting" "unknown" "false")" \
+    "-@scripting unknown default" \
+    "redis-queue: sürüm bilinmiyor + bayrak YOK -> unknown/default (değişmedi)"
+
+# ── Talep VAR + yetenek VAR (Redis 7+) -> onaylanır, gerçekten açılır ──
+assert_eq "$(_domain_redis_queue_gate "+@scripting" "enabled" "true")" \
+    "+@scripting enabled requested" \
+    "redis-queue: Redis>=7 + bayrak VAR -> +@scripting enabled (bilinçli açılış GERÇEKTEN uygulanır)"
+
+# ── (2) KRİTİK: talep VAR ama yetenek YOK (Redis <7) -> yine disabled ──
+# fail-closed garantisi bayrakla ASLA aşılamaz.
+assert_eq "$(_domain_redis_queue_gate "-@scripting" "disabled" "true")" \
+    "-@scripting disabled rejected_version" \
+    "redis-queue KRİTİK: Redis<7 + bayrak VAR -> yine disabled (ZORLA açılmaz, fail-closed korunur)"
+assert_eq "$(_domain_redis_queue_gate "-@scripting" "unknown" "true")" \
+    "-@scripting unknown rejected_version" \
+    "redis-queue: sürüm bilinmiyor + bayrak VAR -> yine unknown/reddedildi (fail-closed korunur)"
+
+# ── Uçtan uca kompozisyon: gerçek _domain_redis_scripting_mode çıktısı gate'e beslenir ──
+_gate_from_major() {
+    local major="$1" requested="$2" flag status
+    read -r flag status <<< "$(_domain_redis_scripting_mode "$major")"
+    _domain_redis_queue_gate "$flag" "$status" "$requested"
+}
+assert_eq "$(_gate_from_major 7 false)" "-@scripting disabled default" \
+    "kompozisyon: major=7 + bayrak YOK -> disabled (uçtan uca doğrulama)"
+assert_eq "$(_gate_from_major 7 true)"  "+@scripting enabled requested" \
+    "kompozisyon: major=7 + bayrak VAR -> enabled (uçtan uca doğrulama)"
+assert_eq "$(_gate_from_major 6 true)"  "-@scripting disabled rejected_version" \
+    "kompozisyon: major=6 + bayrak VAR -> yine disabled (uçtan uca fail-closed doğrulama)"
+assert_eq "$(_gate_from_major 6 false)" "-@scripting disabled default" \
+    "kompozisyon: major=6 + bayrak YOK -> disabled (değişmedi)"
+
+# ═══════════════════════════════════════════════════════════════
 #  _redis_major_version — fail-closed: ne redis-server ne redis-cli
 #  PATH'te bulunamazsa 1 döner ve stdout BOŞ kalır (gerçek servise
 #  dokunmadan: PATH geçici olarak boşaltılıyor, test sonunda geri

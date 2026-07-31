@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`srvctl` is a CLI-only, security-hardened server management tool written entirely in **Bash**, targeting **Ubuntu 22.04 LTS** running as root (PHP-FPM, Nginx, MariaDB, Redis). It provisions per-domain isolation (separate Linux user, chroot, AppArmor, FPM pool, DB/Redis ACLs) plus server-wide hardening (ModSecurity WAF, seccomp, cgroups v2, AIDE, ClamAV). See [README.md](README.md) for the full command/security-layer reference.
+`srvctl` is a CLI-only, security-hardened server management tool written entirely in **Bash**, targeting **Ubuntu 22.04 LTS and 24.04 LTS** (both first-class, neither deprecated) running as root (PHP-FPM, Nginx, MariaDB, Redis). It provisions per-domain isolation (separate Linux user, chroot, AppArmor, FPM pool, DB/Redis ACLs) plus server-wide hardening (ModSecurity WAF, seccomp, cgroups v2, AIDE, ClamAV). See [README.md](README.md) for the full command/security-layer reference.
 
 There is **no build step, no test suite, and no CI/lint tooling**. `shellcheck` directives appear inline (`# shellcheck disable=...`) but nothing enforces them. The tool cannot meaningfully run on the macOS dev machine — it expects a root Ubuntu host with systemd, nginx, php-fpm, etc.
 
@@ -45,6 +45,7 @@ Each `lib/<module>.sh` follows the same shape:
 - Every script starts with `set -euo pipefail`. Be deliberate about commands that may fail (append `|| true` where a non-zero exit is expected).
 - Reuse `core.sh` helpers for output and config; don't hand-roll color codes or re-read the config file.
 - Use `_<module>_<action>` naming for new subcommand handlers and wire them into the module's `case` block (and ideally the help text + `completions/srvctl.bash` / `completions/srvctl.zsh`).
+- **Dual-LTS rule:** any code with version-dependent behavior (package names, ACL/config syntax, log paths) must prefer capability detection (`command -v`, file existence, `--version` output) over a bare `VERSION_ID` string compare. `lib/core.sh`'s `_os_version_id()`/`_os_id()`/`_os_is_supported_ubuntu()` are the single source of truth for "which Ubuntu LTS is this" (used e.g. by `install.sh`'s support gate); they are not a template for scattering `/etc/os-release` parsing across modules. See [.claude/ubuntu-compat.md](.claude/ubuntu-compat.md) for the full 22.04-vs-24.04 behavior-difference reference (Redis pub/sub ACL, PHP package availability, AppArmor parser, etc.).
 
 ## Version note
 

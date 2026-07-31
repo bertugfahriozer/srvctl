@@ -66,6 +66,37 @@ for fn in exec passthru shell_exec system proc_open popen pcntl_exec pcntl_fork;
     assert_contains ",${pool_base},"   ",${fn}," "pool tabanı: '${fn}' kapalı"
 done
 
+# (4) GÜVENLİK DENETİMİ EKİ — mail-ailesi fonksiyonlar + putenv() LD_PRELOAD
+# zinciri: mail()/mb_send_mail()/imap_mail() ÜÇÜ DE dahili popen(sendmail_path)
+# çağırır; bu iç popen() disable_functions içindeki 'popen' girişinden
+# BAĞIMSIZDIR (o giriş yalnız PHP kodunun DOĞRUDAN popen() çağırmasını
+# engeller) — HOST'ta doğrulandı (srvctl-jammy, Ubuntu 22.04, PHP 8.3): 'mail'
+# disable_functions'tayken bile mb_send_mail() GERÇEKTEN spawn etti. putenv'in
+# aksine bu üç fonksiyon için hiçbir framework'ün boot-zamanı zorunluluğu
+# yoktur — bu yüzden istisnasız HER framework için (ci4 DAHİL) TABANDA kapalı
+# olmalı; ne global'den ne pool tabanından eksik olabilir.
+for fn in mail mb_send_mail imap_mail; do
+    assert_contains ",${global_list}," ",${fn}," \
+        "global: '${fn}' kapalı (mail-ailesi + putenv() LD_PRELOAD zincirinin savunması)"
+    assert_contains ",${pool_base}," ",${fn}," \
+        "pool tabanı (ci4 dalı): '${fn}' kapalı — putenv'in aksine ci4'e istisna YOK"
+done
+
+# (5) error_log KASITLI OLARAK listede OLMAMALI — kapatılamayan kalıcı delik.
+# error_log($msg, 1, $to) AYNI dahili sendmail yolunu kullanır ve HOST'ta
+# 'mail' disable_functions'tayken bile spawn ETTİĞİ doğrulandı, ama
+# Laravel/CI4/Monolog'un TEMEL hata loglamasına gömülü olduğundan
+# disable_functions'a EKLENEMEZ (eklenirse framework'ler ÇALIŞAMAZ hale gelir).
+# Bu NEGATİF assertion, birinin ileride "tutarlılık" adına error_log'u listeye
+# eklemesini (ve frameworkleri kırmasını) yakalar — bkz.
+# lib/domain.sh:_domain_disable_functions_for başlık yorumu ("error_log
+# KASITLI OLARAK EKLENMEDİ" bölümü, gerçek kontrolün AppArmor exec deny
+# olduğu HOST kanıtıyla birlikte).
+assert_not_contains ",${global_list}," ",error_log," \
+    "global: 'error_log' KAPATILMADI (Laravel/CI4/Monolog'u kırmamak için kasıtlı)"
+assert_not_contains ",${pool_base}," ",error_log," \
+    "pool tabanı: 'error_log' KAPATILMADI (kasıtlı — yukarı bkz.)"
+
 # --- Fonksiyonun kendi davranışı: ci4 istisnası dar mı? ---
 ci4_out=$(_domain_disable_functions_for "ci4")
 lar_out=$(_domain_disable_functions_for "laravel")
@@ -76,6 +107,22 @@ assert_not_contains ",${ci4_out}," ",putenv," "ci4: 'putenv' AÇIK (framework bo
 assert_contains     ",${lar_out},"  ",putenv," "laravel: 'putenv' kapalı"
 assert_contains     ",${sym_out},"  ",putenv," "symfony: 'putenv' kapalı"
 assert_contains     ",${none_out}," ",putenv," "framework beyan edilmemiş: 'putenv' kapalı (güvenli varsayılan)"
+
+# mail-ailesi (mail/mb_send_mail/imap_mail) putenv'in AKSİNE HER framework
+# çıktısında kapalı olmalı — ci4 için de istisna YOK (hiçbiri boot'ta
+# gerekmiyor, yalnız uygulama-zamanı opsiyonel).
+for fn in mail mb_send_mail imap_mail; do
+    assert_contains ",${ci4_out}," ",${fn}," "ci4: '${fn}' kapalı (putenv'ten farklı olarak istisna yok)"
+    assert_contains ",${lar_out}," ",${fn}," "laravel: '${fn}' kapalı"
+    assert_contains ",${sym_out}," ",${fn}," "symfony: '${fn}' kapalı"
+    assert_contains ",${none_out}," ",${fn}," "framework beyan edilmemiş: '${fn}' kapalı"
+done
+
+# error_log HİÇBİR framework çıktısında OLMAMALI (kasıtlı — yukarı bkz.)
+assert_not_contains ",${ci4_out}," ",error_log," "ci4: 'error_log' KAPATILMADI (kasıtlı)"
+assert_not_contains ",${lar_out}," ",error_log," "laravel: 'error_log' KAPATILMADI (kasıtlı)"
+assert_not_contains ",${sym_out}," ",error_log," "symfony: 'error_log' KAPATILMADI (kasıtlı)"
+assert_not_contains ",${none_out}," ",error_log," "framework beyan edilmemiş: 'error_log' KAPATILMADI (kasıtlı)"
 
 # İstisna GERÇEKTEN dar olmalı: ci4 ile laravel arasındaki TEK fark putenv
 diff_only=$(tr ',' '\n' <<<"$lar_out" | sort > /tmp/.df_lar.$$; \

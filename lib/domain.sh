@@ -28,9 +28,14 @@ cmd_domain() {
             echo ""
             echo "  Temel:"
             echo "    add <domain> [--php=8.3] [--framework=ci4|laravel|symfony]"
-            echo "        [--resources=micro|standard|ecommerce|heavy]"
+            echo "        [--resources=micro|standard|ecommerce|heavy] [--redis-queue]"
             echo "                                     Yeni domain ekle (framework varsayılan: ci4,"
             echo "                                     kaynak profili varsayılan: standard)"
+            echo "                                     --redis-queue: Laravel Redis kuyruk sürücüsü/"
+            echo "                                     Horizon için EVAL/Lua scripting'i AÇIKÇA iste"
+            echo "                                     (varsayılan HER ZAMAN kapalı — Redis 7+ olsa"
+            echo "                                     BİLE bu bayrak olmadan açılmaz; yalnız Redis 7+"
+            echo "                                     VE bu bayrakla onaylanır, bkz. çıktıdaki uyarı)"
             echo "    remove <domain>                 Domain kaldır"
             echo "    list                            Tüm domain'leri listele"
             echo "    info <domain> [--show-secrets]  Domain bilgisi (parolalar varsayılan gizli)"
@@ -153,23 +158,303 @@ _domain_load_apparmor_profile() {
     return 0
 }
 
+# ─── Hayalet/kalıntı domain tespiti (GÜVENLİK DENETİMİ EKİ — kendi kendini
+# sahiplenme döngüsünün kırılması) ───
+# HOST bulgusu (srvctl-jammy): nginx paketi kendi '/var/www/html' dizinini
+# kurar. 'list_all_domains()' (lib/core.sh) bunu '.credentials' varlığına
+# bakarak eler — AMA '_domain_repair'in KENDİSİ o dizine (DB/Redis adımı
+# atlanıp fonksiyon sonunda) '.credentials' YAZIYOR ve bir AppArmor profili
+# YÜKLÜYORDU. Yani BİR KEZ 'repair --all' çalıştıktan sonra '/var/www/html'
+# ARTIK 'list_all_domains()'e göre de MEŞRU bir domain oluyordu: işaret,
+# onu YARATAN komut tarafından tüketiliyordu (kendi kendini doğrulayan bir
+# döngü — 'repair' kendi ürettiği kalıntıyı bir sonraki çalıştırmada
+# "onarılacak domain" sanıyordu).
+#
+# NEDEN '.srvctl-meta' DEĞİL, 'web_<sname>' LİNUX KULLANICISI SEÇİLDİ: ilk
+# akla gelen çözüm '.srvctl-meta' varlığını da şart koşmaktı (repair bu
+# dosyayı YALNIZCA Redis ACL adımı DB/Redis parolaları GERÇEKTEN
+# üretilmişse yazar — bkz. aşağıdaki Redis bloğu — boş parola için hiç
+# tetiklenmez, bu yüzden '.srvctl-meta' de repair'in kendi kendine
+# üretemeyeceği bir işarettir). AMA '.srvctl-meta' Faz 2'de eklenen GÖRECELİ
+# YENİ bir dosya: bu özellikten ÖNCE '_domain_add' ile eklenmiş MEŞRU/eski
+# bir domain bu kontrolde YANLIŞLIKLA hayalet sayılıp '--all' dışında
+# bırakılırdı — sessiz bir regresyon. 'web_<sname>' Linux sistem kullanıcısı
+# ise '_domain_add'in EN İLK adımından beri (bu dosyada 'useradd' YALNIZCA
+# BİR YERDE çağrılır — '_domain_add'in adım 1'i, aşağıda ARANDI ve
+# doğrulandı) HER domain için oluşturulur ve _domain_repair bunu ASLA
+# oluşturmaz (bu fonksiyon hiçbir yerde 'useradd'/'groupadd' ÇAĞIRMAZ) —
+# yani geriye dönük yanlış pozitif üretmeyen, repair'in kendi eylemleriyle
+# ASLA taklit edilemeyen tek sinyal budur.
+#
+# PREDİKAT: 0=hayalet (domain GİBİ görünmüyor), 1=gerçek domain gibi görünüyor.
+_domain_repair_is_ghost() {
+    local domain="$1"
+    local sname web_user
+    sname=$(safe_name "$domain")
+    web_user="web_${sname}"
+    ! id "$web_user" &>/dev/null
+}
+
+# Hayalet/kalıntı teşhisini AÇIKÇA raporlar — sessizce atlamak YOK, otomatik
+# silme YOK (karar operatöre bırakılır; '.credentials' içinde üretilmiş
+# gerçek parolalar olabilir ve/veya operatörün GERÇEK ama bozuk bir domaini
+# olabilir — bkz. görev talebi).
+_domain_repair_ghost_report() {
+    local domain="$1"
+    local base="${WEB_ROOT}/${domain}"
+    local sname web_user
+    sname=$(safe_name "$domain")
+    web_user="web_${sname}"
+    local has_creds="YOK" has_meta="YOK"
+    [[ -f "${base}/.credentials" ]] && has_creds="VAR"
+    [[ -f "${base}/.srvctl-meta" ]] && has_meta="VAR"
+    warn "'${domain}' (${base}) srvctl tarafından yönetilen GERÇEK bir domain gibi GÖRÜNMÜYOR:"
+    warn "    Linux sistem kullanıcısı '${web_user}': YOK  |  .credentials: ${has_creds}  |  .srvctl-meta: ${has_meta}"
+    if [[ "$has_creds" == "VAR" ]]; then
+        warn "    (.credentials VAR ama web kullanıcısı YOK — muhtemelen DAHA ÖNCEKİ bir 'repair --all' çalıştırmasının bıraktığı bir KALINTI; ör. nginx'in varsayılan '/var/www/html' dizini yanlışlıkla domain sanılmış olabilir.)"
+    fi
+    warn "    'domain repair' bu dizine DOKUNMADI (otomatik silme YAPILMAZ). Elle karar verin:"
+    warn "      - Meşru ama bozuk bir domainse: eksik Linux kullanıcısını oluşturup (groupadd/useradd '${web_user}') tekrar deneyin."
+    warn "      - Hayalet bir kalıntıysa (ör. nginx varsayılan dizini): '${base}' içeriğini inceleyip gerekiyorsa elle kaldırın."
+}
+
+# ─── public_html / current onarımı (GÜVENLİK DENETİMİ EKİ — KARAR REVİZYONU) ───
+# İLK KARAR (bu fonksiyonun önceki sürümü) yalnız TEŞHİS koyuyordu:
+# "kök neden deploy tarafında, releases/ boşken yönlendirilecek geçerli
+# hedef yok" gerekçesiyle onarmıyordu. HOST'ta (srvctl-jammy) elde edilen
+# YENİ kanıt bu gerekçeyi geçersiz kıldı: deploy tarafının kendi kurtarma
+# kodu (BUG C düzeltmesi, lib/deploy.sh:_deploy_no_rollback_recover, bu
+# görevin kapsamı DIŞI — DOKUNULMADI) çalışıp kırık symlink'i KALDIRDI ve
+# arkasında 'public_html.bak.<epoch>/' adlı GERÇEK, kurtarılabilir bir yedek
+# BIRAKTI. Yani "yönlendirilecek geçerli hedef yok" iddiası artık DOĞRU
+# DEĞİL. Ayrıca ölçüldü: 'public_html' TAMAMEN YOKKEN (ne dizin ne symlink)
+# 'domain repair', 'php-switch', 'security harden-fpm --apply' — YANİ TÜM
+# belgelenmiş kurtarma yolları — FPM config-test aşamasında BAŞARISIZ
+# oluyordu ('chdir = /public_html', chroot'a göreli, pool.conf.tpl DOĞRU —
+# sorun şablonda değil, YOLUN YOKLUĞUNDA). Repair'in "domainimi düzelt"
+# komutu olması ve kendi önerdiği kurtarma yolunun (harden-fpm --apply) AYNI
+# nedenle çalışmaması bu döngüyü ACİL kılıyor: repair'in onaramadığı tek
+# şey, repair'in ÇALIŞMASINI ENGELLEYEN şeyin ta kendisiydi — bu yüzden
+# artık KENDİSİ onarıyor.
+#
+# SIRALAMA SÖZLEŞMESİ: çağıran (_domain_repair) bunu FPM config-test/
+# aktivasyon adımından (2/4) ÖNCE çağırmalı — aksi halde 'chdir' invariant'ı
+# hâlâ bozukken config-test yine düşer.
+#
+# 'current' İÇİN AYRI karar: 'current' bir release'e işaret ETMEK
+# ZORUNDADIR — geçerli bir release yoksa SAHTE bir hedef ÜRETMEK YANLIŞ
+# olur. lib/deploy.sh:_deploy_no_rollback_recover İLE AYNI karar (o
+# fonksiyonun başlık yorumu: "'current' İÇİN AYRI bir yedek YOKTUR ...
+# systemd WorkingDirectory'si için 'current'ın VAR OLMASI ZORUNLU
+# DEĞİLDİR"). Bu yüzden kırık 'current' YALNIZCA KALDIRILIR, ASLA yeniden
+# ÜRETİLMEZ.
+#
+# YAN ETKİLİ — PREDİKAT DEĞİL: her zaman koşulsuz döner (bir sonraki adımın
+# — FPM config-test — kendi başarı/başarısızlığı ZATEN doğru sinyali verir;
+# bu fonksiyonun kendi başarısızlığını AYRICA izlemek gereksiz tekrar olurdu).
+_domain_repair_fix_docroot() {
+    local target="$1" base="$2" web_user="$3"
+
+    # 'current': kırıksa kaldır, UYDURMA (bkz. yukarı).
+    if [[ -L "${base}/current" && ! -e "${base}/current" ]]; then
+        local cur_target
+        cur_target=$(readlink "${base}/current" 2>/dev/null)
+        rm -f "${base}/current"
+        warn "'${target}': 'current' kırık bir symlink'ti (hedef: ${cur_target:-?}) — kaldırıldı. 'current' YENİDEN ÜRETİLMEDİ (geçerli bir release'e işaret etmesi ZORUNLU; sahte bir hedef üretmek yanlış olur) — 'srvctl deploy' ile yeni bir release yayınlayın."
+    fi
+
+    # 'public_html' zaten sağlıklıysa (gerçek dizin ya da hedefi mevcut bir
+    # symlink) dokunma. '-e' kırık symlink'te YANLIŞ döner (hedefi takip
+    # eder) — bu yüzden bu tek satır hem "yok" hem "kırık" durumunu birlikte
+    # yakalar.
+    [[ -e "${base}/public_html" ]] && return 0
+
+    # Kırık symlink varsa aşağıdaki kademelere geçmeden önce temizle.
+    [[ -L "${base}/public_html" ]] && rm -f "${base}/public_html"
+
+    # 1) Diskteki EN YENİ 'public_html.bak.<epoch>' dizinini geri yükle.
+    # lib/deploy.sh:_deploy_no_rollback_recover İLE AYNI desen/gerekçe: epoch
+    # dizin ADINDAN okunur (mtime'DAN DEĞİL) — 'base' root:root 751
+    # olduğundan (T1 fs-ownership modeli) web_user base İÇİNE YENİ bir
+    # '.bak.<epoch>' dizini YARATAMAZ, bu yüzden isimdeki epoch güvenilirdir.
+    local newest_epoch="" newest_bak="" epoch
+    while IFS= read -r epoch; do
+        [[ -z "$epoch" ]] && continue
+        newest_epoch="$epoch"
+    done < <(find "$base" -maxdepth 1 -type d -name 'public_html.bak.*' 2>/dev/null \
+                 | sed 's#.*/public_html\.bak\.##' \
+                 | grep -E '^[0-9]+$' \
+                 | sort -n)
+    if [[ -n "$newest_epoch" ]]; then
+        newest_bak="${base}/public_html.bak.${newest_epoch}"
+        if [[ -d "$newest_bak" && ! -L "$newest_bak" ]]; then
+            local bak_human
+            bak_human=$(date -r "$newest_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+                || date -d "@${newest_epoch}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+                || echo "epoch ${newest_epoch}")
+            mv "$newest_bak" "${base}/public_html"
+            warn "'${target}': 'public_html' eksik/kırıktı — diskte bulunan ÖNCEKİ bir yedek geri yüklendi: $(basename "$newest_bak") (tarih: ${bak_human}). Bu içerik BAYAT olabilir, kontrol edin."
+        fi
+    fi
+
+    # 2) Hâlâ yoksa: BOŞ bir public_html oluştur (chdir invariant'ı için
+    # ZORUNLU) — sahiplik/izin '_domain_fs_plan' (TEK doğruluk kaynağı,
+    # harden-fs'in de kullandığı) İLE TUTARLI. Framework argümanı burada
+    # ÖNEMSİZ: 'public_html' satırı _domain_fs_plan'ın TABAN listesindedir
+    # (framework'e özgü case bloğunun DIŞINDA), bu yüzden hangi framework
+    # verilirse verilsin AYNI değeri döner.
+    if [[ ! -e "${base}/public_html" ]]; then
+        mkdir -p "${base}/public_html"
+        local pub_mode
+        pub_mode=$(_domain_fs_plan "${base}" "${web_user}" "ci4" | awk -F'|' '$1=="public_html"{print $3}')
+        [[ -n "$pub_mode" ]] || pub_mode=750
+        chown "${web_user}:${web_user}" "${base}/public_html" 2>/dev/null || true
+        chmod "$pub_mode" "${base}/public_html" 2>/dev/null || true
+        if command -v setfacl &>/dev/null; then
+            setfacl -m "u:www-data:rx" "${base}/public_html" 2>/dev/null || true
+            setfacl -d -m "u:www-data:rx" "${base}/public_html" 2>/dev/null || true
+        fi
+        warn "'${target}': 'public_html' YOKTU ve geri yüklenecek bir yedek bulunamadı — BOŞ bir 'public_html' oluşturuldu (PHP-FPM 'chdir' invariant'ı için ZORUNLU; aksi halde domain HİÇBİR komutla — php-switch/harden-fpm/repair dahil — kurtarılamazdı). 'srvctl deploy' ile içerik yayınlayın."
+    fi
+}
+
+# ─── Hayalet FPM pool.d dosyalarının temizliği (GÜVENLİK DENETİMİ EKİ —
+# ikinci dereceden hasar: hayalet domain düzeltmesi kaynağı kapattı ama
+# ZATEN ÜRETİLMİŞ kalıntı filoyu bloke etmeye devam ediyordu) ───
+# HOST bulgusu (srvctl-jammy): önceki bir 'repair --all' çalıştırması,
+# hayalet '/var/www/html' için 'user = web_html' (VAR OLMAYAN bir sistem
+# kullanıcısı) içeren bir 'pool.d/html.conf' YAZMIŞTI (hayalet-tespiti
+# eklenmeden ÖNCE — bkz. _domain_repair_is_ghost). php-fpm böyle bir havuzu
+# KABUL ETMEZ — TEK bu dosya yüzünden paylaşılan php<ver>-fpm.service HİÇ
+# BAŞLAYAMIYOR ('Restart=on-failure' döngüsü → "start request repeated too
+# quickly" rate-limit). Sonuç: o php sürümünü kullanan HİÇBİR YENİ domain
+# eklenemiyordu — 'domain add' 4/10. adımda (PHP-FPM pool) ölüyordu.
+# Hayalet-tespiti kaynağı KAPATTI (yeni kalıntı ÜRETİLMEZ) ama zaten var
+# olan kalıntıyı TEMİZLEMİYORDU — kullanıcı komut satırından çıkamayacağı
+# bir çıkmaza düşüyordu ('domain add' çalışmıyor, eski 'repair' de bu
+# dosyayı kaldırmıyordu).
+#
+# KARAR — burada OTOMATİK SİL, '.credentials' kararından (yalnız raporla,
+# silme) BİLİNÇLİ olarak FARKLI: bir pool.d/*.conf dosyası SAF altyapı
+# konfigürasyonudur — hiçbir sır/parola/kullanıcı verisi İÇERMEZ (bkz.
+# templates/php-fpm/pool.conf.tpl — DB/Redis kimlikleri '.credentials'ta,
+# BURADA değil) ve 'user = <var olmayan sistem kullanıcısı>' HİÇBİR meşru
+# senaryoda geçerli olamaz: gerçek bir domain'in web_user'ı _domain_add'in
+# İLK adımından beri HER ZAMAN var olur (AYNI sinyal —
+# _domain_repair_is_ghost başlık yorumuna bkz., o fonksiyonda da 'id
+# web_<sname>' kullanılıyor). '.credentials'ta kaybedilecek YENİDEN
+# ÜRETİLEMEZ bir değer (üretilmiş parola) varken, burada YOK; buna karşın
+# BIRAKMANIN bedeli somut ve yüksek: TEK bir kalıntı dosya o php sürümünü
+# paylaşan TÜM filonun 'domain add'ini kilitler. Yine de SESSİZ değil:
+# silinen HER dosyanın TAM YOLU hem kullanıcıya (warn) hem log_action'a
+# yazılır.
+#
+# PREDİKAT DEĞİL — yan etkili, koşulsuz döner (bir php sürümünün pool.d'si
+# henüz yoksa/boşsa bu HATA değildir).
+_domain_fpm_purge_ghost_pools() {
+    local php_version="$1"
+    local pool_dir="${SRVCTL_PHP_POOL_DIR:-/etc/php/${php_version}/fpm/pool.d}"
+    [[ -d "$pool_dir" ]] || return 0
+
+    local conf pool_user
+    for conf in "${pool_dir}"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        # 'www.conf'(.disabled) bu taramanın kapsamı DIŞI — srvctl-yönetimli
+        # değil, init.sh tarafından zaten devre dışı bırakılıp yönetiliyor
+        # (bkz. lib/init.sh:_install_php).
+        [[ "$(basename "$conf")" == "www.conf" ]] && continue
+        pool_user=$(grep -m1 -E '^[[:space:]]*user[[:space:]]*=' "$conf" 2>/dev/null \
+            | sed -E 's/^[^=]*=[[:space:]]*//' | tr -d '[:space:]')
+        [[ -n "$pool_user" ]] || continue
+        if ! id "$pool_user" &>/dev/null; then
+            warn "Hayalet FPM havuzu bulundu ve KALDIRILDI: ${conf} (var olmayan sistem kullanıcısı: '${pool_user}' — bu dosya TEK BAŞINA paylaşılan php${php_version}-fpm servisinin hiç başlamamasına yol açabiliyordu)"
+            log_action "hayalet pool.d dosyası kaldırıldı: ${conf} (user=${pool_user} sistemde yok)"
+            rm -f -- "$conf"
+        fi
+    done
+}
+
 _domain_repair() {
     local target="$1"
     [[ -z "$target" ]] && error "Kullanım: srvctl domain repair <domain> | --all"
 
     if [[ "$target" == "--all" ]]; then
         header "Tüm Domainler Onarılıyor..."
-        for dir in "${WEB_ROOT}"/*/; do
-            [[ ! -d "$dir" ]] && continue
-            local domain
-            domain=$(basename "$dir")
-            _domain_repair "$domain"
-        done
-        success "Tüm domainler onarıldı."
-        return
+        # ─── GÜVENLİK DENETİMİ EKİ (fail-open raporlama düzeltmesi) ───
+        # ESKİDEN: '_domain_repair "$domain"' çıplak çağrılıyordu (dönüş
+        # değeri YOK SAYILIYORDU) ve döngü sonunda KOŞULSUZ
+        # 'success "Tüm domainler onarıldı."' + implicit EXIT=0 basılıyordu.
+        # HOST'ta ölçüldü (srvctl-jammy): FPM unit aktif edilemeyen bir
+        # domain'de bile (izole unit durdurulmuş/disable edilmiş, site
+        # KAPALI) çıktı "✓ Domain onarıldı." + "✓ Tüm domainler onarıldı." +
+        # EXIT=0 basıyordu — bir cron/betik yalnız exit kodunu kontrol
+        # ederse her şeyin yolunda olduğunu SANIR (composer/privdrop'ta
+        # yakalanan sınıfla AYNI). Artık her domain'in GERÇEK dönüş değeri
+        # toplanır; TEK bir domain başarısız olsa bile DÖNGÜ DEVAM EDER
+        # (toplu iş yarıda kesilmez) ama SONUÇ dürüst: kaç domain başarısız
+        # olduğu yazılır ve en az biri başarısızsa fonksiyon SIFIRDAN FARKLI
+        # döner. NOT: 'set -e' altında çıplak '_domain_repair "$domain"'
+        # çağrısı, fonksiyon 1 dönünce TÜM döngüyü/'--all' komutunu
+        # KOŞULSUZ sonlandırırdı (bkz. CLAUDE.md/proje kuralı — koşul
+        # olmayan bağlamda non-zero exit script'i düşürür); bu yüzden çağrı
+        # 'if ! ...' ile GUARD'lanır.
+        #
+        # GÜVENLİK DENETİMİ EKİ (kendi kendini sahiplenme döngüsü — HOST'ta
+        # ölçüldü): buradaki numaralandırma ESKİDEN '${WEB_ROOT}/*/' üzerinde
+        # HAM bir glob'du — 'domain list'/'security audit' gibi diğer
+        # tüketicilerin kullandığı 'list_all_domains()' (lib/core.sh)
+        # sözleşmesini ATLIYORDU. Artık AYNI sözleşme kullanılıyor (tekilleşme)
+        # VE ONA EK OLARAK 'list_all_domains()'in çıktısı
+        # '_domain_repair_is_ghost' ile bir kez daha süzülüyor — yalnız
+        # 'list_all_domains()'e geçmek TEK BAŞINA yetmezdi: o fonksiyonun
+        # işareti '.credentials' ve repair'in KENDİSİ tam olarak bu dosyayı
+        # üretiyor (bkz. '_domain_repair_is_ghost' başlık yorumu — kendi
+        # kendini doğrulayan döngü). Hayalet bulunan her dizin AÇIKÇA
+        # raporlanır (bkz. '_domain_repair_ghost_report') ve ATLANIR — ne
+        # 'failed_domains'e ne de 'repair_total'e sayılır: bu, gerçek
+        # domain başarısızlıklarını sabit bir "nginx varsayılan dizini"
+        # gürültüsünden AYIRIR (bu ayrım olmadan düzeltmenin dürüst
+        # exit-kodu değeri, HER standart sunucuda '/var/www/html' yüzünden
+        # SIFIRLANIRDI).
+        local -a failed_domains=()
+        local -a ghost_domains=()
+        local repair_total=0
+        while IFS= read -r domain; do
+            [[ -n "$domain" ]] || continue
+            if _domain_repair_is_ghost "$domain"; then
+                ghost_domains+=("$domain")
+                _domain_repair_ghost_report "$domain"
+                continue
+            fi
+            repair_total=$((repair_total + 1))
+            if ! _domain_repair "$domain"; then
+                failed_domains+=("$domain")
+            fi
+        done < <(list_all_domains)
+        if [[ "${#failed_domains[@]}" -eq 0 ]]; then
+            if [[ "${#ghost_domains[@]}" -gt 0 ]]; then
+                success "Tüm GERÇEK domainler onarıldı (${repair_total}/${repair_total}) — ${#ghost_domains[@]} hayalet kalıntı ATLANDI (yukarıya bakın): ${ghost_domains[*]}"
+            else
+                success "Tüm domainler onarıldı (${repair_total}/${repair_total})."
+            fi
+            return 0
+        else
+            warn "Onarım TAMAMLANAMADI: ${#failed_domains[@]}/${repair_total} domain başarısız: ${failed_domains[*]}"
+            warn "Her biri için ayrıntılı hata yukarıda — tek tek 'srvctl domain repair <domain>' ile tekrar deneyin."
+            return 1
+        fi
     fi
 
     domain_exists "$target" || error "Domain bulunamadı: ${target}"
+    # GÜVENLİK DENETİMİ EKİ: doğrudan 'srvctl domain repair <ad>' çağrısı da
+    # AYNI hayalet kontrolünden geçer — 'domain_exists' yalnız dizin+ad
+    # sözdizimini doğrular (bkz. core.sh), nginx'in '/var/www/html' gibi
+    # srvctl-DIŞI bir dizinini ELEMEZ. Bu kontrol olmadan operatör elle de
+    # olsa bir hayalet dizine '.credentials'/AppArmor profili YAZDIRABİLİRDİ.
+    if _domain_repair_is_ghost "$target"; then
+        _domain_repair_ghost_report "$target"
+        error "'${target}' bir srvctl domain'i gibi görünmüyor (web kullanıcısı yok) — onarım İPTAL EDİLDİ, yukarıya bakın."
+    fi
     read_credentials "$target"
     local base="${WEB_ROOT}/${target}"
     # PHP sürümü _derive_php ile DOĞRULANMIŞ biçimde alınır (assert_php_version) —
@@ -216,6 +501,25 @@ _domain_repair() {
     fi
 
     header "Domain Onarılıyor: ${target}"
+
+    # ─── GÜVENLİK DENETİMİ EKİ: genel başarı takibi ───
+    # 'repair' birden fazla BAĞIMSIZ alt-sistemi (chroot, FPM, AppArmor,
+    # DB/Redis, credentials) yeniden kurar; bunlardan biri başarısız olsa
+    # bile KALAN adımlar mümkün olduğunca çalışmaya devam eder — bu KASITLI
+    # (kısmi onarım, hiç onarım yapmamaktan iyidir). Ama fonksiyon SONUNDA
+    # koşulsuz "✓ Domain onarıldı" basmak YANLIŞ GÜVENCE üretir — HOST'ta
+    # ölçüldü (srvctl-jammy): FPM unit aktif edilemeyen (site fiilen KAPALI)
+    # bir domain'de bile bu mesaj + EXIT=0 basılıyordu. 'repair_failed'
+    # aşağıdaki adımlar boyunca gerçek durumu izler; fonksiyon sonunda mesaj
+    # VE dönüş değeri buna göre seçilir (bkz. fonksiyon sonu).
+    local repair_failed=false
+
+    # ─── public_html / current onarımı (KARAR REVİZYONU — artık BURADA
+    # ONARILIYOR, bkz. _domain_repair_fix_docroot başlık yorumu) ───
+    # FPM config-test/aktivasyon adımından (2/4) ÖNCE çağrılır ki 'chdir'
+    # invariant'ı düzeltilmiş olarak o adıma girilsin.
+    _domain_repair_fix_docroot "$target" "$base" "$web_user"
+
     step "1/4" "Chroot kütüphaneleri güncelleniyor (PHP ${php_ver})..."
     _apply_chroot_php_deps "${base}" "${php_ver}"
     
@@ -242,6 +546,13 @@ _domain_repair() {
     local using_isolated_fpm=false
     [[ -f "$isolated_conf" ]] && using_isolated_fpm=true
 
+    # GÜVENLİK DENETİMİ EKİ: bu domain'in kendi işini yapmadan ÖNCE, aynı php
+    # sürümünün pool.d'sindeki hayalet kalıntıları temizle — bkz.
+    # _domain_fpm_purge_ghost_pools başlık yorumu. Bu, operatörün
+    # 'srvctl domain repair --all' ile fleet'i PROAKTİF temizleyebilmesini
+    # sağlar (bir sonraki 'domain add' bu temizliğe muhtaç kalmadan önce).
+    _domain_fpm_purge_ghost_pools "$php_ver"
+
     if $using_isolated_fpm; then
         info "Domain izole FPM unit kullanıyor (srvctl-fpm-${sname}.service) — pool tanımı paylaşılan pool.d/'ye DEĞİL izole hedefe yazılacak"
         # Unit'i ÖNCE durdur ki render+activate ESKİ config'le çalışır kalmasın
@@ -252,7 +563,19 @@ _domain_repair() {
         if _domain_activate_fpm_unit "$target"; then
             success "İzole FPM unit yenilendi: srvctl-fpm-${sname}.service"
         else
-            warn "İzole FPM unit yeniden başlatılamadı — 'srvctl security harden-fpm ${target} --apply' ile elle deneyin"
+            # GÜVENLİK DENETİMİ EKİ: HOST'ta doğrulandı — bu dal başarısız
+            # olduğunda '_domain_activate_fpm_unit' unit'i ZATEN disable+stop
+            # etmiş durumda (fail-closed — kendi başlık yorumuna bkz.).
+            # Yukarıda BİZ de repair başlamadan unit'i durdurmuştuk; yani
+            # BURADAN itibaren domain'in FPM'i KESİN KAPALI ve bu 'repair'
+            # çağrısı onu GERİ AÇAMADI. Eskiden bu yalnız "elle deneyin" diye
+            # warn ediyordu ve fonksiyon sonunda yine de "✓ Domain onarıldı"
+            # basıyordu — kullanıcı sitenin şu an tamamen KAPALI olduğunu
+            # buradan ASLA öğrenemiyordu (Bulgu 1 — journalctl'de doğrulandı:
+            # unit repair ÖNCESİ aktifken repair SONRASI 'inactive').
+            repair_failed=true
+            warn "İzole FPM unit AKTİF EDİLEMEDİ — bu domain ŞU AN KAPALI kaldı (unit durduruldu, eskisi gibi ÇALIŞMIYOR): srvctl-fpm-${sname}.service"
+            warn "Elle deneyin: srvctl security harden-fpm ${target} --apply"
         fi
 
         # ─── Kalıntı temizliği (madde 3 — bozuk MEVCUT kurulumları onar) ───
@@ -352,15 +675,39 @@ SQL
 
     # Redis ACL: TEK KAYNAK olan _domain_build_redis_acl_line ile _domain_add
     # ile BİREBİR AYNI mantıkla yeniden üretilir (iki yerde ayrışma riski yok).
-    # Bu, ör. Redis 6→7 sürüm yükseltmesi sonrası scripting kararının ya da
-    # 'redis-server' yeniden kurulumu sonrası kaybolan ACL girdisinin
+    # Bu, ör. 'redis-server' yeniden kurulumu sonrası kaybolan ACL girdisinin
     # onarılmasını sağlar.
+    #
+    # İKİ YÖNLÜ SESSİZ DEĞİŞİM KORUMASI (kullanıcı kararı — ÖLÇÜM: repair
+    # ÖNCEDEN scripting_status'u DOĞRUDAN _domain_redis_scripting_mode(major)
+    # çıktısından, o ÇALIŞTIRMADAKİ sürümle SIFIRDAN hesaplıyordu — domainin
+    # '.srvctl-meta'sındaki ÖNCEKİ değere HİÇ bakmıyordu. Bu, host Redis 6→7'ye
+    # yükseltildiğinde (ör. resmi depo geçişiyle) HİÇBİR '--redis-queue'
+    # talebi olmayan domainlerin repair çalıştığında SESSİZCE 'enabled'a
+    # dönmesine yol açardı — 'domain add'deki TAM OLARAK aynı sınıf regresyon,
+    # bkz. _domain_redis_queue_gate. Düzeltme: repair bir CLI bayrağı ALMAZ
+    # (idempotent bakım komutu); bunun yerine domainin BU çalıştırmadan
+    # ÖNCEKİ REDIS_SCRIPTING meta değeri "operatör daha önce AÇIKÇA istedi
+    # mi" sinyali olarak kullanılır — önceden 'enabled' ise kalıcı bir istek
+    # gibi ele alınır (sürüm hâlâ izin veriyorsa AÇIK kalır, SESSİZCE
+    # KAPANMAZ); önceden 'disabled'/'unknown'/meta hiç yoksa istek YOK
+    # sayılır (sürüm sonradan izin verse bile SESSİZCE AÇILMAZ).
     if [[ -n "$redis_user" && -n "$redis_pass" ]]; then
+        local prev_scripting_status
+        prev_scripting_status=$(_domain_read_redis_scripting_status "$target")
+        local redis_queue_prev_requested=false
+        [[ "$prev_scripting_status" == "enabled" ]] && redis_queue_prev_requested=true
+
         _sed_inplace /etc/redis/users.acl "/^user ${redis_user} /d" 2>/dev/null || true
-        local redis_major="" redis_minor="" scripting_flag scripting_status channel_status
+        local redis_major="" redis_minor="" base_scripting_flag base_scripting_status channel_status
         read -r redis_major redis_minor <<< "$(_redis_version_pair)"
-        read -r scripting_flag scripting_status <<< "$(_domain_redis_scripting_mode "$redis_major")"
+        read -r base_scripting_flag base_scripting_status <<< "$(_domain_redis_scripting_mode "$redis_major")"
         channel_status=$(_redis_channel_isolation_mode "$redis_major" "$redis_minor")
+
+        local scripting_flag scripting_status redis_queue_reason
+        read -r scripting_flag scripting_status redis_queue_reason <<< \
+            "$(_domain_redis_queue_gate "$base_scripting_flag" "$base_scripting_status" "$redis_queue_prev_requested")"
+
         local acl_line
         acl_line=$(_domain_build_redis_acl_line "$redis_user" "$redis_pass" "$sname" "$scripting_flag" "$channel_status")
         echo "$acl_line" >> /etc/redis/users.acl
@@ -368,15 +715,55 @@ SQL
         local redis_admin_pass
         redis_admin_pass=$(grep "^REDIS_ADMIN_PASS=" "${SRVCTL_CONF}" 2>/dev/null | cut -d= -f2)
         if [[ -n "$redis_admin_pass" ]]; then
-            REDISCLI_AUTH="$redis_admin_pass" redis-cli --user admin --no-auth-warning ACL LOAD 2>/dev/null || \
-                systemctl restart redis-server
+            # GÜVENLİK DENETİMİ EKİ (BUG 3 — core.sh sahibi agent'ın bulgusu):
+            # 'redis-cli', sunucudan HERHANGİ bir yanıt aldığı sürece —
+            # yanıt bir HATA METNİ olsa bile — genellikle 0 ile çıkar. Çıplak
+            # 'ACL LOAD ... || systemctl restart' zinciri bu yüzden ACL'in
+            # CANLI kural kümesine GERÇEKTEN uygulanıp uygulanmadığını HİÇ
+            # ÖLÇMÜYORDU. HOST'ta ölçüldü: 'ACL LOAD' "ERR .../users.acl:5:
+            # Syntax error" ile çöktü, Redis "no change to the previously
+            # active ACL rules was performed" dedi — ama repair "✓ Domain
+            # onarıldı" + EXIT=0 basıyordu. Sonuç: bu domainin Redis kanal
+            # izolasyonu (komşu domainin pub/sub kanalını dinlemesini/yayın
+            # yapmasını ENGELLEYEN kontrol) hiç yürürlüğe girmemişti —
+            # fonksiyonel testte domain A, domain B'nin kanalına hem
+            # PUBLISH hem SUBSCRIBE yapabiliyordu.
+            #
+            # '_redis_acl_load' (core.sh, paylaşılan sarmalayıcı) hem dönüş
+            # kodunu HEM çıktının TAM OLARAK 'OK' olduğunu kontrol eder;
+            # başarısızlıkta Redis'in kendi teşhis metnini zaten stderr'e
+            # basar. Dönüş değeri ARTIK YUTULMUYOR — bu turda repair için
+            # kurulan dürüst raporlama mekanizmasına ('repair_failed')
+            # bağlanıyor: ACL LOAD başarısızlığı da FPM aktivasyon
+            # başarısızlığı gibi "✓ Domain onarıldı" YALANINI engeller.
+            #
+            # 'systemctl restart redis-server' fallback'i BİLEREK KALDIRILDI
+            # (yalnız bu dalda — 'redis_admin_pass' YOKSA aşağıdaki 'else'
+            # dalı hâlâ restart'a başvurur, o farklı bir senaryo): ACL LOAD
+            # başarısızlığının en olası nedeni /etc/redis/users.acl'deki bir
+            # SÖZDİZİMİ HATASIDIR (HOST'ta doğrulandı) — Redis, ACL dosyası
+            # bozukken BAŞLAMAYI REDDEDER. Bu durumda 'restart' denemek TEK
+            # domainin izolasyon eksikliğini TÜM domainlerin Redis'e hiç
+            # erişememesine (Redis'in tamamen çökmesine) çevirebilirdi — bu
+            # daha büyük bir hasardır. Bunun yerine operatör AÇIKÇA uyarılır.
+            if ! _redis_acl_load "$redis_admin_pass"; then
+                repair_failed=true
+                warn "GÜVENLİK: Redis ACL bu domain için CANLI kural kümesine UYGULANMADI (${target}) — anahtar alanı VE kanal izolasyonu kontrolleri YÜRÜRLÜKTE DEĞİL, komşu domainler bu domainin Redis verilerine/pub-sub kanallarına erişebilir. Redis'in kendi hata metni yukarıda. 'systemctl restart redis-server' BİLEREK DENENMEDİ (ACL dosyası bozuksa restart TÜM domainlerin Redis'ini çökertebilir) — önce /etc/redis/users.acl'i elle inceleyip düzeltin, sonra 'srvctl domain repair ${target}' ile tekrar deneyin."
+            fi
         else
             systemctl restart redis-server
         fi
 
         write_meta "$target" "REDIS_SCRIPTING" "$scripting_status"
         if [[ "$scripting_status" != "enabled" ]]; then
-            warn "Redis scripting (EVAL/Lua) bu domainde KAPALI (${scripting_status}) — Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAZ; QUEUE_CONNECTION=database kullanın."
+            if [[ "$prev_scripting_status" == "enabled" ]]; then
+                # DÜŞÜŞ: domain daha önce AÇIKTI, artık Redis ${redis_major}
+                # bunu güvenle DESTEKLEMİYOR (ör. downgrade/yeniden kurulum) —
+                # fail-closed korunur ama bu SESSİZ bir kapanma DEĞİL.
+                warn "Redis scripting (EVAL/Lua) bu domainde DAHA ÖNCE AÇIKTI, artık Redis ${redis_major:-bilinmiyor} bunu güvenle desteklemediği için KAPATILDI — Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAYABİLİR."
+            else
+                warn "Redis scripting (EVAL/Lua) bu domainde KAPALI (${scripting_status}) — Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAZ; QUEUE_CONNECTION=database kullanın."
+            fi
         fi
 
         write_meta "$target" "REDIS_CHANNEL_ISOLATION" "$channel_status"
@@ -412,10 +799,29 @@ SQL
     if $using_isolated_fpm; then
         info "İzole FPM unit zaten yenilendi (adım 2/4) — paylaşılan php${php_ver}-fpm'e dokunulmadı (bu domain onu kullanmıyor)"
     else
-        systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+        # GÜVENLİK DENETİMİ EKİ: 'restart ... || true' izole daldaki AYNI
+        # fail-open sınıfıydı — paylaşılan master'ın restart'ı başarısız
+        # olursa SESSİZCE yutuluyordu. Artık gerçek durum izlenir ve
+        # 'repair_failed' üzerinden fonksiyon sonucuna yansır.
+        if ! systemctl restart "php${php_ver}-fpm" 2>/dev/null; then
+            repair_failed=true
+            warn "Paylaşılan php${php_ver}-fpm yeniden BAŞLATILAMADI — bu domain (ve aynı master'ı paylaşan diğer domainler) ETKİLENMİŞ olabilir: 'systemctl status php${php_ver}-fpm' ile kontrol edin"
+        fi
     fi
 
+    # ─── GÜVENLİK DENETİMİ EKİ: dürüst sonuç raporlama ───
+    # Yukarıdaki adımlardan HERHANGİ biri 'repair_failed'i true yaptıysa
+    # (izole/paylaşılan FPM aktivasyonu) koşulsuz "✓ Domain onarıldı" ARTIK
+    # BASILMAZ — bu tam olarak HOST'ta yakalanan fail-open bulgusuydu
+    # (Bulgu 1). Fonksiyon de SIFIRDAN FARKLI döner ki '--all' dalı VE
+    # doğrudan tek-domain çağrısı gerçek durumu (ve doğru exit kodunu)
+    # yansıtsın.
+    if $repair_failed; then
+        warn "Domain KISMEN onarıldı — yukarıdaki hata(lar)a bakın: ${target}"
+        return 1
+    fi
     success "Domain onarıldı: ${target}"
+    return 0
 }
 
 
@@ -658,12 +1064,80 @@ _domain_framework_declared() {
 # yok). Bu yüzden marjinal risk düşük, CI4'ün TAMAMEN boot edememesi ise
 # kritik bir fonksiyonel kırılma — güvenlik kazancı bu dar kullanım
 # kaybından ağır basmıyor, dar bir istisna yeterli.
+#
+# ─── GÜVENLİK DENETİMİ EKİ (2. TUR — HOST ÖLÇÜMÜYLE DÜZELTİLDİ): mail-ailesi
+# fonksiyonlar + LD_PRELOAD zinciri, ve asıl kesen katmanın ne olduğu ───
+# Bu yorumun İLK sürümü "mail()'i disable_functions'a eklemek yeterli, çünkü
+# chroot'ta zaten sendmail/sh yok, zincir zaten kırık" diyordu. HOST ölçümü
+# (srvctl-jammy, Ubuntu 22.04, PHP 8.3) bunun İKİ noktada YANLIŞ/eksik
+# olduğunu gösterdi — aşağıda düzeltilmiş hâli.
+#
+# HATA 1 — 'mail' TEK BAŞINA yeterli değil (mail-ailesi başka fonksiyonlar
+# var): disable_functions yalnız LİSTELENEN Zend fonksiyon tablosu girişini
+# kapatır. mbstring'in mb_send_mail()'i ve imap eklentisinin imap_mail()'i
+# mail() ile AYNI dahili popen(sendmail_path) yolunu kullanır ve
+# disable_functions'taki 'mail' girişinden ETKİLENMEZ (ayrı fonksiyon tablosu
+# girdileri). HOST'ta doğrulandı: 'mail' disable_functions'tayken bile
+# sendmail_path marker-yazan bir betiğe yönlendirildi ve
+# @mb_send_mail("a@b.c","s","b") GERÇEKTEN spawn etti (argv=-t -i). Bu yüzden
+# 'mb_send_mail' ve 'imap_mail' de 'mail' ile AYNI gerekçeyle (hiçbir
+# framework boot'ta ihtiyaç duymaz → istisnasız) TABANA eklendi — bkz.
+# aşağıdaki 'base'. imap_mail eklentisi bugün kurulu olmasa da eklendi:
+# disable_functions'a var olmayan bir fonksiyon adı yazmak PHP'yi hataya
+# düşürmez (php -d ile doğrulandı — ini işlenirken yalnızca fonksiyon
+# tabloda BULUNURSA silinir, bulunamazsa sessizce yok sayılır); yani operatör
+# ileride 'php-imap' kurarsa liste SESSİZCE delinmez.
+#
+# HATA 2 — DAHA ÖNEMLİSİ, "chroot boşluğu zinciri kapatıyor" savunması TEK
+# BAŞINA GÜVENİLMEZ: HOST mutasyon testi canlı ci4.local chroot'una elle bir
+# /bin/sh (dash) VE /usr/sbin/sendmail YERLEŞTİRDİ, sonra web üzerinden bir
+# spawn tetikleyici (error_log($m,1,...) — aşağıya bkz.) çağrıldı. Spawn YİNE
+# olmadı; auditd sebebi:
+#   apparmor="DENIED" operation="exec" profile="srvctl-ci4_local"
+#   name="/var/www/ci4.local/bin/sh" requested_mask="x" denied_mask="x"
+# Yani zinciri fiilen kesen katman chroot'un BOŞLUĞU DEĞİL, AppArmor
+# profilinin exec İZİN VERMEMESİDİR (web kökü altındaki hiçbir yola 'x' izni
+# yok — templates/apparmor/*, bu görevin kapsamı DIŞI). Chroot boşluğu
+# İKİNCİL/ek bir katman: chroot İÇERİĞİNİ deploy/build adımları
+# yazabildiğinden (bkz. lib/deploy.sh, kapsam dışı) TEK BAŞINA dayanılacak
+# bir kontrol DEĞİLDİR — "chroot boş, o yüzden güvenli" varsayımı YANLIŞ
+# GÜVENCE üretir.
+#
+# SONUÇ — bu fonksiyonun ürettiği disable_functions listesi BEST-EFFORT'TUR,
+# TEK/YETERLİ KATMAN DEĞİL: yalnız BİLİNEN "mail ailesi" PHP fonksiyonlarını
+# (mail, mb_send_mail, imap_mail) kapatabilir. Asıl/güvenilir kontrol
+# AppArmor'ın exec deny'i ve — ondan bağımsız, ikincil bir katman olarak —
+# chroot'un fiilen boş tutulmasıdır. PAYLAŞILAN pool'daki (AppArmor attach
+# EDİLMEYEN — bkz. _domain_isolated_fpm_effective) domainlerde bu liste
+# pratikte TEK giriş engelidir; framework istisnası olmadan GENİŞ tutulması
+# bu yüzden daha da önemli.
+#
+# error_log KASITLI OLARAK EKLENMEDİ — KAPATILAMAYAN KALICI BİR DELİK:
+# error_log($msg, 1, $to) (message_type=1) AYNI dahili sendmail yolunu
+# kullanır ve HOST'ta doğrulandı: 'mail' disable_functions'tayken bile
+# GERÇEKTEN spawn etti (error_log kendi popen çağrısını mail()/
+# mb_send_mail()'in disable durumuna BAKMADAN yapar — ayrı bir C-seviyesi
+# çağrı yolu). error_log ise Laravel/CI4/Monolog'un TEMEL hata loglama
+# altyapısına gömülüdür; disable_functions'a eklemek framework'ü ÇALIŞAMAZ
+# hale getirir (fonksiyonel kırılma, kabul edilemez). BU YÜZDEN
+# error_log disable_functions'a EKLENMEDİ ve EKLENMEMELİDİR — bir sonraki
+# okuyucu "tutarlılık" adına eklemeye kalkışmasın. Bu satırın anlamı:
+# disable_functions'ın 'mail ailesi' kapsamı error_log'u KAPSAMAZ; error_log
+# üzerinden AYNI sınıf (popen→/bin/sh→LD_PRELOAD) spawn PAYLAŞILAN pool'da
+# (AppArmor'sız) teorik olarak HÂLÂ mümkündür — bunu durduran TEK katman
+# yine AppArmor exec deny'idir (yukarıdaki HATA 2). php_admin_value
+# [sendmail_path] override'ı da bunu ÇÖZMEZ: popen() glibc içinde HER
+# ZAMAN '/bin/sh -c "<komut>"' exec eder — sendmail_path yalnız <komut>
+# dizesini değiştirir, /bin/sh'in KENDİSİNİN exec edilmesini ENGELLEMEZ; bu
+# yüzden sendmail_path override'ı BİLİNÇLİ OLARAK EKLENMEDİ (gerçek koruma
+# yine exec'i reddeden AppArmor'dur, komut dizesini kısıtlamak değil).
 _domain_disable_functions_for() {
     local framework="$1"
     # TABAN: lib/init.sh:99-srvctl-security.ini'deki disable_functions satırıyla
-    # BİREBİR AYNI olmalı (ikisinde de 'putenv' YOK). Sapmayı
-    # tests/test_disable_functions_sync.sh yakalar.
-    local base="exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,show_source,highlight_file"
+    # BİREBİR AYNI olmalı ('putenv' ikisinde de YOK; 'mail'/'mb_send_mail'/
+    # 'imap_mail' ikisinde de VAR; 'error_log' İKİSİNDE DE YOK — kasıtlı,
+    # yukarı bkz.). Sapmayı tests/test_disable_functions_sync.sh yakalar.
+    local base="exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,show_source,highlight_file,mail,mb_send_mail,imap_mail"
     if [[ "$framework" == "ci4" ]]; then
         echo "$base"
     else
@@ -719,13 +1193,40 @@ _domain_capacity_read_profile() {
 }
 
 # DOMAIN_ISOLATED_FPM efektif değerini döndürür (stdout: "true"|"false").
-# Öncelik: .srvctl-meta ISOLATED_FPM (web-yazılabilir → validate_bool ile
-# doğrulanır) > global DOMAIN_ISOLATED_FPM (conf/srvctl.conf, core.sh
-# load_config zaten validate_bool ile doğruladı). Meta değeri eksik/
-# geçersizse SESSİZCE global değere düşülür — hatalı/tampered bir meta
-# satırı varsayılanı ASLA override edemez (fail-closed: bkz. rapor —
-# lib/security.sh:_meta_known_keys whitelist'ine ISOLATED_FPM eklenmesi
-# gerekir, o dosya bu görevin kapsamı dışında).
+# Öncelik: .srvctl-meta ISOLATED_FPM > global DOMAIN_ISOLATED_FPM
+# (conf/srvctl.conf, core.sh load_config zaten validate_bool ile doğruladı).
+#
+# DÜZELTME (HOST'ta ölçüldü, Ubuntu 22.04, dört domain): '.srvctl-meta'
+# WEB-YAZILABİLİR DEĞİLDİR — bu yorumun önceki sürümü ("web-yazılabilir →
+# validate_bool ile doğrulanır") yanlıştı. Gerçek sahiplik/izin: dosya
+# root:root 644, üst dizin (${WEB_ROOT}/<domain>) root:root 751 (T1/
+# _domain_apply_fs_ownership — 'domain add' anında doğuştan hardened).
+# Gerçek tamper denemesiyle doğrulandı: domain'in KENDİ web kullanıcısı
+# olarak ('sudo -u web_ci4_local bash -c "echo TAMPER=1 >>
+# .../.srvctl-meta"') PERMISSION DENIED alındı — ne dosyanın kendisi
+# değiştirilebiliyor ne de üst dizin 751 (o+x, o-w) olduğundan yerine yeni
+# bir dosya konulabiliyor. Yani bu ISOLATED_FPM override'ı için tehdit
+# modeli "düşman-kontrollü web kullanıcısı" DEĞİLDİR — bu vektör zaten
+# dosya-sistemi izinleriyle KAPALI.
+#
+# 'validate_bool' NEDEN HÂLÂ VAR (yanlış gerekçe düzeltildi, kontrolün
+# kendisi KALDIRILMADI): bu, adversarial girdiye karşı değil, OPERATÖRÜN
+# ELLE DÜZENLEMESİNDEKİ YAZIM HATALARINA karşı bir korumadır (ör.
+# 'ISOLATED_FPM=Yes' ya da 'ISOLATED_FPM=1' — yalnız 'true'/'false'
+# bekleniyor). Bu meşru ve korunması gereken bir savunma katmanıdır.
+#
+# Aşağıdaki '_require_owned_or_warn' çağrısı AYRI bir katmandır ve bu
+# yüzden KALDIRILMADI: henüz T1 sahiplik modeline geçmemiş/hardened
+# OLMAYAN (ör. eski/migrate edilmemiş) bir domainde meta'nın GERÇEKTEN
+# web-yazılabilir kalabileceği residual senaryoya karşı savunma-derinliği
+# sağlıyor — normal/hardened bir domainde (yukarıdaki ölçüm) bu dal zaten
+# tetiklenmiyor (ownership her zaman root).
+#
+# Meta değeri eksik/geçersizse SESSİZCE global değere düşülür — hatalı/
+# yanlış yazılmış bir meta satırı varsayılanı ASLA override edemez
+# (fail-closed: bkz. rapor — lib/security.sh:_meta_known_keys
+# whitelist'ine ISOLATED_FPM eklenmesi gerekir, o dosya bu görevin
+# kapsamı dışında).
 _domain_isolated_fpm_effective() {
     local domain="$1"
     local meta_file="${WEB_ROOT}/${domain}/.srvctl-meta"
@@ -1002,10 +1503,28 @@ _domain_activate_fpm_unit() {
         || { warn "FPM config yok: ${fpm_dir}/${sname}.conf"; return 1; }
 
     # 1. Config sözdizimi kontrolü — systemd'yi bozuk config'le uğraştırma.
+    #
+    # GÜVENLİK DENETİMİ EKİ (HOST'ta ölçüldü, srvctl-jammy): eskiden bu test
+    # '>/dev/null 2>&1' ile TÜM çıktıyı (php-fpm'in kendi ERROR satırlarını
+    # DAHİL) yutuyor, kullanıcıya yalnız "FPM config testi başarısız" diyordu.
+    # Gerçek bir kırık deploy'da (releases/ boş, public_html/current hedefi
+    # silinmiş symlink) php-fpm'in asıl hatası şuydu:
+    #   ERROR: [pool <sname>] the chdir path '/public_html' within the
+    #          chroot path '<WEB_ROOT>/<domain>' (...) does not exist or is
+    #          not a directory
+    # — bu satır doğrudan çözüme (kırık symlink) götürüyor, ama önceki
+    # kod BUNU YUTUYORDU; operatör kök nedeni yalnız php-fpm'i ELLE
+    # çalıştırarak bulabiliyordu. Artık gerçek stdout+stderr YAKALANIP
+    # (girintili) kullanıcıya gösteriliyor — _domain_load_apparmor_profile'daki
+    # 'parser_err' deseniyle AYNI.
     local fpm_bin="/usr/sbin/php-fpm${php_version}"
     if [[ -x "$fpm_bin" ]]; then
-        "$fpm_bin" --fpm-config "${fpm_dir}/${sname}.conf" -t >/dev/null 2>&1 \
-            || { warn "FPM config testi başarısız: ${fpm_dir}/${sname}.conf"; return 1; }
+        local fpm_test_err
+        if ! fpm_test_err=$("$fpm_bin" --fpm-config "${fpm_dir}/${sname}.conf" -t 2>&1); then
+            warn "FPM config testi başarısız: ${fpm_dir}/${sname}.conf"
+            [[ -n "$fpm_test_err" ]] && echo "$fpm_test_err" | sed 's/^/    /' >&2
+            return 1
+        fi
     else
         warn "php-fpm binary yok: ${fpm_bin} — config testi atlandı"
     fi
@@ -1025,6 +1544,12 @@ _domain_activate_fpm_unit() {
         warn "Unit başlatılamadı: ${unit}"
         systemctl status "$unit" --no-pager -l 2>/dev/null | tail -20 >&2 || true
         systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        # GÜVENLİK DENETİMİ EKİ: yukarıdaki 'disable --now' bu unit'i FİİLEN
+        # durdurup devre dışı bırakıyor — çağıran taraf (_domain_repair vb.)
+        # bunu yalnız "elle deneyin" diye warn edip sanki hafif bir aksaklıkmış
+        # gibi geçiştirebiliyordu. Kullanıcı burada AÇIKÇA bilsin: bu domain
+        # şu an FPM'siz kaldı.
+        warn "SONUÇ: ${unit} DURDURULDU/devre dışı bırakıldı — bu domain'in PHP-FPM'i şu an ÇALIŞMIYOR"
         return 1
     fi
 
@@ -1033,6 +1558,7 @@ _domain_activate_fpm_unit() {
         warn "Unit aktif değil: ${unit}"
         systemctl status "$unit" --no-pager -l 2>/dev/null | tail -20 >&2 || true
         systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        warn "SONUÇ: ${unit} DURDURULDU/devre dışı bırakıldı — bu domain'in PHP-FPM'i şu an ÇALIŞMIYOR"
         return 1
     fi
 
@@ -1341,6 +1867,70 @@ _domain_redis_scripting_mode() {
     fi
 }
 
+# '--redis-queue' (ya da 'domain repair'de eşdeğeri — bkz. aşağıdaki NOT)
+# bayrağının nihai ACL/meta KARARINI üreten SAF fonksiyon. İKİ AYRI SORUYU
+# BİLİNÇLİ OLARAK AYRI TUTAR (birinin gerekçesi TEKNİK, diğerininki POLİTİKA
+# — birbirine KARIŞTIRILMAZ):
+#   1) YETENEK (teknik): bu Redis sürümü scripting'i GÜVENLE sunabilir mi?
+#      → _domain_redis_scripting_mode(major) yanıtlar. BU FONKSİYON O
+#        FONKSİYONUN DAVRANIŞINI DEĞİŞTİRMEZ/TEKRAR HESAPLAMAZ — onun
+#        ürettiği 'base_flag'/'base_status' (enabled|disabled|unknown) İKİ
+#        GİRDİDEN biri olarak AYNEN alınır.
+#   2) TALEP (politika): operatör bunu AÇIKÇA istedi mi (--redis-queue)?
+#      → 'requested' parametresiyle temsil edilir.
+# NİHAİ KARAR = YETENEK **VE** TALEP — ikisi de 'evet' olmadıkça scripting
+# KAPALI kalır. KRİTİK: Redis sürümü scripting'i GÜVENLE destekse BİLE
+# (major>=7, base_status=enabled), TALEP yoksa (requested != true) sonuç
+# YİNE disabled'dır — sürüm YÜKSELTMESİ (ör. Ubuntu 22.04'te Redis'in resmi
+# depodan 7.x'e taşınması) HİÇBİR domain'i, operatörün bilinçli bir
+# '--redis-queue' talebi OLMADAN, sessizce 'enabled'a ÇEVİREMEZ. Kullanıcı
+# "framework=laravel gibi dolaylı bir ipuncundan otomatik açma" seçeneğini
+# AÇIKÇA reddetti; sürüm-tabanlı otomatik açma da AYNI sınıfa girer
+# (operatörün bilinçli tercihi olmadan güvenlik yüzeyinin genişlemesi).
+#
+# GÜVENLİK GEREKÇESİ (TALEP olsa BİLE Redis <7'de scripting'i ZORLA AÇAMAZ):
+# '+@scripting'in ACL anahtar-deseni (~<sname>:*) kısıtlamasını Lua script
+# İÇİNDE de garanti altına alması Redis 7'DEN ÖNCE garanti değildir (bkz.
+# yukarıdaki _domain_redis_scripting_mode notu). Bu garantisiz durumda
+# scripting'i zorla açmak, komşu bir domainin Redis anahtar alanına EVAL ile
+# erişilebilmesi — yani kiracı İZOLASYONUNUN KIRILMASI — anlamına gelir; bu
+# yüzden TALEP tek başına YETERSİZDİR, YETENEK de ZORUNLUDUR.
+#
+# NOT ('domain repair' için 'requested' KAYNAĞI): repair bir CLI bayrağı
+# ALMAZ (idempotent bir bakım komutudur) — bunun yerine domainin '.srvctl-
+# meta'sındaki (BU çalıştırmadan ÖNCEKİ) REDIS_SCRIPTING değeri "operatör
+# daha önce AÇIKÇA istedi mi" sinyali olarak kullanılır: önceden 'enabled'
+# ise kalıcı bir istek gibi ele alınır (bkz. _domain_repair çağrı sitesi).
+#
+# Girdi: base_flag/base_status (_domain_redis_scripting_mode çıktısı),
+#        requested ("true" ise açık talep VAR demektir)
+# Çıktı: "<nihai_acl_bayrağı> <nihai_durum_kodu> <sebep_kodu>"
+#   nihai_durum_kodu: enabled|disabled|unknown (meta'ya YAZILACAK gerçek değer)
+#   sebep_kodu (yalnız MESAJLAŞMA için, karara DAHİL DEĞİL):
+#     default          : talep yok — sonuç HER ZAMAN disabled/unknown'dır
+#                        (yetenek 'enabled' olsa BİLE talep yoksa düşürülür).
+#     requested        : talep VAR ve yetenek de VAR → onaylandı, açıldı.
+#     rejected_version : talep VAR ama yetenek YOK (Redis <7/tespit
+#                        edilemedi) → reddedildi, fail-closed korunur.
+_domain_redis_queue_gate() {
+    local base_flag="$1" base_status="$2" requested="${3:-false}"
+    if [[ "$requested" != "true" ]]; then
+        if [[ "$base_status" == "enabled" ]]; then
+            # KRİTİK: yetenek VAR (Redis 7+) ama talep YOK — otomatik AÇILMAZ.
+            echo "-@scripting disabled default"
+        else
+            # Zaten kısıtlıydı (disabled/unknown) — davranış DEĞİŞMEDİ.
+            echo "${base_flag} ${base_status} default"
+        fi
+        return 0
+    fi
+    if [[ "$base_status" == "enabled" ]]; then
+        echo "${base_flag} enabled requested"
+    else
+        echo "${base_flag} ${base_status} rejected_version"
+    fi
+}
+
 # NOT (kapsam genişletmesi): 'Redis kanal (pub/sub) izolasyonu ACL kararı'
 # saf fonksiyonu da ('_domain_redis_channel_isolation_mode' idi) artık BURADA
 # DEĞİL, lib/core.sh'ta '_redis_channel_isolation_mode(major, minor)' adıyla
@@ -1418,6 +2008,61 @@ _domain_read_redis_channel_status() {
     esac
 }
 
+# ─── Paylaşılan php-fpm'e dayanıklı reload/restart (GÜVENLİK DENETİMİ EKİ) ───
+# HOST bulgusu: bu adım eskiden ÇIPLAK 'systemctl restart' çağrısıydı —
+# hatası BASTIRILMAMIŞTI, 'set -e' altında TÜM 'domain add'i düşürüyordu
+# (rollback tetiklenip kısmi kaynaklar düzgün temizleniyordu, ama ekleme
+# HİÇ TAMAMLANAMIYORDU — geri alma mekanizması sağlıklı olsa bile, "hiç
+# eklenemeyen domain" 100-domain hedefine giden yolda kabul edilemez).
+#
+# ÖLÇÜM — paylaşılan servise dokunmak DOMAIN_ISOLATED_FPM=true (varsayılan)
+# durumunda bile GEREKSİZ DEĞİLDİR: lib/security.sh:_harden_fpm_apply'ın
+# kendi başlık yorumu tam tersini varsayıyor ("Geri dönüş: 'domain add'
+# paylaşılan havuza yeni bir pool yazdığında 'systemctl reload || systemctl
+# restart' zincirini kullanır; restart durmuş/disable servisi yeniden
+# ayağa kaldırır"). Yani: bir önceki migrasyon paylaşılan servisi BİLEREK
+# durdurup devre dışı bırakmış olabilir (havuzsuz kalınca — bkz.
+# _harden_fpm_apply); bu domain'in BİRAZDAN yazdığı geçici pool'un
+# GERÇEKTEN yüklenmesi (yalnız diskte durması değil) için servisin şu an
+# ÇALIŞIYOR olması gerekir — hem izole migrasyon başarısız olursa fallback
+# olarak (bkz. _domain_migrate_to_isolated_fpm), hem de
+# DOMAIN_ISOLATED_FPM=false ise KALICI üretim mekanizması olarak. Bu
+# yüzden adım TAMAMEN ATLANMIYOR — üç somut sorunu çözecek şekilde
+# DAYANIKLI hale getirildi:
+#   1) Servis 'failed'/rate-limited durumdaysa çıplak 'restart' da
+#      başarısız olurdu ("start request repeated too quickly") —
+#      'reset-failed' şimdi restart'tan ÖNCE deneniyor.
+#   2) Servis 'inactive' ise 'reload'un "Unit cannot be reloaded because it
+#      is inactive" hatası NORMAL bir durumdur, hata değil — zaten
+#      '|| restart' zincirine düşülüyor, ekstra dallanma gerekmiyor.
+#   3) BAŞARISIZLIK ARTIK 'domain add'i ÖLDÜRMÜYOR: bu adım yalnız bir
+#      ARA/bootstrap adımdır (fonksiyon SONUNDA çağrılan
+#      _domain_migrate_to_isolated_fpm — trap temizlendikten SONRA, yani
+#      domain add'in genel başarısını ASLA etkilemez — bu domain'i
+#      birazdan izole unit'e taşıyacaktır).
+#
+# Kendi fonksiyonuna ÇIKARILDI (test edilebilirlik — _domain_activate_fpm_unit
+# ile AYNI desen): çağıran taraf ('if ... ; then success ... ; fi') bir
+# bare/unguarded çağrı DEĞİL, bu yüzden 'set -e' altında başarısızlık
+# fonksiyonu/'domain add'i DÜŞÜRMEZ (bkz. CLAUDE.md/proje kuralı — koşul
+# bağlamı 'set -e'den muaftır).
+# PREDİKAT: 0=servis reload/restart ile ayakta (ya da zaten öyleydi), 1=değil
+# (başarısızlıkta kendi içinde warn+log_action yapar; ÇAĞIRAN bunu ASLA
+# fatal saymaz — yalnız _domain_add'in bu adımı, bkz. çağrı yeri).
+_domain_add_bootstrap_shared_fpm() {
+    local php_version="$1" domain="$2"
+    if systemctl reload "php${php_version}-fpm" 2>/dev/null; then
+        return 0
+    fi
+    systemctl reset-failed "php${php_version}-fpm" 2>/dev/null || true
+    if systemctl restart "php${php_version}-fpm" 2>/dev/null; then
+        return 0
+    fi
+    warn "Paylaşılan php${php_version}-fpm yeniden başlatılamadı (${domain}) — bu yalnız GEÇİCİ bir bootstrap adımıdır: domain birazdan izole FPM unit'ine taşınacak (DOMAIN_ISOLATED_FPM=${DOMAIN_ISOLATED_FPM}, bkz. _domain_migrate_to_isolated_fpm). İzolasyon da başarısız olursa domain paylaşılan pool'da ÇALIŞMAZ kalabilir — 'systemctl status php${php_version}-fpm' ile inceleyip 'srvctl domain repair ${domain}' ile tekrar deneyin."
+    log_action "domain add: paylaşılan php${php_version}-fpm reload/restart başarısız (${domain}) — izole FPM migrasyonuna güveniliyor"
+    return 1
+}
+
 # ═══════════════════════════════════════════════
 #  DOMAIN ADD — 10 adımda tam güvenlikli domain
 # ═══════════════════════════════════════════════
@@ -1447,6 +2092,17 @@ _domain_add() {
     # deseninin CLI kapısı (rate_profile ile AYNI YUMUŞAK desen: tanınmayan
     # değer sessizce 'standard'a düşer + warn, hard error DEĞİL).
     local resource_profile="standard"
+    # KULLANICI KARARI: Redis EVAL/Lua (scripting) — Laravel Redis kuyruk
+    # sürücüsü/Horizon'un ihtiyaç duyduğu özellik — VARSAYILAN OLARAK KAPALI
+    # kalır ve bu HER ZAMAN GEÇERLİDİR: Redis sürümü bunu güvenle destekliyor
+    # olsa BİLE (>=7), '--redis-queue' verilmedikçe scripting AÇILMAZ (bkz.
+    # _domain_redis_queue_gate — yetenek VE talep birlikte gerekir; sürüm
+    # yükseltmesi TEK BAŞINA hiçbir domain'i sessizce açamaz). '--redis-queue'
+    # bunu AÇIKÇA istemenin TEK yoludur; framework=laravel gibi dolaylı bir
+    # ipucundan OTOMATİK türetilmez (operatör bilinçli bir güvenlik ödünü
+    # vermeli). Nihai karar (ACL flag'i/meta) Redis sürüm YETENEĞİYLE
+    # BİRLEŞTİRİLİR, bkz. _domain_redis_queue_gate.
+    local redis_queue_requested=false
 
     # Argümanları parse et
     for arg in "$@"; do
@@ -1457,12 +2113,13 @@ _domain_add() {
             --framework=*) framework="${arg#--framework=}"; framework_declared="$framework" ;;
             --resources=*) resource_profile="${arg#--resources=}" ;;
             --no-ssl)      do_ssl=false ;;
+            --redis-queue) redis_queue_requested=true ;;
             -*) warn "Bilinmeyen seçenek: ${arg}" ;;
             *) domain="$arg" ;;
         esac
     done
 
-    [[ -z "$domain" ]] && error "Domain belirtilmedi. Kullanım: srvctl domain add example.com [--php=8.3] [--rate=standard] [--framework=ci4|laravel|symfony] [--resources=micro|standard|ecommerce|heavy]"
+    [[ -z "$domain" ]] && error "Domain belirtilmedi. Kullanım: srvctl domain add example.com [--php=8.3] [--rate=standard] [--framework=ci4|laravel|symfony] [--resources=micro|standard|ecommerce|heavy] [--redis-queue]"
     _domain_add_validate_gate "$domain" || error "Geçersiz domain adı: ${domain}"
     domain_exists "$domain" && error "Domain zaten mevcut: ${domain}"
     php_version_exists "$php_version" || error "PHP ${php_version} kurulu değil. Önce kurun."
@@ -1680,6 +2337,20 @@ _domain_add() {
     # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
     # '$framework' burada zaten CLI'dan (--framework=) çözülmüş durumda
     # (write_meta ile .srvctl-meta'ya yazılması AŞAĞIDA gerçekleşir).
+
+    # GÜVENLİK DENETİMİ EKİ (ikinci dereceden hasar — bkz.
+    # _domain_fpm_purge_ghost_pools başlık yorumu): render'dan ÖNCE aynı php
+    # sürümünün pool.d'sindeki hayalet kalıntılar temizlenir. HOST'ta
+    # ölçüldü: önceki (hayalet-tespitinden ÖNCEKİ) bir 'repair --all'ın
+    # bıraktığı 'user = web_html' (var olmayan kullanıcı) içeren bir
+    # 'pool.d/html.conf' TEK BAŞINA paylaşılan php-fpm servisinin hiç
+    # başlamamasına yol açıyordu — bu da aşağıdaki reload/restart'ı
+    # (dolayısıyla TÜM 'domain add'i) bloke ediyordu. Kaynağı kapatan
+    # hayalet-tespiti (bkz. _domain_repair_is_ghost) YENİ kalıntı üretilmesini
+    # önlüyor ama ZATEN var olan kalıntıyı temizlemiyordu; bu çağrı BİR
+    # SONRAKİ domain add'in aynı tuzağa düşmesini engeller.
+    _domain_fpm_purge_ghost_pools "$php_version"
+
     render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
         "SAFE_NAME=${sname}" \
         "DOMAIN=${domain}" \
@@ -1694,9 +2365,14 @@ _domain_add() {
         "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$framework_declared")" \
         > "/etc/php/${php_version}/fpm/pool.d/${sname}.conf"
 
-    systemctl reload "php${php_version}-fpm" 2>/dev/null || \
-        systemctl restart "php${php_version}-fpm"
-    success "PHP-FPM pool aktif (chroot: ${base})"
+    # GÜVENLİK DENETİMİ EKİ: dayanıklı reload/restart — kendi fonksiyonuna
+    # ÇIKARILDI (test edilebilirlik + _domain_activate_fpm_unit ile AYNI
+    # desen), bkz. _domain_add_bootstrap_shared_fpm başlık yorumu. Bu 'if'
+    # çağrısı BİLİNÇLİ: bare/unguarded bir çağrı 'set -e' altında
+    # başarısızlıkta TÜM 'domain add'i düşürürdü.
+    if _domain_add_bootstrap_shared_fpm "$php_version" "$domain"; then
+        success "PHP-FPM pool aktif (chroot: ${base})"
+    fi
 
     # ─── 5. Nginx Vhost ───
     current=$((current + 1))
@@ -1839,10 +2515,13 @@ SQL
     #    dosyası "Syntax error" ile REDDEDİLİR ve Redis HİÇ BAŞLAMAZ (Ubuntu
     #    22.04 = redis-server 6.0.16'da gerçek VM'de gözlemlendi). Redis <6.2
     #    ya da sürüm belirlenemezse token'lar ATLANIR + operatör UYARILIR.
-    # 2) scripting: SÜRÜM KOŞULLU (bkz. _domain_redis_scripting_mode üstündeki
-    #    ayrıntılı gerekçe) — Redis 7+'ta '+@scripting' (script içi ACL
-    #    enforcement garantili, Laravel queue/Horizon çalışır), <7'de veya
-    #    sürüm belirlenemezse '-@scripting' (fail-closed, izolasyon önceliklidir).
+    # 2) scripting: İKİ AŞAMALI — (a) YETENEK: SÜRÜM KOŞULLU (bkz.
+    #    _domain_redis_scripting_mode üstündeki ayrıntılı gerekçe) — Redis
+    #    7+'ta script içi ACL enforcement garantili, <7'de veya sürüm
+    #    belirlenemezse GARANTİSİZ. (b) TALEP: operatör '--redis-queue' ile
+    #    AÇIKÇA istedi mi (bkz. _domain_redis_queue_gate). NİHAİ '+@scripting'
+    #    yalnız İKİSİ DE 'evet' ise yazılır — sürüm 7+ olsa BİLE talep yoksa
+    #    '-@scripting' kalır (izolasyon önceliklidir, otomatik açılma YOK).
     # 3) '-SCAN -RANDOMKEY': ACL key pattern'i SCAN/RANDOMKEY sonuçlarını
     #    filtrelemez (yalnız sonrasında yapılan GET gibi komutlar NOPERM ile
     #    engellenir) → komşu domainlerin key adları numaralandırılabilirdi.
@@ -1851,10 +2530,18 @@ SQL
     #    metrik/monitoring ekranını kırardı. INFO yalnız sunucu-geneli agregat
     #    istatistik döndürür (başka domainin key adı/değerini sızdırmaz), bu
     #    yüzden geri açıldı — Horizon dashboard'u çalışmaya devam eder.
-    local redis_major="" redis_minor="" scripting_flag scripting_status channel_status
+    local redis_major="" redis_minor="" base_scripting_flag base_scripting_status channel_status
     read -r redis_major redis_minor <<< "$(_redis_version_pair)"
-    read -r scripting_flag scripting_status <<< "$(_domain_redis_scripting_mode "$redis_major")"
+    read -r base_scripting_flag base_scripting_status <<< "$(_domain_redis_scripting_mode "$redis_major")"
     channel_status=$(_redis_channel_isolation_mode "$redis_major" "$redis_minor")
+
+    # Nihai karar: YETENEK (base_scripting_status, sürüm) VE TALEP
+    # (redis_queue_requested, '--redis-queue') BİRLEŞTİRİLİR — bkz.
+    # _domain_redis_queue_gate üstündeki gerekçe. redis_queue_reason
+    # yalnız MESAJLAŞMA için (karara dahil değil).
+    local scripting_flag scripting_status redis_queue_reason
+    read -r scripting_flag scripting_status redis_queue_reason <<< \
+        "$(_domain_redis_queue_gate "$base_scripting_flag" "$base_scripting_status" "$redis_queue_requested")"
 
     local acl_line
     acl_line=$(_domain_build_redis_acl_line "$redis_user" "$redis_pass" "$sname" "$scripting_flag" "$channel_status")
@@ -1864,28 +2551,60 @@ SQL
     local redis_admin_pass
     redis_admin_pass=$(grep "^REDIS_ADMIN_PASS=" "${SRVCTL_CONF}" 2>/dev/null | cut -d= -f2)
     if [[ -n "$redis_admin_pass" ]]; then
-        # Parolayı argv'den uzak tut: REDISCLI_AUTH env redis-cli tarafından okunur (ps'te görünmez).
-        REDISCLI_AUTH="$redis_admin_pass" redis-cli --user admin --no-auth-warning ACL LOAD 2>/dev/null || \
-            systemctl restart redis-server
+        # GÜVENLİK DENETİMİ EKİ (BUG 3 — _domain_repair'daki AYNI düzeltme,
+        # bkz. o çağrı sitesindeki tam gerekçe): 'redis-cli' sunucudan
+        # HERHANGİ bir yanıt aldığı sürece — hata metni olsa bile —
+        # genellikle 0 ile çıkar; çıplak '|| systemctl restart' zinciri ACL
+        # LOAD'ın CANLI kural kümesine GERÇEKTEN uygulanıp uygulanmadığını
+        # HİÇ ÖLÇMÜYORDU. 'domain add' burada 'repair' gibi bir
+        # 'add_failed'/dürüst-exit-kodu mekanizmasına sahip DEĞİL (bu
+        # görevin kapsamı bu iş için yeni bir mekanizma icat etmek değil) —
+        # ama SESSİZCE geçilmiyor: dönüş değeri kontrol edilir, başarısızlık
+        # AÇIKÇA warn+log_action edilir (domain'in geri kalanı —DB, vhost,
+        # dosyalar— yine de başarıyla oluşturulduğundan tüm eklemeyi
+        # ÖLDÜRMEZ, ama operatör Redis izolasyonunun eksik olduğunu BİLİR).
+        # 'restart redis-server' fallback'i BİLEREK KALDIRILDI — ACL dosyası
+        # sözdizimi hatası içeriyorsa restart TÜM domainlerin Redis'ini
+        # çökertebilir (bkz. _domain_repair'daki AYNI gerekçe).
+        if ! _redis_acl_load "$redis_admin_pass"; then
+            warn "GÜVENLİK: Redis ACL bu domain için CANLI kural kümesine UYGULANMADI (${domain}) — anahtar alanı VE kanal izolasyonu kontrolleri YÜRÜRLÜKTE DEĞİL. Redis'in kendi hata metni yukarıda. 'systemctl restart redis-server' BİLEREK DENENMEDİ (ACL dosyası bozuksa restart TÜM domainlerin Redis'ini çökertebilir) — /etc/redis/users.acl'i elle inceleyip 'srvctl domain repair ${domain}' ile tekrar deneyin."
+            log_action "domain add: Redis ACL LOAD başarısız (${domain}) — kanal izolasyonu YÜRÜRLÜKTE DEĞİL"
+        fi
     else
         systemctl restart redis-server
     fi
 
     # Scripting durumunu meta'ya yaz (web-yazılabilir ama SIR değil — 'srvctl
-    # domain info' bunu okuyup operatöre gösterir) ve kısıtlıysa/belirsizse
-    # operatörü hemen uyar (Horizon/queue neden çalışmadığını anlasın).
+    # domain info' bunu okuyup operatöre gösterir) — bu, NİHAİ (yetenek+talep
+    # birleştirilmiş) değerdir, yalnız sürüm yeteneği DEĞİL.
     write_meta "$domain" "REDIS_SCRIPTING" "$scripting_status"
+
     case "$scripting_status" in
         enabled)
             success "Redis ACL: ${redis_user} → ${sname}:* (Redis ${redis_major}: scripting AÇIK)"
+            if [[ "$redis_queue_reason" == "requested" ]]; then
+                warn "--redis-queue: bu domain için Redis EVAL/Lua script çalıştırma AÇILDI (Laravel Redis kuyruk sürücüsü/Horizon bunu kullanır). Bu, varsayılan olarak KAPALI tutulan bir yetenektir; ACL yine de bu domaini kendi anahtar alanıyla (${sname}:*) sınırlar."
+            fi
             ;;
         disabled)
             success "Redis ACL: ${redis_user} → ${sname}:*"
-            warn "Redis ${redis_major} tespit edildi — scripting (EVAL/Lua) bu domainde KAPALI. Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAZ; QUEUE_CONNECTION=database kullanın."
+            if [[ "$redis_queue_reason" == "rejected_version" ]]; then
+                warn "--redis-queue istendi ama REDDEDİLDİ: Redis ${redis_major}, script içindeki anahtar erişiminin ACL ile sınırlandığını garanti etmiyor (7.0 altı) — açılırsa komşu domainlerin anahtar alanına EVAL ile erişilebilir. Bu riski göze alamayız; Redis'i 7+'a yükseltin (bayrak olmadan yine AÇILMAZ, '--redis-queue' gerekir) ya da QUEUE_CONNECTION=database kullanın."
+            elif [[ "$base_scripting_status" == "enabled" ]]; then
+                # KRİTİK: Redis EVAL/Lua'yı GÜVENLE destekliyor (7+) ama
+                # operatör AÇIKÇA istemedi — artık burada OTOMATİK
+                # AÇILMIYOR (bilinçli tasarım kararı, bkz. _domain_redis_queue_gate).
+                warn "Redis ${redis_major} EVAL/Lua scripting'i güvenle destekliyor ama bu domainde VARSAYILAN OLARAK KAPALI bırakıldı — Laravel Redis kuyruk sürücüsü/Horizon için 'srvctl domain add ... --redis-queue' ile AÇIKÇA isteyin, ya da QUEUE_CONNECTION=database kullanın."
+            else
+                warn "Redis ${redis_major} tespit edildi — scripting (EVAL/Lua) bu domainde KAPALI. Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAZ; QUEUE_CONNECTION=database kullanın."
+            fi
             ;;
         *)
             success "Redis ACL: ${redis_user} → ${sname}:*"
             warn "Redis sürümü tespit edilemedi — fail-closed: scripting (EVAL/Lua) KAPALI. Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAZ; QUEUE_CONNECTION=database kullanın."
+            if [[ "$redis_queue_reason" == "rejected_version" ]]; then
+                warn "--redis-queue istendi ama REDDEDİLDİ: Redis sürümü tespit edilemediğinden fail-closed kural gereği scripting açılmadı."
+            fi
             ;;
     esac
 
@@ -2276,17 +2995,21 @@ _domain_info() {
         echo -e "  ${CYAN}Redis${NC}"
         echo "  Redis User:     ${REDIS_USER:-redis_${sname}}"
         echo "  Redis Prefix:   ${REDIS_PREFIX:-${sname}:}"
-        # Scripting (EVAL/Lua) durumu sürüm-koşullu kararla belirlenir (bkz.
-        # _domain_redis_scripting_mode) — operatör Horizon/Redis queue neden
-        # çalışmadığını (ya da çalıştığını) buradan anlayabilir.
+        # Scripting (EVAL/Lua) durumu YETENEK (sürüm) VE TALEP (--redis-queue)
+        # birleşimiyle belirlenir (bkz. _domain_redis_queue_gate) — operatör
+        # Horizon/Redis queue neden çalışmadığını (ya da çalıştığını)
+        # buradan anlayabilir. 'kapalı' Redis <7'DEN OLABİLECEĞİ GİBİ (yetenek
+        # yok) Redis 7+ olup '--redis-queue' hiç İSTENMEMİŞ olmasından da
+        # (talep yok) kaynaklanabilir — meta bu ikisini AYIRT ETMEZ (yalnız
+        # nihai durumu tutar), bu yüzden mesaj HER İKİ olasılığı da kapsar.
         local scripting_status
         scripting_status=$(_domain_read_redis_scripting_status "$domain")
         case "$scripting_status" in
             enabled)
-                echo -e "  Redis Scripting: ${GREEN}✅ açık${NC} (Redis 7+ — EVAL/Lua ACL kısıtına tabi, Laravel queue/Horizon çalışır)"
+                echo -e "  Redis Scripting: ${GREEN}✅ açık${NC} (Redis 7+ VE '--redis-queue' ile AÇIKÇA istendi — EVAL/Lua ACL kısıtına tabi, Laravel queue/Horizon çalışır)"
                 ;;
             disabled)
-                echo -e "  Redis Scripting: ${YELLOW}⚠️  kapalı${NC} (Redis <7 — Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAZ; QUEUE_CONNECTION=database kullanın)"
+                echo -e "  Redis Scripting: ${YELLOW}⚠️  kapalı${NC} (Laravel Redis kuyruk sürücüsü/Horizon ÇALIŞMAZ — Redis <7 ise hiçbir zaman açılamaz; Redis 7+ ise 'srvctl domain add ... --redis-queue' ile açıkça istenmeliydi; QUEUE_CONNECTION=database kullanın)"
                 ;;
             *)
                 echo -e "  Redis Scripting: ${YELLOW}⚠️  bilinmiyor${NC} (henüz belirlenmedi — 'srvctl domain repair ${domain}' çalıştırın)"

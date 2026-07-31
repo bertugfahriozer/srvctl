@@ -71,9 +71,14 @@ _ask() {
 # 25.04) FAIL-CLOSED değil UYARI-TABANLI ele alınır — kullanıcı 'evet' derse
 # devam eder (kilitlenmez, sadece bilgilendirilir). Ubuntu olmayan dağıtımlarda
 # mevcut davranış (uyarı + onay) korunur.
-if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    source /etc/os-release
+# Test-seam (bkz. CLAUDE.md "Test-seams for macOS dev"): gerçek çalışmada
+# SRVCTL_OS_RELEASE_FILE hiç set edilmez, davranış değişmez — yalnızca
+# tests/test_install_os_gate.sh macOS'ta /etc/os-release olmadan (ya da
+# gerçek dosyayı bozmadan) bu case bloğunu sahte bir dosyayla test edebilsin
+# diye var.
+if [[ -f "${SRVCTL_OS_RELEASE_FILE:-/etc/os-release}" ]]; then
+    # shellcheck disable=SC1090,SC1091
+    source "${SRVCTL_OS_RELEASE_FILE:-/etc/os-release}"
     if [[ "${ID:-}" != "ubuntu" ]]; then
         echo -e "${YELLOW}⚠${NC}  Bu script Ubuntu için tasarlanmıştır. (Tespit: ${ID:-bilinmiyor})"
         _ask "Devam etmek istiyor musunuz?" "hayir" || exit 0
