@@ -2925,6 +2925,18 @@ _domain_row() {
 # ═══════════════════════════════════════════════
 #  DOMAIN LIST
 # ═══════════════════════════════════════════════
+# GÜVENLİK DENETİMİ EKİ (HOST'ta ölçüldü, srvctl-jammy): bu fonksiyon
+# ESKİDEN '${WEB_ROOT}/*/' üzerinde HAM bir glob ile numaralandırıyordu —
+# 'security audit' (lib/security.sh) ve 'domain repair --all' zaten
+# kullandığı 'list_all_domains()' (lib/core.sh) sözleşmesini ATLIYORDU. Bu
+# tutarsızlık nginx paketinin kendi kurduğu '/var/www/html' dizinini
+# TAMAMEN HAYALİ bir domain gibi gösteriyordu: 'web_html' diye bir sistem
+# kullanıcısı YOKKEN çıktıda "KULLANICI: web_html" satırı basılıyordu ve
+# 'Toplam: N domain' sayacı bunu içeriyordu — aynı sunucuda AYNI ANDA
+# 'security audit' bu dizini HİÇ görmüyordu (iki komut aynı soruya farklı
+# cevap veriyordu). Artık TEK sözleşme: 'list_all_domains()' (kapı:
+# validate_domain + '.credentials' varlığı) — üç tüketici (list/audit/
+# repair --all) AYNI kümeyi görür.
 _domain_list() {
     echo ""
     echo -e "  ${BOLD}Kayıtlı Domain'ler${NC}"
@@ -2933,17 +2945,45 @@ _domain_list() {
     divider
 
     local count=0
-    for dir in "${WEB_ROOT}"/*/; do
-        [[ ! -d "$dir" ]] && continue
-        local row domain php_ver user ssl chroot
+    local domain dir row php_ver user ssl chroot
+    while IFS= read -r domain; do
+        [[ -n "$domain" ]] || continue
+        dir="${WEB_ROOT}/${domain}/"
         row=$(_domain_row "$dir")
         IFS='|' read -r domain php_ver user ssl chroot <<< "$row"
         printf "  %-30s %-8s %-15s %-6s %-8s\n" "$domain" "$php_ver" "$user" "$ssl" "$chroot"
         count=$((count + 1))
-    done
+    done < <(list_all_domains)
 
     divider
     echo "  Toplam: ${count} domain"
+
+    # KARAR (görev talebi — WEB_ROOT altında domain OLMAYAN dizinler ne
+    # olacak): SESSİZCE gizlemiyoruz AMA tabloya da HİÇBİR ZAMAN satır
+    # olarak eklemiyoruz. Gerekçe: bu tür bir dizin için PHP/KULLANICI/SSL/
+    # CHROOT üretmenin bir anlamı yok — '.credentials' yoksa bu değerler
+    # tamamen UYDURULMUŞ olur (tam olarak bu görevin bulgusu — 'web_html'
+    # diye bir kullanıcı YOKKEN öyle gösterilmesi) ve otomasyon 'domain
+    # list' çıktısını ayrıştırıyorsa var olmayan bir domain üzerinde işlem
+    # yapmaya kalkışabilir. Ama TAMAMEN sessiz kalmak da yanlış: operatör
+    # '/var/www' altında gördüğü bir dizinin neden listede YOK olduğunu
+    # merak eder (bu görevin bizzat kendisi böyle bir gözlemle başladı).
+    # Orta yol: yönetilmeyen dizin SAYISI ayrı, açıkça etiketlenmiş bir
+    # DİPNOT olarak gösterilir — ana tabloya KARIŞTIRILMAZ, sayaca DAHİL
+    # EDİLMEZ. Sayım 'list_all_domains()'in iki-kapılı testini (validate_
+    # domain + .credentials) TEKRAR YAZMADAN, WEB_ROOT altındaki TOPLAM
+    # dizin sayısından yönetilen domain sayısını (yukarıdaki 'count')
+    # ÇIKARARAK yapılır — böylece tek doğruluk kaynağı yine 'list_all_
+    # domains()' kalır, burada yalnız bir fark alınır.
+    local total_dirs=0 d
+    for d in "${WEB_ROOT}"/*/; do
+        [[ -d "$d" ]] || continue
+        total_dirs=$((total_dirs + 1))
+    done
+    local unmanaged=$((total_dirs - count))
+    if [[ "$unmanaged" -gt 0 ]]; then
+        echo "  (${unmanaged} dizin listelenmedi: srvctl tarafından yönetilmiyor — ör. nginx'in varsayılan '/var/www/html' dizini. Ayrıntı için: ls ${WEB_ROOT})"
+    fi
     echo ""
 }
 
