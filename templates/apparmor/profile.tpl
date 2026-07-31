@@ -66,36 +66,71 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   # private dizin (CI4 uygulama kodu — okuma)
   {{WEB_ROOT}}/{{DOMAIN}}/private/** r,
 
+  # ─── Dosya kilidi ('k') — flock()/LOCK_EX (kanıt: gerçek Ubuntu 22.04 VM) ───
+  # Aşağıdaki TÜM domain-içi yazma kuralları 'rw,' DEĞİL 'rwk,' kullanır.
+  # DÜZELTME (aynı Laravel HTTP 500 zincirinin İKİNCİ halkası — bkz.
+  # shared/bootstrap-cache düzeltmesiyle AYNI VM oturumu): 'rw' TEK BAŞINA
+  # dosya İÇERİĞİ okuma/yazmayı açar ama AppArmor'da dosya KİLİTLEME
+  # (flock(2)/fcntl(F_SETLK)) AYRI bir izin harfidir ('k'). 'rw' verilmiş
+  # bir dosyada bile LOCK_EX reddedilir; PHP'de bu genelde "Exclusive locks
+  # are not supported for this stream" hatası olarak görünür
+  # (Illuminate\Filesystem\Filesystem::put($path,$contents,$lock=true) →
+  # file_put_contents(..., LOCK_EX)). Blade view derleme, dosya tabanlı
+  # cache/session sürücüleri (Laravel), writable/cache yazımı (CI4), cache
+  # warmup (Symfony) hep bu yolu kullanır — 'k' eksikse HTTP 500 ya da
+  # (daha sinsi) kilitsiz eşzamanlı yazma yarışı (sessiz veri bozulması)
+  # olur. Doğrulama: VM'de domain-içi kurallar 'rwk,' yapılınca aynı istek
+  # HTTP 200 döndü, uygulama log'u boş kaldı, view cache dosyaları oluştu.
+  #
+  # GÜVENLİK: 'k' YALNIZCA zaten 'rw' verilmiş bir yolda kilit ALMAYA izin
+  # verir; YENİ bir yola erişim AÇMAZ, domain sınırını GENİŞLETMEZ — kapsam
+  # her satırın kendi yol deseniyle (glob) AYNEN sınırlı kalır.
+  # /run/srvctl, /run/php, soket ve /dev/null kuralları BİLEREK 'k' ALMADI:
+  # bunlar FPM MASTER'ın kendi kontrol dosyalarıdır (PHP uygulama kodunun
+  # flock() çağırdığı domain içeriği DEĞİL); soketlerde zaten flock(2)
+  # anlamsızdır.
+
   # writable dizinleri (okuma + yazma) — CI4
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/cache/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/logs/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/session/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/uploads/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/shared/writable/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/writable/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/cache/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/logs/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/session/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/uploads/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/writable/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/writable/** rwk,
 
   # Laravel yazma yolları (storage/framework/views, bootstrap/cache vb.)
   # render_template değer'lerinde newline yasak olduğundan framework'e göre
   # koşullu blok ENJEKTE EDİLEMEZ — bu yüzden üç framework'ün yolları da
   # statik/koşulsuz olarak dahil edilir (kullanılmayan yol = boş/no-op,
   # ek saldırı yüzeyi doğurmaz). Bkz. rapor: "Render escaping" notu.
-  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/storage/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/bootstrap/cache/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/shared/storage/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/storage/** rwk,
+  # NOT (kanıt: gerçek Ubuntu 22.04 VM, HTTP 500 + tempnam() hatası): 'srvctl
+  # deploy' HER release'de bootstrap/cache'i shared/bootstrap-cache'e
+  # symlink'ler (bkz. lib/deploy.sh:_deploy_link_shared, shared_pairs).
+  # AppArmor symlink'i ÇÖZER ve GERÇEK (shared) yolu denetler — bu yüzden
+  # aşağıdaki 'releases/**/bootstrap/cache/**' kuralı srvctl deploy ile
+  # yönetilen release'lerde ASLA eşleşmez (ölü kural). Yine de KORUNUYOR:
+  # operatör symlink'i kaldırıp bootstrap/cache'i GERÇEK bir dizin olarak
+  # kullanırsa (srvctl deploy dışı/manuel bir dağıtım) bu satır devreye
+  # girer; kullanılmıyorken boş/no-op olduğundan ek saldırı yüzeyi
+  # doğurmaz. Asıl çalışan kural bir alt satırdaki 'shared/bootstrap-cache/**'tir.
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/bootstrap/cache/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/storage/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/bootstrap-cache/** rwk,
 
   # Symfony yazma yolları (var/cache, var/log, var/sessions vb.)
-  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/var/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/shared/var/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/var/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/var/** rwk,
 
   # Log dizini (yazma)
-  {{WEB_ROOT}}/{{DOMAIN}}/logs/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/logs/** rwk,
 
   # Temp dizini (okuma + yazma)
-  {{WEB_ROOT}}/{{DOMAIN}}/tmp/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/tmp/** rwk,
 
   # Session dizini (okuma + yazma)
-  {{WEB_ROOT}}/{{DOMAIN}}/sessions/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/sessions/** rwk,
 
   # ─── FPM master kontrol dosyaları (chroot DIŞI, gerçek host yolları) ───
 

@@ -228,6 +228,8 @@ _domain_repair() {
     # BUG 2: disable_functions listesi framework'e göre türetilir (ci4'te
     # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
     local repair_framework; repair_framework=$(_domain_read_framework "$target")
+    # disable_functions gevşetmesi AÇIK beyan ister (bkz. _domain_framework_declared)
+    local repair_fw_declared; repair_fw_declared=$(_domain_framework_declared "$target")
     render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
         "SAFE_NAME=${sname}" \
         "DOMAIN=${target}" \
@@ -239,7 +241,7 @@ _domain_repair() {
         "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
         "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
         "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
-        "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$repair_framework")" \
+        "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$repair_fw_declared")" \
         > "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf"
 
     render_template "${SRVCTL_TEMPLATES}/apparmor/profile.tpl" \
@@ -518,6 +520,39 @@ _domain_read_framework() {
             warn "Geçersiz FRAMEWORK meta değeri (${domain}): '${FRAMEWORK}' — 'ci4' kullanılıyor"
             echo "ci4"
             ;;
+    esac
+}
+
+# Domain'in AÇIKÇA BEYAN EDİLMİŞ framework'ünü oku — _domain_read_framework'ün
+# aksine varsayılana DÜŞMEZ: beyan yoksa/geçersizse BOŞ döner.
+#
+# NEDEN AYRI BİR OKUYUCU VAR (güvenlik denetimi bulgusu): _domain_read_framework
+# "beyan yok" ile "beyan = ci4"u AYIRT ETMEZ, ikisinde de 'ci4' döndürür. Bu
+# fallback vhost/dizin yapısı için doğru (dizin şeması zaten CI4 varsayımlı),
+# ama GÜVENLİK GEVŞETMESİNİ beslerse fail-open olur: _domain_disable_functions_for
+# 'ci4' dalında 'putenv'i açtığından, '--framework' verilmeden eklenmiş HER
+# domain ve meta'sı olmayan TÜM eski domainler sessizce 'putenv' AÇIK pool
+# alırdı — oysa gevşetme yalnız gerçekten CI4 çalıştıran domainler için
+# amaçlanmıştı.
+#
+# KURAL: bir güvenlik kontrolünü gevşeten her karar AÇIK BEYAN istemeli;
+# "beyan yok / okunamadı / geçersiz" durumu HER ZAMAN sıkı tarafa düşmeli.
+# Bu yüzden disable_functions kararı _domain_read_framework'ü DEĞİL bunu
+# kullanır (bkz. tests/test_disable_functions_sync.sh — zinciri test eder).
+_domain_framework_declared() {
+    local domain="$1"
+    local meta_file="${WEB_ROOT}/${domain}/.srvctl-meta"
+    local FRAMEWORK=""
+    if [[ -f "$meta_file" ]]; then
+        if _require_owned_or_warn "$domain" "$meta_file"; then
+            read_kv_file "$meta_file" FRAMEWORK
+        else
+            error "Güvenlik: ${meta_file} root-owned değil (tamper). Okuma reddedildi."
+        fi
+    fi
+    case "${FRAMEWORK:-}" in
+        ci4|laravel|symfony) echo "$FRAMEWORK" ;;
+        *) echo "" ;;   # beyan yok / geçersiz → sıkı tarafa düş
     esac
 }
 
@@ -854,6 +889,8 @@ _domain_render_fpm_unit() {
     # .srvctl-meta henüz yazılmamışsa (ör. birim testleri) 'ci4' varsayılanına
     # düşer — _domain_read_framework'ün kendi güvenli fallback'i.
     local unit_framework; unit_framework=$(_domain_read_framework "$domain")
+    # disable_functions gevşetmesi AÇIK beyan ister (bkz. _domain_framework_declared)
+    local unit_fw_declared; unit_fw_declared=$(_domain_framework_declared "$domain")
 
     # config = [global] + pool (pool.conf.tpl TEK kaynak, kopyalanmaz)
     {
@@ -867,7 +904,7 @@ _domain_render_fpm_unit() {
             "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
             "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
             "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
-            "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$unit_framework")"
+            "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$unit_fw_declared")"
     } > "$fpm_conf"
     _domain_assert_no_leftover_tokens "$fpm_conf"
     render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-fpm.service.tpl" \
@@ -1331,6 +1368,10 @@ _domain_add() {
     # belirlenir — otomatik tespit YOK. Belirtilmezse 'ci4' (mevcut dizin
     # yapısı zaten CI4 varsayımlıydı — geriye uyumlu varsayılan).
     local framework="ci4"
+    # AÇIK BEYAN İZİ: '--framework=' GERÇEKTEN verildi mi? $framework tek
+    # başına bunu söyleyemez (varsayılanı da 'ci4'). disable_functions
+    # gevşetmesi bu ize bakar — bkz. _domain_framework_declared.
+    local framework_declared=""
     # GÖREV 2: kaynak (cgroups/FPM pool) profili — resource_profile_load
     # deseninin CLI kapısı (rate_profile ile AYNI YUMUŞAK desen: tanınmayan
     # değer sessizce 'standard'a düşer + warn, hard error DEĞİL).
@@ -1342,7 +1383,7 @@ _domain_add() {
             --php=*)       php_version="${arg#--php=}" ;;
             --rate=*)      rate_profile="${arg#--rate=}" ;;
             --sensitive=*) sensitive_paths="${arg#--sensitive=}" ;;
-            --framework=*) framework="${arg#--framework=}" ;;
+            --framework=*) framework="${arg#--framework=}"; framework_declared="$framework" ;;
             --resources=*) resource_profile="${arg#--resources=}" ;;
             --no-ssl)      do_ssl=false ;;
             -*) warn "Bilinmeyen seçenek: ${arg}" ;;
@@ -1579,7 +1620,7 @@ _domain_add() {
         "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
         "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
         "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
-        "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$framework")" \
+        "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$framework_declared")" \
         > "/etc/php/${php_version}/fpm/pool.d/${sname}.conf"
 
     systemctl reload "php${php_version}-fpm" 2>/dev/null || \
@@ -1592,7 +1633,18 @@ _domain_add() {
 
     write_meta "$domain" "RATE_PROFILE" "$rate_profile"
     write_meta "$domain" "SENSITIVE_PATHS" "$sensitive_paths"
-    write_meta "$domain" "FRAMEWORK" "$framework"
+    # FRAMEWORK meta'ya YALNIZ açık '--framework=' beyanı varsa yazılır.
+    # Beyan yokken varsayılan 'ci4'ü yazmak, 'domain add' (sıkı liste) ile
+    # sonraki 'domain repair' (meta'da 'ci4' görüp GEVŞEK liste) arasında
+    # tutarsızlık yaratırdı — repair sessizce fail-open olurdu.
+    # Beyan yoksa _domain_read_framework zaten 'ci4' fallback'i uygular
+    # (dizin/vhost şeması için doğru davranış); _domain_framework_declared ise
+    # boş döndürerek disable_functions'ı sıkı tarafta tutar.
+    # NOT: 'set -e' altında '[[ ]] && cmd' kalıbı koşul yanlışken tüm komutu
+    # başarısız sayıp script'i düşürür — bu yüzden açık 'if' kullanılıyor.
+    if [[ -n "$framework_declared" ]]; then
+        write_meta "$domain" "FRAMEWORK" "$framework"
+    fi
     # GÖREV 2: RESOURCE_PROFILE zaten resource_profile_resolve ile whitelist'ten
     # geçirildi — write_meta'ya doğrulanmamış ham CLI girdisi ASLA gitmez.
     # RAPOR: lib/security.sh:_meta_known_keys whitelist'ine RESOURCE_PROFILE

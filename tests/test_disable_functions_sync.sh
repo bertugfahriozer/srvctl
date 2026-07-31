@@ -85,4 +85,70 @@ rm -f /tmp/.df_lar.$$ /tmp/.df_ci4.$$
 assert_eq "$diff_only" "putenv" \
     "ci4 istisnası DAR: laravel'e göre tek fark 'putenv' (başka fonksiyon gevşetilmemiş)"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ZİNCİR TESTİ — asıl korunan sınıf
+#
+# NEDEN VAR: bu testin ilk sürümü YALNIZ _domain_disable_functions_for'u izole
+# çağırıyordu ('' → putenv kapalı) ve GEÇİYORDU. Ama gerçek çağrı sitesi
+# fonksiyona _domain_read_framework çıktısını veriyordu; o da beyan
+# yoksa/geçersizse 'ci4' döndürdüğü için '--framework' verilmeden eklenmiş HER
+# domain ve meta'sı olmayan TÜM eski domainler sessizce 'putenv' AÇIK pool
+# alıyordu. Yani test HALKAYI doğruluyordu, ZİNCİRİ değil — bir güvenlik
+# denetimi bunu yakaladı.
+#
+# Bu blok artık zincirin tamamını ölçer: meta içeriği → _domain_framework_declared
+# → _domain_disable_functions_for → putenv açık/kapalı.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "== zincir: meta beyanı -> disable_functions =="
+
+source "${REPO_ROOT}/lib/core.sh"
+WEB_ROOT=$(mktemp -d)
+
+# Sahiplik kapısı bu testin kapsamı DEĞİL (kendi testi var) — nötrle ki
+# framework beyan mantığını izole ölçebilelim.
+_require_owned_or_warn() { return 0; }
+
+decl_body=$(awk '/^_domain_framework_declared\(\) \{/,/^\}/' "${REPO_ROOT}/lib/domain.sh")
+assert_ok test -n "$decl_body"
+eval "$decl_body"
+
+# meta_içeriği | beklenen_declared | beklenen_putenv_durumu | açıklama
+_chain_case() {
+    local meta_content="$1" want_decl="$2" want_putenv="$3" label="$4"
+    local d="ornek.test"
+    rm -rf "${WEB_ROOT:?}/${d}"; mkdir -p "${WEB_ROOT}/${d}"
+    [[ "$meta_content" != "__YOK__" ]] && printf '%s\n' "$meta_content" > "${WEB_ROOT}/${d}/.srvctl-meta"
+
+    local got_decl; got_decl=$(_domain_framework_declared "$d" 2>/dev/null)
+    assert_eq "$got_decl" "$want_decl" "${label}: beyan='${want_decl:-<boş>}'"
+
+    local out; out=$(_domain_disable_functions_for "$got_decl")
+    local got_putenv; case ",$out," in *,putenv,*) got_putenv="KAPALI";; *) got_putenv="AÇIK";; esac
+    assert_eq "$got_putenv" "$want_putenv" "${label}: putenv ${want_putenv}"
+}
+
+_chain_case "__YOK__"              ""        "KAPALI" "meta dosyası YOK (eski domain)"
+_chain_case "RATE_PROFILE=standard" ""       "KAPALI" "meta var ama FRAMEWORK satırı yok"
+_chain_case "FRAMEWORK="            ""       "KAPALI" "FRAMEWORK boş"
+_chain_case "FRAMEWORK=bogus"       ""       "KAPALI" "FRAMEWORK geçersiz (bozuk/tamper)"
+_chain_case "FRAMEWORK=ci4"         "ci4"    "AÇIK"   "FRAMEWORK=ci4 AÇIKÇA beyan edilmiş"
+_chain_case "FRAMEWORK=laravel"     "laravel" "KAPALI" "FRAMEWORK=laravel"
+_chain_case "FRAMEWORK=symfony"     "symfony" "KAPALI" "FRAMEWORK=symfony"
+
+rm -rf "${WEB_ROOT:?}"
+
+# ─── Statik regresyon kilidi ───
+# Çağrı siteleri fail-open okuyucuyu (_domain_read_framework) disable_functions'a
+# BESLEMEMELİ. Biri ileride geri değiştirirse burada yakalanır.
+bad_calls=$(grep -nE '_domain_disable_functions_for "\$\(?_domain_read_framework' "${REPO_ROOT}/lib/domain.sh" || true)
+assert_eq "$bad_calls" "" \
+    "hiçbir çağrı sitesi _domain_read_framework çıktısını disable_functions'a beslemiyor"
+
+# Her çağrı sitesi 'declared' izini kullanmalı
+call_args=$(grep -oE '_domain_disable_functions_for "\$[a-z_]+"' "${REPO_ROOT}/lib/domain.sh" \
+    | sed 's/.*"\$//; s/"//' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+assert_eq "$call_args" "framework_declared repair_fw_declared unit_fw_declared" \
+    "üç çağrı sitesi de AÇIK beyan değişkenini kullanıyor"
+
 test_summary

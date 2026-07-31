@@ -82,26 +82,41 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   {{WEB_ROOT}}/{{DOMAIN}}/current r,
 
   {{WEB_ROOT}}/{{DOMAIN}}/private/** r,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/cache/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/logs/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/session/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/uploads/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/shared/writable/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/writable/** rw,
+
+  # ─── Dosya kilidi ('k') — flock()/LOCK_EX (bkz. profile.tpl AYNI NOT,
+  #     kanıt: gerçek Ubuntu 22.04 VM) ───
+  # queue:work/schedule:run AYNI Illuminate\Filesystem API'sini kullanır
+  # (Laravel Cache/dosya session sürücüleri, Blade derleme, Symfony cache
+  # warmup); 'k' olmadan LOCK_EX reddedilir ("Exclusive locks are not
+  # supported for this stream"). Aşağıdaki TÜM domain-içi yazma kuralları
+  # bu yüzden 'rwk,'dir — gerekçe/güvenlik analizi profile.tpl'dekiyle
+  # BİREBİR aynıdır (yeni bir yola erişim AÇMAZ, yalnız zaten 'rw' verilmiş
+  # bir yolda kilit almaya izin verir).
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/cache/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/logs/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/session/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/private/writable/uploads/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/writable/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/writable/** rwk,
 
   # Laravel (queue:work: storage/logs, cache; schedule:run: bootstrap/cache)
-  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/storage/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/bootstrap/cache/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/shared/storage/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/storage/** rwk,
+  # bootstrap/cache: 'srvctl deploy' bunu shared/bootstrap-cache'e symlink'ler
+  # (bkz. profile.tpl'deki AYNI NOT ve lib/deploy.sh:_deploy_link_shared) —
+  # bu satır srvctl deploy release'lerinde ölü kural, manuel/srvctl-deploy-
+  # dışı dağıtımlar için korunuyor (no-op, ek saldırı yüzeyi doğurmaz).
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/bootstrap/cache/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/storage/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/bootstrap-cache/** rwk,
 
   # Symfony (messenger:consume: var/cache, var/log)
-  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/var/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/shared/var/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/releases/**/var/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/var/** rwk,
 
-  {{WEB_ROOT}}/{{DOMAIN}}/logs/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/tmp/** rw,
-  {{WEB_ROOT}}/{{DOMAIN}}/sessions/** rw,
+  {{WEB_ROOT}}/{{DOMAIN}}/logs/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/tmp/** rwk,
+  {{WEB_ROOT}}/{{DOMAIN}}/sessions/** rwk,
 
   # ─── Sistem Dosyaları (salt okuma) ───
   /etc/php/** r,
