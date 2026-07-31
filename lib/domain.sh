@@ -220,29 +220,88 @@ _domain_repair() {
     _apply_chroot_php_deps "${base}" "${php_ver}"
     
     step "2/4" "PHP-FPM Pool ve AppArmor yapılandırmaları yenileniyor..."
-    # Kaynak profili domain'in KENDİ meta beyanından (RESOURCE_PROFILE) okunur
-    # — repair, 'domain add' anındaki '--resources=' seçimini sessizce
-    # 'standard'a DÜŞÜRMEMELİ (bkz. _domain_render_fpm_unit ile AYNI desen).
-    local repair_resource_profile; repair_resource_profile=$(_domain_read_resource_profile "$target")
-    resource_profile_load "$repair_resource_profile"
-    # BUG 2: disable_functions listesi framework'e göre türetilir (ci4'te
-    # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
-    local repair_framework; repair_framework=$(_domain_read_framework "$target")
-    # disable_functions gevşetmesi AÇIK beyan ister (bkz. _domain_framework_declared)
-    local repair_fw_declared; repair_fw_declared=$(_domain_framework_declared "$target")
-    render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
-        "SAFE_NAME=${sname}" \
-        "DOMAIN=${target}" \
-        "WEB_USER=${web_user}" \
-        "WEB_ROOT=${WEB_ROOT}" \
-        "PHP_VERSION=${php_ver}" \
-        "PM_MODE=${RES_PM_MODE}" "PM_MAX_CHILDREN=${RES_MAX_CHILDREN}" \
-        "PM_START_SERVERS=${RES_PM_START_SERVERS}" \
-        "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
-        "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
-        "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
-        "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$repair_fw_declared")" \
-        > "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf"
+    # ─── İZOLASYON-FARKINDA POOL HEDEFİ (BLOKE EDİCİ düzeltme — gerçek Ubuntu
+    #     22.04 VM'de kanıtlandı) ───
+    # ESKİDEN bu adım KOŞULSUZ paylaşılan pool.d/'ye yazıyordu. Domain
+    # DOMAIN_ISOLATED_FPM=true (varsayılan) ile per-domain unit'e
+    # (srvctl-fpm-<sname>.service, config: ${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/
+    # <sname>.conf) geçmişse, bu koşulsuz yazım pool tanımını PAYLAŞILAN
+    # master'a GERİ KOYUYORDU: aynı unix socket'i artık İKİ master (izole unit
+    # + paylaşılan master) tanımlıyor; izole unit socket'i zaten bind ettiğinden
+    # paylaşılan master 'status=78' (config hatası) ile ölüyor ve BİR SONRAKİ
+    # 'domain add' (önce paylaşılan pool'a yazıp master'ı başlatan akış) bu
+    # noktadan itibaren HER ZAMAN başarısız oluyordu (VM'de ölçülen belirti:
+    # "php8.3-fpm.service failed... Main PID ... status=78").
+    # 'Kullanılıyor mu' durumu META TERCİHİNE bakılarak DEĞİL (o yalnız
+    # BEYANDIR — _domain_isolated_fpm_effective; migrasyon başarısız kalmış
+    # olabilir) dosya sisteminin GERÇEK haline bakılarak belirlenir —
+    # _domain_php_switch'teki (satır ~2551) AYNI desen.
+    local php_pool_dir="${SRVCTL_PHP_POOL_DIR:-/etc/php/${php_ver}/fpm/pool.d}"
+    local isolated_conf="${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/${sname}.conf"
+    local shared_pool="${php_pool_dir}/${sname}.conf"
+    local using_isolated_fpm=false
+    [[ -f "$isolated_conf" ]] && using_isolated_fpm=true
+
+    if $using_isolated_fpm; then
+        info "Domain izole FPM unit kullanıyor (srvctl-fpm-${sname}.service) — pool tanımı paylaşılan pool.d/'ye DEĞİL izole hedefe yazılacak"
+        # Unit'i ÖNCE durdur ki render+activate ESKİ config'le çalışır kalmasın
+        # (zaten aktif bir unit'te 'enable --now' no-op'tur, yeni config'i
+        # YÜKLEMEZ — _domain_php_switch'teki AYNI desen).
+        systemctl stop "srvctl-fpm-${sname}.service" 2>/dev/null || true
+        _domain_render_fpm_unit "$target" "$php_ver"
+        if _domain_activate_fpm_unit "$target"; then
+            success "İzole FPM unit yenilendi: srvctl-fpm-${sname}.service"
+        else
+            warn "İzole FPM unit yeniden başlatılamadı — 'srvctl security harden-fpm ${target} --apply' ile elle deneyin"
+        fi
+
+        # ─── Kalıntı temizliği (madde 3 — bozuk MEVCUT kurulumları onar) ───
+        # Bu bug'a DAHA ÖNCE çarpmış bir sunucuda "izole unit VAR + pool.d'de
+        # AYNI isimde kalıntı VAR" durumu kalmış olabilir (yukarıdaki dal bunu
+        # artık ÜRETMEZ, ama GEÇMİŞTE üretilmiş olabilir). Kalıntı paylaşılan
+        # master'ın socket çakışmasıyla 'status=78' ile ölmeye devam etmesine
+        # yol açar — kaldırılıp master toparlanır.
+        if [[ -f "$shared_pool" ]]; then
+            warn "Paylaşılan pool.d'de kalıntı bulundu (${shared_pool}) — izole unit'le socket çakışması yaratıyordu, kaldırılıyor"
+            rm -f -- "$shared_pool"
+            if compgen -G "${php_pool_dir}/*.conf" > /dev/null 2>&1; then
+                systemctl reset-failed "php${php_ver}-fpm" 2>/dev/null || true
+                systemctl reload "php${php_ver}-fpm" 2>/dev/null || systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+                info "Paylaşılan php${php_ver}-fpm başka domain(ler) için hâlâ havuz barındırıyor — yeniden yüklendi"
+            else
+                systemctl stop "php${php_ver}-fpm" 2>/dev/null || true
+                systemctl disable "php${php_ver}-fpm" 2>/dev/null || true
+                systemctl reset-failed "php${php_ver}-fpm" 2>/dev/null || true
+                info "Paylaşılan php${php_ver}-fpm havuzsuz kaldı — durduruldu (tüm domainler izole unit'lerde)"
+            fi
+            log_action "domain repair: pool.d kalıntısı temizlendi (${target}) — izole unit socket çakışması onarıldı"
+        fi
+    else
+        mkdir -p "$php_pool_dir" 2>/dev/null || true
+        # Kaynak profili domain'in KENDİ meta beyanından (RESOURCE_PROFILE) okunur
+        # — repair, 'domain add' anındaki '--resources=' seçimini sessizce
+        # 'standard'a DÜŞÜRMEMELİ (bkz. _domain_render_fpm_unit ile AYNI desen).
+        local repair_resource_profile; repair_resource_profile=$(_domain_read_resource_profile "$target")
+        resource_profile_load "$repair_resource_profile"
+        # BUG 2: disable_functions listesi framework'e göre türetilir (ci4'te
+        # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
+        local repair_framework; repair_framework=$(_domain_read_framework "$target")
+        # disable_functions gevşetmesi AÇIK beyan ister (bkz. _domain_framework_declared)
+        local repair_fw_declared; repair_fw_declared=$(_domain_framework_declared "$target")
+        render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
+            "SAFE_NAME=${sname}" \
+            "DOMAIN=${target}" \
+            "WEB_USER=${web_user}" \
+            "WEB_ROOT=${WEB_ROOT}" \
+            "PHP_VERSION=${php_ver}" \
+            "PM_MODE=${RES_PM_MODE}" "PM_MAX_CHILDREN=${RES_MAX_CHILDREN}" \
+            "PM_START_SERVERS=${RES_PM_START_SERVERS}" \
+            "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
+            "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
+            "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
+            "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$repair_fw_declared")" \
+            > "$shared_pool"
+    fi
 
     render_template "${SRVCTL_TEMPLATES}/apparmor/profile.tpl" \
         "SAFE_NAME=${sname}" \
@@ -342,8 +401,20 @@ SQL
         "$redis_user" "$redis_pass" "$redis_prefix"
 
     step "4/4" "PHP-FPM yeniden başlatılıyor..."
-    systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
-    
+    # ─── 100 domain ölçeğinde önemli fark ───
+    # ESKİDEN bu adım İZOLASYON DURUMUNDAN BAĞIMSIZ paylaşılan php${php_ver}-fpm
+    # master'ını restart ediyordu — izole bir domain'in 'repair'i bile o anda
+    # paylaşılan pool'da çalışan TÜM DİĞER domainleri kısa bir kesintiye
+    # sokuyordu (ve zaten havuzsuzsa 'harden-fpm'in bilerek durdurduğu ölü
+    # servisi anlamsızca yeniden başlatmaya çalışıyordu). İzole domain kendi
+    # unit'inde adım 2/4'te zaten yenilendi; paylaşılan master'a burada
+    # DOKUNULMAZ.
+    if $using_isolated_fpm; then
+        info "İzole FPM unit zaten yenilendi (adım 2/4) — paylaşılan php${php_ver}-fpm'e dokunulmadı (bu domain onu kullanmıyor)"
+    else
+        systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+    fi
+
     success "Domain onarıldı: ${target}"
 }
 
@@ -2117,9 +2188,16 @@ _domain_row() {
     # SSL kontrolü
     [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]] && ssl="✅"
 
-    # Chroot kontrolü
-    if [[ -f "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf" ]]; then
-        grep -q "chroot" "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf" 2>/dev/null && chroot="✅"
+    # Chroot kontrolü — İZOLASYON-FARKINDA (sistematik denetim bulgusu, bkz.
+    # rapor): izole bir domain'in pool tanımı artık paylaşılan pool.d/'de
+    # DEĞİL, ${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/<sname>.conf'ta yaşıyor
+    # (bkz. _domain_render_fpm_unit) — yalnız pool.d'ye bakmak, izolasyona
+    # geçmiş (yani DAHA GÜVENLİ) domainleri yanlışlıkla "chroot yok" gösterirdi.
+    # _security_audit (lib/security.sh) zaten AYNI iki-yol desenini kullanıyor.
+    local pool_conf="${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/${sname}.conf"
+    [[ -f "$pool_conf" ]] || pool_conf="${SRVCTL_PHP_POOL_DIR:-/etc/php/${php_ver}/fpm/pool.d}/${sname}.conf"
+    if [[ -f "$pool_conf" ]]; then
+        grep -q "chroot" "$pool_conf" 2>/dev/null && chroot="✅"
     fi
 
     printf '%s|%s|%s|%s|%s\n' "$domain" "$php_ver" "$user" "$ssl" "$chroot"
@@ -2254,13 +2332,21 @@ _domain_info() {
 
     local php_ver="${PHP_VERSION:-${DEFAULT_PHP_VERSION}}"
 
-    # PHP-FPM pool
+    # PHP-FPM pool — izole unit varsa oradan oku, yoksa paylaşılan pool.d'ye
+    # düş (bkz. _domain_row başlık yorumu — aynı sistematik denetim bulgusu:
+    # izole domainler yalnız pool.d kontrolüyle yanlışlıkla "pool yok" görünürdü).
+    local pool_conf="${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/${sname}.conf"
+    local pool_kind="izole unit"
+    if [[ ! -f "$pool_conf" ]]; then
+        pool_conf="${SRVCTL_PHP_POOL_DIR:-/etc/php/${php_ver}/fpm/pool.d}/${sname}.conf"
+        pool_kind="paylaşılan"
+    fi
     local pool_status="${RED}❌ Yok${NC}"
-    if [[ -f "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf" ]]; then
-        if grep -q "chroot" "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf" 2>/dev/null; then
-            pool_status="${GREEN}✅ Aktif (chroot)${NC}"
+    if [[ -f "$pool_conf" ]]; then
+        if grep -q "chroot" "$pool_conf" 2>/dev/null; then
+            pool_status="${GREEN}✅ Aktif (chroot, ${pool_kind})${NC}"
         else
-            pool_status="${YELLOW}⚠️  Aktif (chroot yok)${NC}"
+            pool_status="${YELLOW}⚠️  Aktif (chroot yok, ${pool_kind})${NC}"
         fi
     fi
     echo -e "  PHP-FPM Pool:   ${pool_status}"
