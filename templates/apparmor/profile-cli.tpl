@@ -31,20 +31,26 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
 
   # ─── PHP CLI binary'si (php-fpm DEĞİL — /usr/sbin/php-fpm{{PHP_VERSION}}
   #     FPM'e özgüdür, worker /usr/bin/php{{PHP_VERSION}} çalıştırır) ───
-  # DÜZELTME (rapor: dalga4/B4): önceden yalnız 'mr' verilmişti (kendi
-  # metin sayfalarını mmap etmek için) ve exec ('x') İZNİ YOKTU. Ama bu
-  # profil altında çalışan süreç (worker/scheduler) çoğu zaman KENDİ ALT
-  # SÜRECİNİ açar — Laravel schedule:run'ın ->command()/->exec() görevleri,
-  # Symfony Process bileşeni, Horizon/queue supervisor'ları hep bir alt
-  # 'php ...' veya 'sh -c "php ..."' çağırır. 'x' izni olmadan bu execve
-  # AppArmor'da REDDEDİLİR ama üst süreç (schedule:run) genelde yine de 0
-  # ile çıkar — hata hiçbir yerde görünmez, görev sessizce hiç çalışmaz
-  # (fail-open/sessiz kesinti). Bu yüzden TAM YOL (glob'suz) ile 'rix'
-  # (mevcut profile INHERIT ederek exec) veriliyor; blanket
-  # 'deny /usr/bin/** x' bloğu (aşağıda) KORUNUYOR — spesifik/glob'suz bir
-  # allow kuralı, altındaki glob deny kuralından DAHA SPESİFİK sayıldığı
-  # için öncelikli olur (apparmor.d(5) specificity matching). HOST'ta
-  # doğrulanmadan enforce'a geçmeyin (bkz. rapor HOST doğrulama bölümü).
+  # DÜZELTME (rapor: dalga4/B4, DOĞRULANDI BUG 1 kanıtıyla): önceden yalnız
+  # 'mr' verilmişti (kendi metin sayfalarını mmap etmek için) ve exec ('x')
+  # İZNİ YOKTU. Ama bu profil altında çalışan süreç (worker/scheduler) çoğu
+  # zaman KENDİ ALT SÜRECİNİ açar — Laravel schedule:run'ın
+  # ->command()/->exec() görevleri, Symfony Process bileşeni, Horizon/queue
+  # supervisor'ları hep bir alt 'php ...' veya 'sh -c "php ..."' çağırır.
+  # 'x' izni olmadan bu execve AppArmor'da REDDEDİLİR ama üst süreç
+  # (schedule:run) genelde yine de 0 ile çıkar — hata hiçbir yerde
+  # görünmez, görev sessizce hiç çalışmaz (fail-open/sessiz kesinti). Bu
+  # yüzden TAM YOL (glob'suz) ile 'rix' (mevcut profile INHERIT ederek
+  # exec) veriliyor.
+  #
+  # ÖNCEDEN "blanket 'deny /usr/bin/** x' spesifik allow'dan daha az
+  # öncelikli, HOST'ta doğrulanmalı" diye belirsiz bırakılmıştı — BUG 1
+  # gerçek VM kanıtı bu varsayımı ÇÜRÜTTÜ: AppArmor'da 'deny' HER ZAMAN
+  # 'allow'u ezer, glob/tam-yol SPESİFİKLİĞİNE bakılmaksızın (profile.tpl'de
+  # php-fpm'in kendi reload-exec'i TAM DA bu yüzden kırılıyordu). Bu yüzden
+  # aşağıdaki 'deny /usr/bin/** x,' ve 'deny /bin/** x,' satırları TAMAMEN
+  # KALDIRILDI (bkz. dosya sonundaki NOT) — belirsizliğe güvenmek yerine
+  # çakışmayı kökünden kaldırdık.
   /usr/bin/php{{PHP_VERSION}} mrix,
 
   # ─── B4: kabuk exec whitelist'i — yalnız TAM YOL, glob YOK ───
@@ -59,7 +65,8 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # bu whitelist YETERSİZ kalır — bash'i BİLİNÇLİ OLARAK whitelist'e
   # EKLEMİYORUZ (tam interaktif kabuk exec yüzeyini genişletmemek için);
   # böyle bir host'ta scheduler yine B4'teki gibi sessizce kırılabilir,
-  # bu üçüncü bir HOST doğrulama maddesidir.
+  # bu HÂLÂ bir HOST doğrulama maddesidir (BUG 1'in çözdüğü yalnızca
+  # deny/allow çakışması, sembolik link hedefi belirsizliği DEĞİL).
   /bin/sh rix,
   /usr/bin/dash rix,
 
@@ -118,18 +125,26 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # ÖNEMLİ: 'disable_functions' (pool.conf.tpl) yalnız FPM SAPI'sini
   # kapsar — CLI SAPI'de exec/shell_exec/proc_open vb. şu an php.ini
   # düzeyinde KAPALI OLMAYABİLİR (bkz. rapor: "CLI SAPI disable_functions
-  # boşluğu"). Bu yüzden aşağıdaki exec-deny kuralları burada salt
-  # dokümantasyon DEĞİL, gerçek bir MAC-katmanı yedek savunmadır — bir
-  # kuyruk job'ı içinden shell_exec() çağrılsa bile AppArmor kernel
-  # düzeyinde reddeder.
-  # NOT (B4): yukarıdaki üç TAM YOL (glob'suz) 'rix' kuralı bu blanket
-  # deny'lerle ÇAKIŞMAZ görünmeli — spesifik allow, glob deny'i ezer. Bu
-  # varsayım HOST'ta doğrulanmadan KESİN sayılmasın (bkz. dosya başı NOT
-  # ve rapor HOST doğrulama bölümü: aa-complain + gerçek schedule:run +
-  # dmesg DENIED taraması).
-  deny /usr/bin/** x,
+  # boşluğu"). Bu yüzden AppArmor'ın default-deny (whitelist) modeli burada
+  # GERÇEK bir MAC-katmanı yedek savunmadır: profilde 'x' izni AÇIKÇA
+  # verilmemiş HİÇBİR binary zaten exec edilemez — bir kuyruk job'ı içinden
+  # shell_exec("curl ...") çağrılsa bile (curl'e x izni YOK) kernel düzeyinde
+  # reddedilir.
+  #
+  # DÜZELTME (BUG 1 kanıtıyla ÇÖZÜLDÜ — eskiden burada 'deny /usr/bin/** x,'
+  # ve 'deny /bin/** x,' vardı): AppArmor'da 'deny' HER ZAMAN 'allow'u ezer
+  # (specificity FARK ETMEZ — BUG 1'in gerçek VM kanıtı bunu doğruladı: bir
+  # glob deny, aynı dosyaya tanımlı TAM YOL bir allow'u da geçersiz kılıyordu).
+  # Bu iki satır yukarıdaki ZORUNLU 'rix' izinleriyle (php CLI kendi
+  # kendini yeniden çalıştırma + Process/schedule alt kabuğu için /bin/sh,
+  # /usr/bin/dash) ÇAKIŞIYORDU — kaldırılmaları saldırı yüzeyini
+  # GENİŞLETMEZ: default-deny zaten /usr/bin/** ve /bin/** altındaki
+  # WHITELIST'TE OLMAYAN (curl, wget, nc, python3, bash, ...) hiçbir
+  # binary'ye 'x' vermiyor; bu iki satır yalnız audit log'unu susturan
+  # dokümantasyondu, gerçek bir ek kısıtlama SAĞLAMIYORDU. '/usr/sbin/**' ve
+  # '/sbin/**' için böyle bir çakışma YOK (bu profilde o yollara hiçbir
+  # allow verilmedi) — o iki satır AYNEN KORUNUYOR.
   deny /usr/sbin/** x,
-  deny /bin/** x,
   deny /sbin/** x,
 
   deny /home/** rwx,

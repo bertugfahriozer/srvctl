@@ -639,14 +639,36 @@ _install_php() {
         # 'cat > /etc/php/${ver}/...' dizin yokluğunda set -e ile init'i patlatır.
         [[ -d "/etc/php/${ver}/fpm/conf.d" ]] || { warn "PHP ${ver} kurulu değil — atlanıyor"; continue; }
 
-        # PHP güvenlik ayarları
+        # PHP güvenlik ayarları — GLOBAL taban.
+        #
+        # KRİTİK: 'disable_functions' TEK YÖNLÜDÜR. Burada listelenen bir fonksiyon
+        # php.ini/conf.d işlenirken zend_disable_function() ile fonksiyon tablosundan
+        # SİLİNİR; pool'un php_admin_value'u onu GERİ AÇAMAZ (yalnızca listeyi
+        # UZATABİLİR). Yani per-domain gevşetme ancak fonksiyonu bu global listeden
+        # çıkarıp pool tarafında geri eklemekle mümkündür.
+        #
+        # Ubuntu 22.04 VM ölçümü: pool listesinde 'putenv' YOKKEN bile, global
+        # listede olduğu için function_exists('putenv') = false döndü ve CodeIgniter 4
+        # boot edemedi (DotEnv::setVariable putenv() çağırır, alternatifi yok).
+        #
+        # Bu yüzden 'putenv' global listede DEĞİL; sıkılaştırma pool seviyesinde
+        # yapılır: _domain_disable_functions_for() (lib/domain.sh) ci4 DIŞINDAKİ
+        # tüm framework'lerin pool'una 'putenv'i EKLER. Net etki: varsayılan
+        # domainler eskisi gibi sıkı kalır, yalnız FRAMEWORK=ci4 pool'unda açıktır.
+        #
+        # Buradaki liste ile _domain_disable_functions_for()'daki 'base' BİREBİR
+        # AYNI olmalı; sapmayı tests/test_disable_functions_sync.sh yakalar.
         cat > "/etc/php/${ver}/fpm/conf.d/99-srvctl-security.ini" << 'PHPINI'
 expose_php = Off
 display_errors = Off
 display_startup_errors = Off
 log_errors = On
 error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
-disable_functions = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,putenv,show_source,highlight_file
+; disable_functions: GLOBAL TABAN. 'putenv' bilerek YOK — global'de silinirse
+; pool geri açamaz (tek yönlüdür) ve CodeIgniter 4 boot edemez. Sıkılaştırma
+; pool'da: lib/domain.sh:_domain_disable_functions_for() ci4 dışındaki tüm
+; framework'lerin php_admin_value'una 'putenv'i ekler.
+disable_functions = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,show_source,highlight_file
 file_uploads = On
 upload_max_filesize = 50M
 post_max_size = 55M

@@ -107,6 +107,37 @@ _apply_chroot_php_deps() {
 # apparmor_parser'ın GERÇEK exit code'u kontrol ediliyor; hata mesajı
 # stderr'e (uyarı olarak) yazdırılıyor, çağıran 1 dönünce KENDİSİ warn basar
 # (bu fonksiyon "success" YALANI söylemez).
+# Her iki AppArmor profilini (FPM + CLI/worker) verilen PHP sürümüyle yeniden
+# render eder ve fail-closed yükler. PREDİKAT: 0=ikisi de enforce, 1=değil.
+#
+# HOST BULGUSU (gerçek Laravel deploy'u, Ubuntu 22.04): PHP sürümü profil
+# İÇERİĞİNE GÖMÜLÜDÜR — hem binary yolu (/usr/sbin/php-fpm<ver>) hem SOCKET
+# yolu (/run/php/php<ver>-fpm-<sname>.sock). 'domain php-switch' profili
+# yenilemediği için 8.3→8.4 geçişinde unit şununla ölüyordu:
+#   ERROR: unable to bind listening socket '/run/php/php8.4-fpm-<sname>.sock':
+#          Permission denied (13)
+# Yani AppArmor, profilde yazmayan yeni socket yolunu reddediyordu.
+_domain_render_apparmor_profiles() {
+    local domain="$1" php_ver="$2"
+    local sname; sname=$(safe_name "$domain")
+    local web_user="web_${sname}"
+    local rc=0
+
+    render_template "${SRVCTL_TEMPLATES}/apparmor/profile.tpl" \
+        "SAFE_NAME=${sname}" "DOMAIN=${domain}" "WEB_USER=${web_user}" \
+        "WEB_ROOT=${WEB_ROOT}" "PHP_VERSION=${php_ver}" \
+        > "/etc/apparmor.d/srvctl-${sname}"
+    _domain_load_apparmor_profile "/etc/apparmor.d/srvctl-${sname}" "srvctl-${sname}" || rc=1
+
+    render_template "${SRVCTL_TEMPLATES}/apparmor/profile-cli.tpl" \
+        "SAFE_NAME=${sname}" "DOMAIN=${domain}" "WEB_USER=${web_user}" \
+        "WEB_ROOT=${WEB_ROOT}" "PHP_VERSION=${php_ver}" \
+        > "/etc/apparmor.d/srvctl-${sname}-cli"
+    _domain_load_apparmor_profile "/etc/apparmor.d/srvctl-${sname}-cli" "srvctl-${sname}-cli" || rc=1
+
+    return $rc
+}
+
 _domain_load_apparmor_profile() {
     local profile_path="$1" profile_name="$2"
     local parser_err
@@ -194,6 +225,9 @@ _domain_repair() {
     # 'standard'a DÜŞÜRMEMELİ (bkz. _domain_render_fpm_unit ile AYNI desen).
     local repair_resource_profile; repair_resource_profile=$(_domain_read_resource_profile "$target")
     resource_profile_load "$repair_resource_profile"
+    # BUG 2: disable_functions listesi framework'e göre türetilir (ci4'te
+    # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
+    local repair_framework; repair_framework=$(_domain_read_framework "$target")
     render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
         "SAFE_NAME=${sname}" \
         "DOMAIN=${target}" \
@@ -205,6 +239,7 @@ _domain_repair() {
         "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
         "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
         "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
+        "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$repair_framework")" \
         > "/etc/php/${php_ver}/fpm/pool.d/${sname}.conf"
 
     render_template "${SRVCTL_TEMPLATES}/apparmor/profile.tpl" \
@@ -484,6 +519,50 @@ _domain_read_framework() {
             echo "ci4"
             ;;
     esac
+}
+
+# BUG 2 düzeltmesi: pool.conf.tpl'nin {{DISABLE_FUNCTIONS}} token'ını
+# framework'e göre üretir. TABAN liste lib/init.sh'daki global
+# 99-srvctl-security.ini ile BİREBİR AYNIDIR — TEK BİLİNÇLİ İSTİSNA:
+# FRAMEWORK=ci4 domainlerde 'putenv' listeden ÇIKARILIR.
+#
+# KÖK NEDEN: CodeIgniter 4'ün DotEnv sınıfı (system/Config/DotEnv.php)
+# .env yüklerken putenv() çağırır, alternatifi YOKTUR; 'putenv' devre dışıyken
+# framework hiç boot edemiyordu ('Call to undefined function putenv()',
+# HTTP 500 — CI4 appstarter deploy'unda kanıtlandı). Laravel/Symfony
+# etkilenmiyor (vlucas/phpdotenv ve Symfony Dotenv putenv()'i opsiyonel/hiç
+# kullanmaz) — bu yüzden istisna yalnız ci4'e ÖZGÜ, diğer TÜM framework'ler
+# (ve framework beyan edilmemiş domainler) 'putenv' DAHİL sıkı listeyi alır.
+#
+# NEDEN İSTİSNA POOL'DA, GLOBAL'DE DEĞİL: 'disable_functions' tek yönlüdür —
+# global 99-srvctl-security.ini'de listelenen fonksiyon php.ini işlenirken
+# tablodan silinir ve pool'un php_admin_value'u onu GERİ AÇAMAZ, yalnızca
+# listeyi UZATABİLİR. Ubuntu 22.04'te ölçüldü: pool listesinde 'putenv' YOKKEN
+# bile global'de olduğu için function_exists('putenv') = false döndü. Bu yüzden
+# 'putenv' global tabandan ÇIKARILDI ve sıkılaştırma buraya taşındı; böylece
+# per-domain granülerlik gerçekten uygulanabiliyor.
+#
+# TEHDİT MODELİ (ci4'te putenv'i açık bırakmak neden düşük risk): putenv()'in
+# tek başına gerçek riski putenv("LD_PRELOAD=...") ile YENİ bir process spawn
+# edildiğinde ortaya çıkar (env yalnız fork+exec'te İNHERİT edilir, hâlihazırda
+# çalışan process'i RETROAKTİF etkilemez). Process-spawn primitifleri (exec,
+# shell_exec, system, passthru, proc_open, popen, pcntl_exec, pcntl_fork) bu
+# listede FRAMEWORK FARK ETMEKSİZİN HER ZAMAN kapalı — putenv tek başına bir
+# sömürü zincirini TAMAMLAYAMAZ (LD_PRELOAD'ı devreye sokacak bir spawn yolu
+# yok). Bu yüzden marjinal risk düşük, CI4'ün TAMAMEN boot edememesi ise
+# kritik bir fonksiyonel kırılma — güvenlik kazancı bu dar kullanım
+# kaybından ağır basmıyor, dar bir istisna yeterli.
+_domain_disable_functions_for() {
+    local framework="$1"
+    # TABAN: lib/init.sh:99-srvctl-security.ini'deki disable_functions satırıyla
+    # BİREBİR AYNI olmalı (ikisinde de 'putenv' YOK). Sapmayı
+    # tests/test_disable_functions_sync.sh yakalar.
+    local base="exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,show_source,highlight_file"
+    if [[ "$framework" == "ci4" ]]; then
+        echo "$base"
+    else
+        echo "${base},putenv"
+    fi
 }
 
 # Domain'in kaynak (cgroups/FPM pool) profili beyanını (.srvctl-meta)
@@ -770,6 +849,11 @@ _domain_render_fpm_unit() {
     # pool.conf.tpl içine sabit '10s' olarak gömülü, buradan BESLENMEZ.
     local resource_profile; resource_profile=$(_domain_read_resource_profile "$domain")
     resource_profile_load "$resource_profile"
+    # BUG 2: disable_functions listesi framework'e göre türetilir (ci4'te
+    # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
+    # .srvctl-meta henüz yazılmamışsa (ör. birim testleri) 'ci4' varsayılanına
+    # düşer — _domain_read_framework'ün kendi güvenli fallback'i.
+    local unit_framework; unit_framework=$(_domain_read_framework "$domain")
 
     # config = [global] + pool (pool.conf.tpl TEK kaynak, kopyalanmaz)
     {
@@ -782,7 +866,8 @@ _domain_render_fpm_unit() {
             "PM_START_SERVERS=${RES_PM_START_SERVERS}" \
             "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
             "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
-            "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M"
+            "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
+            "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$unit_framework")"
     } > "$fpm_conf"
     _domain_assert_no_leftover_tokens "$fpm_conf"
     render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-fpm.service.tpl" \
@@ -1479,6 +1564,10 @@ _domain_add() {
     # GÖREV 2: kaynak profili buradan itibaren PM_* token'larını besler
     # (RES_* değişkenleri resource_profile_load ile doldu — bkz. yukarısı).
     resource_profile_load "$resource_profile"
+    # BUG 2: disable_functions listesi framework'e göre türetilir (ci4'te
+    # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
+    # '$framework' burada zaten CLI'dan (--framework=) çözülmüş durumda
+    # (write_meta ile .srvctl-meta'ya yazılması AŞAĞIDA gerçekleşir).
     render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
         "SAFE_NAME=${sname}" \
         "DOMAIN=${domain}" \
@@ -1490,6 +1579,7 @@ _domain_add() {
         "PM_MIN_SPARE_SERVERS=${RES_PM_MIN_SPARE_SERVERS}" \
         "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
         "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
+        "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$framework")" \
         > "/etc/php/${php_version}/fpm/pool.d/${sname}.conf"
 
     systemctl reload "php${php_version}-fpm" 2>/dev/null || \
@@ -2397,11 +2487,27 @@ _domain_php_switch() {
     assert_php_version "$old_ver" || old_ver="${DEFAULT_PHP_VERSION}"
     [[ "$old_ver" == "$new_ver" ]] && { info "Domain zaten PHP ${new_ver} kullanıyor."; return; }
 
+    # HOST BULGUSU (gerçek Laravel deploy'u, Ubuntu 22.04): bu fonksiyon
+    # TAMAMEN paylaşılan havuz varsayımıyla yazılmıştı ve izole domainlerde
+    # "Mevcut pool bulunamadı: /etc/php/8.3/fpm/pool.d/<sname>.conf" ile
+    # ölüyordu. DOMAIN_ISOLATED_FPM=true (varsayılan) ile havuz artık
+    # /etc/srvctl/fpm/<sname>.conf'ta ve PHP sürümü unit'in ExecStart'ında
+    # gömülü — yani İZOLE BİR DOMAİNİN PHP SÜRÜMÜ HİÇ DEĞİŞTİRİLEMİYORDU.
+    # (audit ve harden-fpm'de düzelttiğimiz "eski yola bakan kod" sınıfının
+    #  üçüncü örneği.)
+    local isolated_unit="srvctl-fpm-${sname}.service"
+    local isolated_conf="${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/${sname}.conf"
+    local is_isolated=false
+    [[ -f "$isolated_conf" ]] && is_isolated=true
+
     local old_pool="/etc/php/${old_ver}/fpm/pool.d/${sname}.conf"
     local new_pool="/etc/php/${new_ver}/fpm/pool.d/${sname}.conf"
-    [[ -f "$old_pool" ]] || error "Mevcut pool bulunamadı: ${old_pool}"
+    if ! $is_isolated && [[ ! -f "$old_pool" ]]; then
+        error "Mevcut pool bulunamadı: ${old_pool} (izole unit de yok: ${isolated_conf})"
+    fi
 
     header "PHP Sürüm Değişimi: ${old_ver} → ${new_ver} (${domain})"
+    $is_isolated && info "Domain izole FPM unit'inde (${isolated_unit}) — config+unit yeniden üretilecek"
 
     step "1/5" "Chroot kütüphaneleri (php${new_ver}-fpm)..."
     # PHP-FPM, Eklentiler (Extensions) ve Shared Libraries
@@ -2409,11 +2515,36 @@ _domain_php_switch() {
     success "Chroot kütüphaneleri güncellendi"
 
     step "2/5" "PHP-FPM pool taşınıyor..."
-    sed "s|php${old_ver}-fpm-${sname}.sock|php${new_ver}-fpm-${sname}.sock|g" "$old_pool" > "$new_pool"
-    rm -f "$old_pool"
-    systemctl reload "php${old_ver}-fpm" 2>/dev/null || true
-    systemctl reload "php${new_ver}-fpm" 2>/dev/null || systemctl restart "php${new_ver}-fpm"
-    success "Pool: php${new_ver}-fpm-${sname}"
+    if $is_isolated; then
+        # Unit'i durdur → config+unit'i YENİ sürümle yeniden render et →
+        # fail-closed aktive et. _domain_render_fpm_unit hem
+        # /etc/srvctl/fpm/<sname>.conf'u hem systemd unit'ini (ExecStart'taki
+        # php-fpm<ver> dahil) üretir; socket adı pool.conf.tpl'den geldiği için
+        # otomatik olarak php<new_ver>-fpm-<sname>.sock olur.
+        systemctl stop "$isolated_unit" 2>/dev/null || true
+        # AppArmor profilleri ÖNCE: socket/binary yolu sürüme bağlı, profil
+        # yenilenmezse yeni unit socket'i bind edemez (Permission denied).
+        _domain_render_apparmor_profiles "$domain" "$new_ver" \
+            || warn "AppArmor profilleri php${new_ver} için enforce edilemedi"
+        _domain_render_fpm_unit "$domain" "$new_ver"
+        if _domain_activate_fpm_unit "$domain"; then
+            success "İzole unit yeni sürümde: ${isolated_unit} (php${new_ver})"
+        else
+            # Geri al: profil + config + unit'i ESKİ sürümle yeniden üret.
+            warn "Yeni sürümle başlatılamadı — ${old_ver} sürümüne GERİ DÖNÜLÜYOR"
+            _domain_render_apparmor_profiles "$domain" "$old_ver" || true
+            _domain_render_fpm_unit "$domain" "$old_ver"
+            _domain_activate_fpm_unit "$domain" \
+                || warn "Geri dönüş de başarısız — 'srvctl domain repair ${domain}' çalıştırın"
+            error "PHP ${new_ver} geçişi başarısız: ${domain} (php${old_ver}'te bırakıldı)"
+        fi
+    else
+        sed "s|php${old_ver}-fpm-${sname}.sock|php${new_ver}-fpm-${sname}.sock|g" "$old_pool" > "$new_pool"
+        rm -f "$old_pool"
+        systemctl reload "php${old_ver}-fpm" 2>/dev/null || true
+        systemctl reload "php${new_ver}-fpm" 2>/dev/null || systemctl restart "php${new_ver}-fpm"
+        success "Pool: php${new_ver}-fpm-${sname}"
+    fi
 
     step "3/5" "Seccomp hardening (yeni sürüm)..."
     _apply_seccomp_hardening "$new_ver"

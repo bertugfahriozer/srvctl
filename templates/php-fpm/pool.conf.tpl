@@ -1,8 +1,11 @@
 ; TOKENS: SAFE_NAME DOMAIN WEB_USER WEB_ROOT PHP_VERSION PM_MODE
 ;         PM_MAX_CHILDREN PM_START_SERVERS PM_MIN_SPARE_SERVERS
-;         PM_MAX_SPARE_SERVERS MEMORY_LIMIT
+;         PM_MAX_SPARE_SERVERS MEMORY_LIMIT DISABLE_FUNCTIONS
 ; Besleyen: lib/domain.sh — _domain_render_fpm_unit, _domain_repair ve
-; domain add akışının pool render'ı (üç çağrı noktası). GÖREV 2 sözleşmesi
+; domain add akışının pool render'ı (üç çağrı noktası). DISABLE_FUNCTIONS
+; her üç çağrı noktasında da _domain_disable_functions_for(framework) ile
+; üretilir (bkz. o fonksiyonun başlık yorumu — BUG 2 düzeltmesi: CI4
+; domainlerinde 'putenv' listeden çıkar). GÖREV 2 sözleşmesi
 ; (ops-infra ↔ bash-developer, KESİNLEŞTİ — bkz. lib/domain.sh
 ; _domain_render_fpm_unit başlık yorumu): PM_MODE=RES_PM_MODE,
 ; PM_MAX_CHILDREN=RES_MAX_CHILDREN, MEMORY_LIMIT=RES_MEMORY_LIMIT_MB+'M',
@@ -74,17 +77,35 @@ php_admin_value[sys_temp_dir] = /tmp/
 php_admin_value[error_log] = /logs/php-error.log
 
 ; ─── Tehlikeli Fonksiyonları Devre Dışı Bırak ───
-; NOT: bu liste lib/init.sh'daki global 99-srvctl-security.ini listesiyle
-; BİREBİR SENKRON olmalı — php_admin_value[disable_functions] EKLEMEZ,
-; php.ini'deki global değeri DEĞİŞTİRİR/EZER. 'putenv' burada eksikse
-; global listede kapatılmış olsa da bu pool'da yeniden AÇILIR (klasik
-; putenv("LD_PRELOAD=...")/mail() enjeksiyon bypass'ı geri döner).
-; Symfony Dotenv'in opt-in usePutenv() modu bundan etkilenir (varsayılan
-; KAPALI — Symfony 5.1+ varsayılanı $_ENV kullanır, putenv() çağırmaz);
-; disable edilince usePutenv(true) çağıran uygulamalarda putenv() sessizce
-; no-op olur (E_WARNING + false döner, fatal değil) — güvenlik kazancı bu
-; dar/opt-in kullanım kaybından ağır basar.
-php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,proc_close,proc_get_status,proc_nice,proc_terminate,pcntl_alarm,pcntl_exec,pcntl_fork,pcntl_get_last_error,pcntl_getpriority,pcntl_setpriority,pcntl_signal,pcntl_signal_dispatch,pcntl_strerror,pcntl_wait,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig,dl,putenv,show_source,highlight_file
+; NOT (BUG 2 düzeltmesi): bu liste lib/init.sh'daki global
+; 99-srvctl-security.ini listesiyle BİREBİR SENKRON olmalı — TEK BİLİNÇLİ
+; İSTİSNA: FRAMEWORK=ci4 domainlerde 'putenv' listeden ÇIKAR. Değer artık
+; SABİT DEĞİL, {{DISABLE_FUNCTIONS}} token'ıyla render edilir; besleyen kod
+; (lib/domain.sh:_domain_disable_functions_for) laravel/symfony/varsayılan
+; domainlerde global ile BİREBİR AYNI (putenv DAHİL) listeyi üretir, yalnız
+; ci4'te putenv'i çıkarır. php_admin_value[disable_functions] EKLEMEZ,
+; php.ini'deki global değeri DEĞİŞTİRİR/EZER — bu yüzden 'putenv' üretilen
+; değerde eksikse (ci4 dışı domainlerde ASLA olmamalı) global listede
+; kapatılmış olsa da bu pool'da yeniden AÇILIR (klasik
+; putenv("LD_PRELOAD=...") enjeksiyon bypass'ı geri döner).
+;
+; KÖK NEDEN (CI4 appstarter deploy → HTTP 500): CodeIgniter 4'ün DotEnv
+; sınıfı (system/Config/DotEnv.php) .env yüklerken putenv() çağırır,
+; alternatifi YOKTUR — kapalıyken framework 'Call to undefined function
+; putenv()' ile HİÇ boot edemiyordu. Laravel/Symfony etkilenmiyor
+; (vlucas/phpdotenv ve Symfony Dotenv putenv()'i opsiyonel/hiç kullanmaz;
+; Symfony'nin opt-in usePutenv() modu zaten varsayılan KAPALI — Symfony
+; 5.1+ varsayılanı $_ENV kullanır) — bu yüzden istisna DAR ve ci4'e ÖZGÜ
+; tutuldu, global varsayılan sıkı kalıyor.
+;
+; TEHDİT MODELİ (ci4'te putenv'i açık bırakmak neden düşük risk): tek başına
+; gerçek risk putenv("LD_PRELOAD=...") ile YENİ bir process spawn
+; edildiğinde ortaya çıkar (env yalnız fork+exec'te İNHERİT edilir, çalışan
+; process'i RETROAKTİF etkilemez). Process-spawn primitifleri (exec,
+; shell_exec, system, passthru, proc_open, popen, pcntl_exec, pcntl_fork)
+; FRAMEWORK FARK ETMEKSİZİN aşağıda HER ZAMAN kapalı — putenv tek başına bir
+; sömürü zincirini TAMAMLAYAMAZ.
+php_admin_value[disable_functions] = {{DISABLE_FUNCTIONS}}
 
 ; ─── Güvenlik Ayarları ───
 php_admin_value[allow_url_fopen] = Off

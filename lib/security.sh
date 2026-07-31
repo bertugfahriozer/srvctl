@@ -273,7 +273,18 @@ _security_audit() {
     echo ""
     echo -e "  ${CYAN}── Servisler ──${NC}"
     _check "Nginx çalışıyor" systemctl is-active nginx
-    _check "PHP-FPM çalışıyor" systemctl is-active "php${DEFAULT_PHP_VERSION}-fpm"
+    # HOST BULGUSU (her iki LTS, gerçek VM): bu kontrol YALNIZ paylaşılan
+    # php<ver>-fpm servisine bakıyordu. DOMAIN_ISOLATED_FPM=true (varsayılan)
+    # ile her domain kendi srvctl-fpm-<sname>.service unit'ine taşınır ve
+    # havuzu pool.d/'den kaldırılır; www.conf da init tarafından zaten
+    # devre dışı bırakılmıştır. Sonuç: paylaşılan master'ın HİÇ HAVUZU KALMAZ,
+    # php-fpm havuzsuz başlayamaz ('failed' + restart döngüsü) ve bu kontrol
+    # SAHTE FAIL verirdi — yani tam izolasyon uygulanmış bir sunucu, izolasyon
+    # yüzünden cezalandırılıyordu. Doğru soru "PHP-FPM çalışıyor mu" değil,
+    # "PHP isteklerini karşılayan EN AZ BİR master var mı".
+    _check "PHP-FPM çalışıyor (paylaşılan ya da per-domain)" \
+        bash -c "systemctl is-active --quiet 'php${DEFAULT_PHP_VERSION}-fpm' \
+                 || systemctl list-units --state=active --no-legend --plain 'srvctl-fpm-*.service' 2>/dev/null | grep -q ."
     _check "MariaDB çalışıyor" systemctl is-active mariadb
     _check "Redis çalışıyor" systemctl is-active redis-server
     _check "Fail2Ban çalışıyor" systemctl is-active fail2ban
@@ -768,6 +779,27 @@ _harden_fpm_apply() {
     fi
 
     rm -f "$pool_bak" 2>/dev/null || true
+    # ─── Havuzsuz kalan paylaşılan master'ı düzgünce durdur ───
+    # HOST BULGUSU (her iki LTS): bu domainin havuzu pool.d/'den kaldırıldıktan
+    # sonra orada AKTİF havuz kalmayabilir (www.conf init tarafından zaten
+    # 'www.conf.disabled' yapılıyor). php-fpm HAVUZSUZ BAŞLAYAMAZ: servis
+    # 'failed' olur, systemd Restart=on-failure ile döngüye girer
+    # ("Start request repeated too quickly", restart counter 5) ve journal
+    # sürekli hata basar. Bu bir arıza değil, izolasyonun DOĞAL SONUCUDUR —
+    # o yüzden servisi bırakıp çırpınmasına izin vermek yerine açıkça
+    # durdurup devre dışı bırakıyoruz.
+    # Geri dönüş: 'domain add' paylaşılan havuza yeni bir pool yazdığında
+    # 'systemctl reload || systemctl restart' zincirini kullanır; restart
+    # durmuş/disable servisi yeniden ayağa kaldırır (lib/domain.sh).
+    local pool_dir="/etc/php/${php_ver}/fpm/pool.d"
+    if ! compgen -G "${pool_dir}/*.conf" > /dev/null 2>&1; then
+        systemctl stop    "php${php_ver}-fpm" 2>/dev/null || true
+        systemctl disable "php${php_ver}-fpm" 2>/dev/null || true
+        systemctl reset-failed "php${php_ver}-fpm" 2>/dev/null || true
+        info "Paylaşılan php${php_ver}-fpm havuzsuz kaldı — durduruldu (tüm domainler izole unit'lerde)"
+        log_action "harden-fpm: paylaşılan php${php_ver}-fpm durduruldu (havuz kalmadı)"
+    fi
+
     success "harden-fpm uygulandı: ${domain}"
     log_action "harden-fpm apply: ${domain}"
 }

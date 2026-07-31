@@ -385,6 +385,23 @@ _deploy_link_current() {
     ln -sfn "$rel_link" "$target_link"
 }
 
+# Switch ÖNCESİ başarısız olan bir release'i diskten kaldırır (trap'ten
+# çağrılır). Guard zinciri _deploy_prune_one ile aynı disiplinde: boş değer,
+# releases/ dışı yol, symlink ve kök dizinler reddedilir — trap bağlamında
+# çalıştığı için buradaki bir hata sessizce yıkıcı olmamalı.
+_deploy_discard_release() {
+    local base="$1" rel="$2"
+    [[ -n "$base" && -n "$rel" ]] || return 0
+    [[ -d "$rel" && ! -L "$rel" ]] || return 0
+    local releases_real rel_real
+    releases_real=$(cd "${base}/releases" 2>/dev/null && pwd -P) || return 0
+    rel_real=$(cd "$rel" 2>/dev/null && pwd -P) || return 0
+    [[ "$rel_real" == "${releases_real}/"* ]] || return 0
+    [[ "$rel_real" == "$releases_real" || "$rel_real" == "$base" || "$rel_real" == "/" ]] && return 0
+    rm -rf -- "$rel_real"
+    warn "Başarısız release diskten kaldırıldı: $(basename "$rel_real")"
+}
+
 # Per-domain deploy kilidi (flock). Aynı domain'e eş zamanlı iki deploy
 # aynı release_dir adını üretebilir, birbirinin symlink'ini ezebilir ve
 # birinin prune'u diğerinin doldurmakta olduğu dizini silebilir.
@@ -564,8 +581,20 @@ _deploy_link_shared() {
 # çalışmıyordur — sessiz eski-sürüm servisi yerine gürültülü hata tercih
 # edilir).
 _deploy_reload_fpm() {
-    local php_version="$1"
+    local php_version="$1" sname="${2:-}"
     local unit="php${php_version}-fpm"
+
+    # HOST BULGUSU (gerçek Laravel deploy'u, Ubuntu 22.04): bu fonksiyon HER
+    # ZAMAN paylaşılan php<ver>-fpm servisini reload ediyordu. İzole domainde
+    # (DOMAIN_ISOLATED_FPM=true — varsayılan) o servis havuzsuz kaldığı için
+    # BİLEREK durdurulmuş durumdadır; reload da restart da başarısız olur ve
+    # deploy, aslında SORUNSUZ tamamlanmış bir switch'ten sonra "PHP-FPM
+    # çalışmıyor olabilir" diyerek error ile ölüyordu. Domainin gerçekte
+    # kullandığı unit'i reload etmek gerekiyor.
+    if [[ -n "$sname" ]] && systemctl list-units --all --plain --no-legend \
+            "srvctl-fpm-${sname}.service" 2>/dev/null | grep -q .; then
+        unit="srvctl-fpm-${sname}.service"
+    fi
     if systemctl reload "$unit" 2>/dev/null; then
         return 0
     fi
@@ -772,7 +801,12 @@ _deploy_run() {
     # içermeyen release'lerde zaten no-op).
     local prev_target="" prev_rel_link="" prev_root_link=""
     if [[ -L "$public_dir" ]]; then
-        prev_target=$(readlink -f "$public_dir")
+        # HOST BULGUSU (gerçek Laravel deploy'u): public_html DANGLING bir
+        # symlink ise (release'i elle silinmiş / yarım kalmış müdahale)
+        # 'readlink -f' BOŞ döner VE non-zero çıkar; 'set -e' deploy'u
+        # HİÇBİR MESAJ VERMEDEN öldürüyordu (operatör yalnız rc=1 görüyordu).
+        # Boş değer zaten aşağıdaki fail-closed mantığı tetikler.
+        prev_target=$(readlink -f "$public_dir" 2>/dev/null) || prev_target=""
         # $base KANONİKLEŞTİRİLİR (bkz. O9): WEB_ROOT (ya da üstü) symlink
         # olabilir (VPS'lerde '/var' başka bir diske bağlanmış olabilir; macOS
         # test ortamında '/var' zaten '/private/var'a symlink'tir). $prev_target
@@ -853,6 +887,16 @@ _deploy_run() {
     # RCE'den fail-closed bir deploy hatasına indirger.
     mkdir -- "$release_dir" \
         || error "Release dizini oluşturulamadı (zaten var — sembolik bağlantı saldırısı olabilir): ${release_dir}"
+
+    # HOST BULGUSU (gerçek Laravel deploy'u, Ubuntu 22.04): switch'ten ÖNCEKİ
+    # hata yollarında (clone/composer/hook/build/izin) release dizini DİSKTE
+    # KALIYORDU. Laravel 13'ün PHP 8.4 gereksinimi yüzünden 'artisan
+    # config:cache' patladığında iki ardışık denemeden ~100'er MB'lık iki ölü
+    # release kaldı (vendor/ dahil). Webhook ile sürekli başarısız olan bir
+    # branch'te bu disk dolmasına gider; prune yalnız BAŞARILI deploy sonunda
+    # çalıştığı için de temizlenmez.
+    # Trap switch başarılı olunca kaldırılır (o noktadan sonra release CANLIDIR).
+    trap '_deploy_discard_release "$base" "$release_dir"' EXIT INT TERM
     GIT_ALLOW_PROTOCOL='https:ssh:git' git clone --depth 1 --branch "${branch}" -- "${repo_url}" "${release_dir}" 2>/dev/null \
         || error "Git clone başarısız. Repo URL'si ve branch'i kontrol edin."
     success "Clone tamamlandı"
@@ -1015,7 +1059,10 @@ _deploy_run() {
         || error "Atomic switch başarısız: ${public_dir}"
     _deploy_link_current "$base" "$current_link" "current" \
         || error "Atomic switch (current) başarısız: ${base}/current (worker/scheduler WorkingDirectory'si)"
-    _deploy_reload_fpm "$php_version"
+    # Release artık CANLI — bundan sonraki hatalarda onu silmek yanlış olur
+    # (health-check dalı kendi rollback/temizlik mantığını uygular).
+    trap - EXIT INT TERM
+    _deploy_reload_fpm "$php_version" "$sname"
     success "Atomic switch tamamlandı"
 
     # 8. Migration — OPT-IN (KULLANICI KARARI, varsayılan kapalı). Switch'ten
@@ -1112,7 +1159,7 @@ _deploy_run() {
                 _deploy_link_current "$base" "$prev_root_link" "current" \
                     || error "Rollback (current) symlink'i kurulamadı. Manuel müdahale: ${base}/current"
             fi
-            _deploy_reload_fpm "$php_version"
+            _deploy_reload_fpm "$php_version" "$sname"
             rm -rf "${release_dir}"
             _deploy_notify "Deploy Otomatik Geri Alındı: ${domain}" "Branch: ${branch}. Sağlıksız release (HTTP ${code}) geri alındı. Geri dönülen: ${prev_rel_link}" "critical"
             error "Deploy geri alındı. Önceki sürüm geri yüklendi: ${prev_rel_link}"
@@ -1155,6 +1202,10 @@ _deploy_rollback() {
 
     _deploy_lock "$domain"
 
+    # _deploy_reload_fpm'e geçilir: izole domainde paylaşılan php<ver>-fpm
+    # yerine srvctl-fpm-<sname>.service reload edilmeli (set -u altında
+    # tanımsız bırakılamaz).
+    local sname; sname=$(safe_name "$domain")
     local base="${WEB_ROOT}/${domain}"
     local public_dir="${base}/public_html"
     local releases="${base}/releases"
@@ -1162,7 +1213,7 @@ _deploy_rollback() {
 
     local php_version; php_version=$(_derive_php "$domain" "${DEFAULT_PHP_VERSION}")
 
-    local current_real=""; [[ -L "$public_dir" ]] && current_real=$(readlink -f "$public_dir")
+    local current_real=""; [[ -L "$public_dir" ]] && current_real=$(readlink -f "$public_dir" 2>/dev/null || true)
     local current_rel="${current_real%/public}"
 
     # Mevcut release'den bir öncekini bul. GÜVENLİK (bkz. rapor Y2/H4):
@@ -1208,7 +1259,7 @@ _deploy_rollback() {
         || error "Rollback symlink'i kurulamadı: ${public_dir} (gerçek dizin olabilir)"
     _deploy_link_current "$base" "$current_link" "current" \
         || error "Rollback (current) symlink'i kurulamadı: ${base}/current"
-    _deploy_reload_fpm "$php_version"
+    _deploy_reload_fpm "$php_version" "$sname"
 
     local code; code=$(_health_probe "$domain")
     if _deploy_health_ok "$code"; then
@@ -1302,7 +1353,7 @@ _deploy_prune_one() {
 
     # ── Canlı release tespiti: çözülemezse HİÇBİR ŞEY silme (fail-closed) ──
     local current_real="" current_rel=""
-    [[ -L "${base}/public_html" ]] && current_real=$(readlink -f "${base}/public_html")
+    [[ -L "${base}/public_html" ]] && current_real=$(readlink -f "${base}/public_html" 2>/dev/null || true)
     current_rel="${current_real%/public}"
     if [[ -z "$current_rel" ]]; then
         warn "${domain}: public_html çözümlenemedi — prune reddedildi (canlı release korunamaz)"
@@ -1398,7 +1449,7 @@ _deploy_list() {
     [[ -z "$domain" ]] && error "Kullanım: srvctl deploy list <domain>"
     domain_exists "$domain" || error "Domain bulunamadı: ${domain}"
     local base="${WEB_ROOT}/${domain}"
-    local current_real=""; [[ -L "${base}/public_html" ]] && current_real=$(readlink -f "${base}/public_html")
+    local current_real=""; [[ -L "${base}/public_html" ]] && current_real=$(readlink -f "${base}/public_html" 2>/dev/null || true)
     header "Release'ler: ${domain}"
     # GÜVENLİK (bkz. Y2/H4): 'ls -t' (mtime) DEĞİL — _deploy_prune_one/
     # _deploy_rollback ile PAYLAŞILAN TEK kaynak (_deploy_release_ids).

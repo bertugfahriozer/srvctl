@@ -31,12 +31,28 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   capability sys_chroot,
   capability kill,
 
-  # ─── Kendi binary'si (execve sonrası mmap-exec için 'm' şart) ───
-  # NOT: AppArmorProfile= systemd tarafından onexec ile zorlanır; bu yüzden
-  # exec-transition kuralı (px/ix) GEREKMEZ, ama process kendi text
-  # sayfalarını PROT_EXEC ile map edebilmek için 'm' iznine ihtiyaç duyar
-  # (distro daemon profillerinde standart desen). HOST'ta doğrulanmalı.
-  /usr/sbin/php-fpm{{PHP_VERSION}} mr,
+  # ─── Kendi binary'si — reload (SIGUSR2) için 'x' (inherit-execute) ZORUNLU ───
+  # DÜZELTME (kanıt: gerçek Ubuntu 22.04 VM). Önceki analiz "AppArmorProfile=
+  # onexec ile zorlanır, exec-transition kuralı GEREKMEZ" diye YANLIŞ
+  # varsayıyordu — bu yalnız İLK execve (systemd'nin ExecStart'ı) için
+  # geçerli. PHP-FPM master SIGUSR2 (graceful reload) aldığında KENDİSİNİ
+  # execvp(saved_argv[0], saved_argv) ile yeniden exec eder (fpm_pctl_exec,
+  # sapi/fpm/fpm/fpm_pctl.c) — bu İKİNCİ execve, AppArmor'da AYRI bir syscall
+  # olarak değerlendirilir ve kendi 'x' iznine ihtiyaç duyar. Yalnız 'mr'
+  # (mmap+read) verilmişken bu execvp REDDEDİLİYOR, php-fpm exit(FPM_EXIT_
+  # SOFTWARE)=70 ile çöküyor, systemd restart ediyor: 'systemctl reload'
+  # TÜM domain'i 2-3 sn'liğine düşürüyordu. Doğrulama: aa-complain modunda
+  # PID DEĞİŞMİYOR (reload başarılı), aa-enforce modunda PID DEĞİŞİYOR
+  # (master ölüyor) — kök neden kesin olarak AppArmor'dı.
+  #
+  # 'ix' (inherit-execute) kullanılıyor, 'ux'/'px'/'Ux' DEĞİL: 'ix' aynı
+  # AppArmor profilinde KALIR (profil geçişi/kaçışı YOK, capability seti
+  # değişmez) — bu execve systemd'nin zaten attach ettiği 'srvctl-{{SAFE_NAME}}'
+  # profilinin DIŞINA çıkmaz. 'ux' process'i TAMAMEN MAC dışına çıkarır
+  # (ayrıcalık yükseltme kapısı olurdu), 'px' farklı bir profile geçiş
+  # yapar (bu zaten en dar/doğru profil — kendine geçiş anlamsız ek
+  # karmaşıklık katardı). Bu yüzden yalnız 'ix' güvenli seçimdir.
+  /usr/sbin/php-fpm{{PHP_VERSION}} mrix,
 
   # ─── SADECE BU DOMAIN'E ERİŞİM ───
 
@@ -180,8 +196,23 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   deny /usr/local/srvctl/** rwx,
 
   # Paket yöneticisi
+  # DÜZELTME (BUG 1 — kanıt: gerçek Ubuntu 22.04 VM): 'deny /usr/sbin/** x,'
+  # satırı BURADAN KALDIRILDI. Bu glob, yukarıda ZORUNLU olarak eklenen
+  # '/usr/sbin/php-fpm{{PHP_VERSION}} mrix' allow kuralıyla ÇAKIŞIYORDU —
+  # AppArmor'da 'deny' HER ZAMAN 'allow'u ezer (specificity/tam-yol vs. glob
+  # FARK ETMEZ); bu satır enforce modda php-fpm'in kendi SIGUSR2 reload
+  # exec'ini REDDEDİYOR, master exit(70) ile ÇÖKÜYORDU — kanıtlanmış kök
+  # neden. Bu satırı php-fpm'i dışlayacak şekilde 'daraltmak' yerine
+  # TAMAMEN KALDIRMAYI tercih ettik: dosya başındaki NOT'ta (yukarı) zaten
+  # belgelendiği gibi AppArmor varsayılan-red (whitelist) modelidir —
+  # profilde 'x' izni AÇIKÇA verilmemiş HİÇBİR /usr/sbin/** binary'si zaten
+  # exec edilemez. Bu satır yalnızca audit log'unu susturan dokümantasyon
+  # amaçlıydı, gerçek bir güvenlik katmanı SAĞLAMIYORDU; kaldırılması
+  # saldırı yüzeyini GENİŞLETMEZ (tek allow hâlâ yalnızca
+  # php-fpm{{PHP_VERSION}} binary'sinin TAM YOLUNA, glob'suz tanımlı).
+  # '/usr/bin/**', '/bin/**', '/sbin/**' için böyle bir çakışma YOK (bu
+  # profilde o yollara hiçbir allow verilmedi) — üç satır AYNEN KORUNUYOR.
   deny /usr/bin/** x,
-  deny /usr/sbin/** x,
   deny /bin/** x,
   deny /sbin/** x,
 
