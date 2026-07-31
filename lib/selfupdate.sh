@@ -74,6 +74,11 @@ cmd_selfupdate() {
             echo "  NOT: 'run', ÖNCE 'check' çalıştırılmasını ZORUNLU kılar —"
             echo "  klon her zaman 'check' anında görülen TAM commit hash'ine sabitlenir."
             echo ""
+            echo "  NEDEN İKİ AŞAMALI: indirilecek içerik önce ('check' ile) görülüp TAM"
+            echo "  commit hash'ine SABİTLENMEDEN kurulmaz — aksi halde 'check' ile 'run'"
+            echo "  arasındaki pencerede repo ele geçirilip içerik SESSİZCE değiştirilebilirdi."
+            echo "  Pin dosyası yoksa 'run' HİÇBİR ŞEY KURMADAN durur ve bunu açıkça bildirir."
+            echo ""
             ;;
     esac
 }
@@ -132,8 +137,15 @@ _selfupdate_check() {
     # yoktu (bkz. rapor). Artık TEK kaynak core.sh.
     info "Mevcut sürüm: ${SRVCTL_VERSION}"
 
+    # BUG (bu düzeltmeyle KAPATILDI): 'git ls-remote' ağ hatasıyla (nonzero)
+    # başarısız olduğunda, 'set -euo pipefail' altında salt '$(...)' ataması
+    # ('|| true' OLMADAN) errexit'i TETİKLER — script hiçbir mesaj basmadan
+    # çıplak bir exit koduyla SESSİZCE ölür; aşağıdaki "Uzak repo'ya
+    # erişilemedi" uyarısı hiçbir zaman ÇALIŞTIRILAMAZDI (dead code). Aynı
+    # sessiz-ölüm sınıfı, pin dosyası eksikken 'run'ın yaşadığı sorunla
+    # BİREBİR aynıdır — burada da '|| true' ile öldürülüyor.
     local remote_hash
-    remote_hash=$(GIT_ALLOW_PROTOCOL='https:ssh:git' git ls-remote "$SRVCTL_REPO" HEAD 2>/dev/null | awk '{print $1}')
+    remote_hash=$(GIT_ALLOW_PROTOCOL='https:ssh:git' git ls-remote "$SRVCTL_REPO" HEAD 2>/dev/null | awk '{print $1}') || true
     if [[ -z "$remote_hash" ]]; then
         warn "Uzak repo'ya erişilemedi. İnternet bağlantınızı kontrol edin."
         return 1
@@ -168,6 +180,28 @@ _selfupdate_check() {
     echo ""
     info "Pinlendi: ${remote_hash:0:8} — uygulamak için: sudo srvctl self-update run"
     echo ""
+}
+
+# Pin BAYAT mı? — yalnız UYARIR, ENGELLEMEZ (bkz. dosya başı GÜVENLİK MODELİ
+# ve _selfupdate_run'daki çağrı noktasındaki gerekçe). Ağ erişilemezse veya
+# yanıt geçerli bir 40-hex hash değilse SESSİZCE atlanır (best-effort — asıl
+# bütünlük garantisi zaten _selfupdate_fetch_pinned'deki hash eşleşmesidir,
+# bu fonksiyon yalnız bir operatör-bilgilendirme katmanıdır).
+_selfupdate_warn_if_pin_stale() {
+    local repo_url="$1" pinned_commit="$2"
+    # '|| true': ağ erişilemezse 'git ls-remote' nonzero döner — 'set -e'
+    # altında '|| true' OLMADAN bu atama _selfupdate_run'ı SESSİZCE
+    # sonlandırırdı (bkz. _selfupdate_check'teki AYNI sınıf düzeltme, birkaç
+    # satır yukarıda). Bu fonksiyon zaten best-effort'tur: hata durumunda
+    # 'remote_head_now' boş kalır, aşağıdaki koşul false olur, sessizce devam edilir.
+    local remote_head_now
+    remote_head_now=$(GIT_ALLOW_PROTOCOL='https:ssh:git' git ls-remote "$repo_url" HEAD 2>/dev/null | awk '{print $1}') || true
+    if [[ "$remote_head_now" =~ ^[0-9a-f]{40}$ ]] && [[ "$remote_head_now" != "$pinned_commit" ]]; then
+        warn "NOT: pinlendiğinden beri uzak repo ilerlemiş (uzak HEAD şimdi: ${remote_head_now:0:8})."
+        warn "Bu çalıştırma yine de PİNLENMİŞ commit'i (${pinned_commit:0:8}) kuracak — TOFU modelinin gereği."
+        warn "En güncel commit'i almak isterseniz: sudo srvctl self-update check (yeniden pinler)"
+    fi
+    return 0
 }
 
 # ─── Pinlenmiş TAM commit hash'ini staging'e getirir + doğrular ───
@@ -216,7 +250,10 @@ _selfupdate_verify_tag_signature() {
     local dest="$1" pinned_commit="$2"
     GIT_ALLOW_PROTOCOL='https:ssh:git' git -C "$dest" fetch -q --tags origin 2>/dev/null || true
     local tag
-    tag="$(git -C "$dest" tag --points-at "$pinned_commit" 2>/dev/null | head -1)"
+    # '|| true': 'git tag' başarısız olursa (nadir), 'set -e' altında bu
+    # best-effort fonksiyonu SESSİZCE ÇÖKERTİP _selfupdate_run'ı yarıda
+    # keserdi — aynı sınıf düzeltme (bkz. _selfupdate_check/_selfupdate_warn_if_pin_stale).
+    tag="$(git -C "$dest" tag --points-at "$pinned_commit" 2>/dev/null | head -1)" || true
     if [[ -z "$tag" ]]; then
         info "Bu commit'e karşılık gelen bir git tag'i yok — imza doğrulaması atlandı (yalnız pinned-commit eşleşmesi uygulandı)."
         return 0
@@ -241,10 +278,19 @@ _selfupdate_backup_current() {
     secure_dir "$SRVCTL_SELFUPDATE_BACKUPS" 700
     secure_dir "$dir" 700
 
+    # KULLANILABİLİRLİK DÜZELTMESİ: eskiden 'cp -a ... 2>/dev/null || return 1'
+    # cp'nin KENDİ hata mesajını da yutuyordu — çağıran (_selfupdate_run) yalnız
+    # "Yedekleme başarısız — güncelleme iptal edildi." diyordu, HANGİ alt dizinin
+    # NEDEN kopyalanamadığı (disk dolu/izin) hiçbir yerde görünmüyordu. Artık
+    # başarısızlık öncesi 'warn' ile teşhis basılıyor (STDOUT'taki 'error' özeti
+    # ile birlikte okununca eksiksiz bir tanı verir).
     local sub
     for sub in bin lib templates completions; do
         if [[ -d "${SRVCTL_ROOT}/${sub}" ]]; then
-            cp -a "${SRVCTL_ROOT}/${sub}" "${dir}/${sub}" 2>/dev/null || return 1
+            if ! cp -a "${SRVCTL_ROOT}/${sub}" "${dir}/${sub}" 2>/dev/null; then
+                warn "Yedekleme başarısız: '${sub}' → '${dir}/${sub}' kopyalanamadı (disk dolu veya izin sorunu olabilir)."
+                return 1
+            fi
         fi
     done
     if [[ -f "${SRVCTL_ROOT}/conf/rate-profiles.conf" ]]; then
@@ -368,8 +414,26 @@ _selfupdate_run() {
     info "Mevcut sürüm: ${current_version}"
 
     # ── 1. Pinlenmiş commit'i oku (GÜVENLİK: 'check' ÖNCE çalıştırılmış olmalı) ──
-    [[ -f "$SRVCTL_SELFUPDATE_PIN" ]] \
-        || error "Pinlenmiş bir güncelleme yok. Önce çalıştırın: sudo srvctl self-update check"
+    # KULLANILABİLİRLİK DÜZELTMESİ (üretimde ölçüldü — bkz. rapor): bu dal
+    # önceden yalnız 'error' ile TEK satırlık bir mesaj basıyordu. 'error'
+    # STDERR'e yazar (bkz. core.sh) ve script burada exit 1 ile durur; yalnız
+    # STDOUT'u yakalayan bir log/izleme kurulumunda ('srvctl self-update run
+    # >> log.txt' — '2>&1' OLMADAN) operatör "Mevcut sürüm: X" satırından
+    # sonra HİÇBİR ŞEY görmüyor, NEDENİNİ asla öğrenemiyordu. Düzeltme: asıl
+    # açıklama artık STDOUT'a ('info') basılıyor — hangi akış yakalanırsa
+    # yakalansın görünür olsun diye — son satır yine 'error' ile hem STDERR'e
+    # tekrarlanıp hem de exit 1 ile script sonlandırılıyor.
+    if [[ ! -f "$SRVCTL_SELFUPDATE_PIN" ]]; then
+        echo ""
+        info "Pinlenmiş bir güncelleme bulunamadı — 'run' HİÇBİR DOSYAYI DEĞİŞTİRMEDEN durdu."
+        info "self-update İKİ AŞAMALI çalışır (bilinçli güvenlik tasarımı):"
+        info "  1) sudo srvctl self-update check   → uzak HEAD'in TAM commit hash'ini okur ve PİNLER"
+        info "  2) sudo srvctl self-update run     → SADECE o pinlenmiş hash'i indirir, doğrular, kurar"
+        info "Neden: indirilecek içerik önce ('check' ile) görülüp SABİTLENMEDEN kurulursa,"
+        info "'check' ile 'run' arasında repo ele geçirilip içerik SESSİZCE değiştirilebilirdi."
+        echo ""
+        error "Önce çalıştırın: sudo srvctl self-update check"
+    fi
     _selfupdate_assert_pin_owned "$SRVCTL_SELFUPDATE_PIN" \
         || error "GÜVENLİK: ${SRVCTL_SELFUPDATE_PIN} root sahipli/izinli değil (tamper olabilir). Reddedildi — 'sudo srvctl self-update check' ile yeniden pinleyin."
 
@@ -378,12 +442,20 @@ _selfupdate_run() {
     [[ -n "$PINNED_COMMIT" ]] \
         || error "Pin dosyası bozuk (PINNED_COMMIT eksik). 'sudo srvctl self-update check' ile yeniden pinleyin."
     [[ "$PINNED_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
-        || error "Pin dosyası bozuk (geçersiz commit hash biçimi): ${PINNED_COMMIT}"
+        || error "Pin dosyası bozuk (geçersiz commit hash biçimi): ${PINNED_COMMIT}. 'sudo srvctl self-update check' ile yeniden pinleyin."
     if [[ -n "$PINNED_REPO" && "$PINNED_REPO" != "$SRVCTL_REPO" ]]; then
-        error "GÜVENLİK: pin farklı bir repo için alınmış (${PINNED_REPO} ≠ ${SRVCTL_REPO}). Reddedildi."
+        error "GÜVENLİK: pin farklı bir repo için alınmış (${PINNED_REPO} ≠ ${SRVCTL_REPO}). Reddedildi — 'sudo srvctl self-update check' ile yeniden pinleyin."
     fi
 
     info "Pinlenmiş commit uygulanacak: ${PINNED_COMMIT:0:8} (pinlendi: ${PINNED_AT:-bilinmiyor})"
+    # ── Bilgilendirme: pin BAYAT olabilir mi? (uzak HEAD pinlendiğinden beri
+    #    ilerlemiş olabilir). Bu SADECE bilgilendirmedir — ENGELLEMEZ: TOFU
+    #    modelinin özü "operatörün 'check' anında GÖRDÜĞÜ TAM O commit'i kur"
+    #    olduğundan, pin bayat diye sessizce en yeni HEAD'e ATLAMAK TOFU'yu
+    #    by-pass eder, pin bayat diye kurulumu DURDURMAK ise operatörün zaten
+    #    onayladığı bir işlemi gereksiz yere engeller. Doğru davranış: haber
+    #    ver, kararı operatöre bırak (bkz. dosya başı GÜVENLİK MODELİ).
+    _selfupdate_warn_if_pin_stale "$PINNED_REPO" "$PINNED_COMMIT"
 
     # ── 2. Mevcut kurulumun YEDEĞİ (staging oluşturulmadan ÖNCE — bkz. aşağıdaki
     #      not: staging '.selfupdate-clone.*' adı hiçbir kopyalama globuna
@@ -432,8 +504,15 @@ _selfupdate_run() {
     echo "$PINNED_COMMIT" > "$SRVCTL_CURRENT_COMMIT"
     rm -f "$SRVCTL_SELFUPDATE_PIN"
 
+    # '|| true': 'grep -m1' EŞLEŞME BULAMAZSA nonzero döner — 'set -e' altında
+    # bu, dosyalar ZATEN başarıyla kurulmuş VE sağlık kontrolünden geçmiş
+    # olsa BİLE, script'i tam bu noktada SESSİZCE keserdi: "Tamamlandı" banner'ı,
+    # yedek temizliği, changelog kaydı ve 'domain repair --all' daveti HİÇ
+    # ÇALIŞMAZ; operatör güncellemenin BAŞARISIZ olduğunu SANIR (oysa dosyalar
+    # kuruludur). Aşağıdaki "[[ -n ]] || bilinmiyor" düşme-yolu tam da bunun
+    # için vardı ama '|| true' olmadan asla ÇALIŞTIRILAMAZDI.
     local new_version
-    new_version="$(grep -m1 '^SRVCTL_VERSION=' "${SRVCTL_ROOT}/lib/core.sh" 2>/dev/null | cut -d= -f2 | tr -d '"')"
+    new_version="$(grep -m1 '^SRVCTL_VERSION=' "${SRVCTL_ROOT}/lib/core.sh" 2>/dev/null | cut -d= -f2 | tr -d '"')" || true
     [[ -n "$new_version" ]] || new_version="bilinmiyor"
 
     step "4/5" "Eski yedekler temizleniyor (son ${SELFUPDATE_KEEP_BACKUPS:-3} tutulur)..."
@@ -497,7 +576,11 @@ _selfupdate_rollback() {
         dir="${SRVCTL_SELFUPDATE_BACKUPS}/${target}"
         [[ -d "$dir" ]] || error "Yedek bulunamadı: ${dir}"
     else
-        name="$(find "$SRVCTL_SELFUPDATE_BACKUPS" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort -r | head -1)"
+        # '|| true': 'find' nadir bir I/O hatasıyla başarısız olursa bile bu
+        # atama script'i SESSİZCE kesmesin — aşağıdaki "[[ -n ]] || error"
+        # zaten hem "boş sonuç" hem "find başarısız" durumunu AÇIK bir mesajla
+        # ele alıyor (aynı sınıf düzeltme, dosya geneli).
+        name="$(find "$SRVCTL_SELFUPDATE_BACKUPS" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort -r | head -1)" || true
         [[ -n "$name" ]] || error "Hiç yedek bulunamadı."
         dir="${SRVCTL_SELFUPDATE_BACKUPS}/${name}"
     fi

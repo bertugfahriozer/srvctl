@@ -201,6 +201,13 @@ sudo srvctl self-update rollback [ad]  # Son (veya belirtilen) yedeğe geri dön
 > klon her zaman `check` anında görülen tam commit hash'ine sabitlenir (HEAD değişse 
 > bile çalıştırmıştır). Operatör kontrolü gözarı edilemez; tedarik zinciri saldırısı 
 > karşı kalkan.
+>
+> `run`, pin dosyası yoksa (yani `check` hiç çalıştırılmamışsa) hiçbir dosyayı
+> değiştirmeden durur ve size `sudo srvctl self-update check` çalıştırmanızı
+> açıkça söyler — neden iki aşamalı olduğunu da (check ile run arasında içeriğin
+> sessizce değişememesi için) açıklar. Pin `check`'ten sonra uzak repo ilerlediyse
+> (yani "bayat" ise), `run` yine de PİNLENMİŞ commit'i kurar ve bunu bir uyarıyla
+> bildirir — sessizce en güncel HEAD'e atlamaz (TOFU modelinin gereği).
 
 ### İzleme & Alarm
 ```bash
