@@ -19,6 +19,7 @@ cmd_domain() {
         staging)   _domain_staging "${@:2}" ;;
         migrate)    _domain_migrate "${@:2}" ;;
         rate-limit) _domain_rate_limit "${@:2}" ;;
+        framework) _domain_framework "${@:2}" ;;
         repair)    _domain_repair "${@:2}" ;;
         worker)    _domain_worker "${@:2}" ;;
         scheduler) _domain_scheduler "${@:2}" ;;
@@ -49,6 +50,11 @@ cmd_domain() {
             echo "    staging <domain>                Staging ortamı oluştur"
             echo "    migrate <domain> <user@host>    Sunucular arası taşı"
             echo "    rate-limit <domain> <profil>    Rate-limit profilini değiştir/göster"
+            echo "    framework <domain> <ci4|laravel|symfony|none>"
+            echo "                                     Mevcut domain'in framework beyanını değiştir/temizle"
+            echo "                                     ('ci4' putenv'i AÇAR — bilinçli güvenlik ödünü, bkz."
+            echo "                                     çıktıdaki uyarı); sonrasında 'domain repair' ÖNERİLİR"
+            echo "                                     (disable_functions'ın fiilen render edilmesi için)"
             echo "    repair <domain>|--all           Eksik chroot kütüphanelerini onarır"
             echo "    worker <domain> <eylem> [ad]    Kuyruk worker'ı yönet (start/stop/status/enable/disable)"
             echo "    scheduler <domain> <eylem>      Zamanlanmış görev yönet (start/stop/status/enable/disable)"
@@ -318,6 +324,121 @@ _domain_repair_fix_docroot() {
     fi
 }
 
+# ─── PHP sürümünü DOSYA SİSTEMİNDEN türet ('.credentials' YOKKEN) ───
+# _domain_ensure_credentials (aşağıda) tarafından kullanılır: '.credentials'
+# hiç yoksa PHP_VERSION'ı öğrenmenin tek yolu gözlemlenebilir duruma bakmaktır
+# ('.credentials'a zaten güvenilemez — konu bu). Sıra: izole per-domain FPM
+# unit'inin ExecStart'ı (php-fpm<ver> — bkz. templates/systemd/
+# srvctl-fpm.service.tpl) → paylaşılan pool.d'nin bulunduğu sürüm dizini.
+# İkisi de bulunamazsa DEFAULT_PHP_VERSION'a düşer — bu bir TAHMİNDİR, gerçek
+# kurulu sürüm DEĞİL; çağırana ve operatöre açıkça warn edilir.
+#
+# GÜVENLİK NOTU: doğrulama 'php_version_exists' (bu MAKİNEDE gerçekten kurulu
+# mu) İLE DEĞİL, '_derive_php'İLE (core.sh) BİREBİR AYNI 'assert_php_version'
+# (yalnız BİÇİM: ^[0-9]+\.[0-9]+$) ile yapılır — kaynak (kendi ürettiğimiz
+# systemd unit'i / pool.d dizin adı) '.credentials' kadar güvenilir DEĞİLDİR
+# ama rastgele saldırgan girdisi de DEĞİLDİR; asıl güvenlik sınırı zaten
+# downstream'de (unit render/aktivasyon gerçek kurulumu doğrular) sağlanır.
+# Bu ayrıca test edilebilirliği sağlar: macOS/CI'da '/usr/sbin/php-fpm*'
+# hiç yoktur, 'php_version_exists' burada kullanılsaydı HER ZAMAN false
+# dönüp bu fonksiyonu fiilen test edilemez kılardı.
+# PREDİKAT DEĞİL — her zaman bir sürüm string'i basar (stdout), asla boş
+# dönmez.
+_domain_detect_installed_php() {
+    local sname="$1"
+    local sysd_dir="${SRVCTL_SYSTEMD_DIR:-/etc/systemd/system}"
+    local unit_file="${sysd_dir}/srvctl-fpm-${sname}.service"
+    local ver=""
+
+    if [[ -f "$unit_file" ]]; then
+        ver="$(grep -oE 'php-fpm[0-9]+\.[0-9]+' "$unit_file" 2>/dev/null | head -1 \
+                 | grep -oE '[0-9]+\.[0-9]+')" || true
+        if [[ -n "$ver" ]] && assert_php_version "$ver"; then
+            echo "$ver"
+            return 0
+        fi
+        ver=""
+    fi
+
+    # Paylaşılan havuz: /etc/php/<ver>/fpm/pool.d/<sname>.conf. Test-seam
+    # YOK — mevcut kod tabanında bu yol zaten her yerde hardcoded (ör.
+    # lib/security.sh '_harden_fpm_apply', bu dosyada '_domain_php_switch');
+    # macOS/CI'da '/etc/php' bulunmadığından glob sessizce eşleşmez, hataya
+    # düşmez (aşağıdaki döngü hiç çalışmaz).
+    local pool_dir
+    for pool_dir in /etc/php/*/fpm/pool.d; do
+        [[ -f "${pool_dir}/${sname}.conf" ]] || continue
+        ver="$(basename "$(dirname "$(dirname "$pool_dir")")")"
+        if assert_php_version "$ver"; then
+            echo "$ver"
+            return 0
+        fi
+        ver=""
+    done
+
+    warn "'${sname}' için kurulu PHP sürümü dosya sisteminden tespit edilemedi — varsayılan (${DEFAULT_PHP_VERSION}) kullanılacak, DOĞRULAYIP gerekiyorsa 'domain php-switch' ile düzeltin"
+    echo "${DEFAULT_PHP_VERSION}"
+    return 0
+}
+
+# ─── '.credentials' KURTARMA (GÜVENLİK DENETİMİ EKİ — designwestgate.art
+#     sınıfı, HOST'ta ölçüldü) ───
+# _domain_repair_fix_docroot İLE AYNI SINIF sorunu çözer: repair'in (ve
+# 'security harden-fpm --apply'ın) KENDİSİ, düzelteceği domain'in eksik bir
+# ön-koşulu YÜZÜNDEN çalışamıyordu. Buradaki ön-koşul 'public_html' değil
+# '.credentials': eski bir srvctl sürümünde eklenmiş ya da yarıda kesilmiş
+# bir 'domain add'de bu dosya HİÇ YAZILMAMIŞ olabilir. Domain GERÇEKTEN
+# hardened ise (bkz. _domain_is_hardened, core.sh) read_credentials/
+# _derive_php bu eksikliği fail-closed 'tamper' sayıp error() ile ÇIKARDI —
+# yani audit'in FAIL dediği domain'i düzeltecek TEK komutların (repair,
+# harden-fpm --apply) kendisi de çalışamıyordu (çıkmaz). KUSUR 2 mesaj
+# ayrımı (core.sh:_require_owned_or_warn) bu çıkmazı GÖRÜNÜR kıldı ama TEK
+# BAŞINA ÇÖZMEDİ — operatör hâlâ dosyayı ELLE üretmek zorundaydı. Bu
+# fonksiyon onu OTOMATİK yapar.
+#
+# İKİ SERT KURAL (görev talebi):
+#  1) VAR OLAN bir '.credentials'a ASLA dokunulmaz — üretim SADECE dosya
+#     GERÇEKTEN yoksa ('-e' testi) tetiklenir.
+#  2) DB/Redis parolası UYDURULMAZ. DB_NAME/DB_USER identifier'ları BİLE
+#     yazılmaz — '_domain_repair' zaten bunları HER ZAMAN safe_name'den
+#     yeniden türetir, '.credentials'taki değerlere GÜVENMEZ (bkz.
+#     _domain_repair başlık yorumu); domain'in GERÇEKTEN bir veritabanı/
+#     Redis ACL kullanıcısı olup olmadığı BİLİNMİYORSA var olduğunu iddia
+#     eden bir isim yazmak yanıltıcı olurdu. Altı alanın (DB_NAME/DB_USER/
+#     DB_PASS/REDIS_USER/REDIS_PASS/REDIS_PREFIX) TÜMÜ boş bırakılır —
+#     '_domain_repair'in kendi DB/Redis provizyon blokları zaten
+#     '-n "$db_pass"'/'-n "$redis_pass"' şartıyla GATED'tır (bkz. o
+#     fonksiyondaki ilgili bloklar): boş parola bu adımları GÜVENLE atlar,
+#     YANLIŞ bir parola ÜRETMEZ/UYGULAMAZ.
+#
+# ÇAĞRI YERİ SÖZLEŞMESİ: yalnız GERÇEK domainler için çağrılmalıdır —
+# çağıranlar ('_domain_repair', 'security harden-fpm') zaten kendi hayalet
+# tespitini yapmış olmalı; bu fonksiyon 'id web_<sname>' ile KENDİ savunma-
+# derinliği kapısını da taşır (ghost bir dizine credentials üretmez).
+#
+# PREDİKAT DEĞİL — yan etkili. Dosya zaten varsa ya da domain hayaletse
+# hiçbir şey YAPMADAN 0 döner.
+_domain_ensure_credentials() {
+    local domain="$1"
+    local base="${WEB_ROOT}/${domain}"
+    local creds_file="${base}/.credentials"
+
+    [[ -e "$creds_file" ]] && return 0
+
+    local sname; sname=$(safe_name "$domain")
+    local web_user="web_${sname}"
+    id "$web_user" &>/dev/null || return 0
+
+    local php_ver; php_ver=$(_domain_detect_installed_php "$sname")
+
+    warn "'${domain}': '.credentials' eksik (muhtemelen eski bir srvctl sürümünde eklenmiş domain — TAMPER DEĞİL) — gözlemlenen durumdan yeniden üretiliyor"
+    _domain_write_credentials "$domain" "$base" "$web_user" "$php_ver" \
+        "" "" "" "" "" ""
+    warn "'${domain}': '.credentials' yeniden üretildi (PHP=${php_ver}). DB_NAME/DB_USER/DB_PASS ve REDIS_* alanları BİLİNMİYOR, BOŞ bırakıldı — bu domain bir veritabanı/Redis kullanıyorsa parolaları ELLE belirleyip dosyaya yazmanız gerekir (aksi halde 'domain repair' bu adımları sessizce atlar); kullanmıyorsa (ör. statik site) boş kalması ZARARSIZDIR."
+    log_action "domain repair/harden-fpm: '.credentials' yeniden üretildi (${domain}, php=${php_ver}, DB/Redis alanları boş)"
+    return 0
+}
+
 # ─── Hayalet FPM pool.d dosyalarının temizliği (GÜVENLİK DENETİMİ EKİ —
 # ikinci dereceden hasar: hayalet domain düzeltmesi kaynağı kapattı ama
 # ZATEN ÜRETİLMİŞ kalıntı filoyu bloke etmeye devam ediyordu) ───
@@ -427,7 +548,29 @@ _domain_repair() {
                 continue
             fi
             repair_total=$((repair_total + 1))
-            if ! _domain_repair "$domain"; then
+            # GÜVENLİK DENETİMİ EKİ (MADDE 1 yan bulgusu — list_all_domains'in
+            # ikinci kapısı açıldıktan SONRA ortaya çıkan yeni bir çökme yolu):
+            # '_domain_repair' tek bir domain için 'read_credentials'/
+            # '_domain_read_framework'/'_domain_framework_declared' (core.sh)
+            # üzerinden 'error()' çağırabilir — hardened bir domain'de
+            # '.credentials'/'.srvctl-meta' root-owned DEĞİLSE (tamper) bu
+            # fonksiyonlar KOŞULSUZ 'exit 1' eder. 'error()' bir RETURN değil,
+            # gerçek bir 'exit'tir; çıplak (subshell'siz) bir çağrıda bu
+            # yalnız BU domain'in onarımını değil, TÜM '--all' SÜRECİNİ
+            # (döngünün geri kalanını) SESSİZCE yarıda keserdi — HOST mutasyon
+            # testiyle doğrulandı: hardened+'.credentials'sız bir domain'den
+            # SONRA gelen alfabetik sırada bir domain HİÇ işlenmiyordu, ne
+            # "TAMAMLANAMADI" özeti ne de dönüş değeri asla basılmıyordu
+            # (process anında ölüyordu). Bu yol ÖNCEDEN ulaşılamazdı — böyle
+            # bir domain '.credentials' yokluğu yüzünden 'list_all_domains()'
+            # tarafından zaten ELENİYORDU; ikinci kapı (web_<sname> kullanıcı
+            # varlığı) bu domainleri artık GÖRÜNÜR kıldığından bu çökme yolu
+            # '--all' için YENİ ortaya çıktı. Çözüm: her domain'in onarımı
+            # bir ALT-KABUKTA ('( ... )') çalıştırılır — 'exit' yalnız o alt
+            # kabuğu sonlandırır, DÖNÜŞ KODU normal şekilde '$?' ile geri
+            # gelir ve 'if !' bunu her zamanki gibi 'başarısız' sayar; döngü
+            # KESİLMEDEN devam eder (tek domain kaybı, toplu iş KAYBOLMAZ).
+            if ! ( _domain_repair "$domain" ); then
                 failed_domains+=("$domain")
             fi
         done < <(list_all_domains)
@@ -455,6 +598,12 @@ _domain_repair() {
         _domain_repair_ghost_report "$target"
         error "'${target}' bir srvctl domain'i gibi görünmüyor (web kullanıcısı yok) — onarım İPTAL EDİLDİ, yukarıya bakın."
     fi
+    # KUSUR 3 (designwestgate.art): ghost DEĞİLSE ama '.credentials' hiç
+    # yoksa, aşağıdaki 'read_credentials' hardened bir domainde fail-closed
+    # 'tamper' reddi verip repair'in KENDİSİNİ bloke ederdi — bkz.
+    # _domain_ensure_credentials başlık yorumu. Yalnız dosya GERÇEKTEN
+    # eksikse üretir, var olana DOKUNMAZ.
+    _domain_ensure_credentials "$target"
     read_credentials "$target"
     local base="${WEB_ROOT}/${target}"
     # PHP sürümü _derive_php ile DOĞRULANMIŞ biçimde alınır (assert_php_version) —
@@ -2884,13 +3033,26 @@ _domain_remove() {
 # ───────────────────────────────────────────────────────────────
 #  Tek domain dizini için liste satırı üret (saf, parse-not-source)
 #  Çıktı: domain|php|user|ssl|chroot
+#
+#  GÜVENLİK DENETİMİ EKİ (MADDE 1 — designwestgate.art HOST bulgusu): PHP
+#  sütunu ESKİDEN '.credentials' yoksa/PHP_VERSION alanı eksik/geçersizse
+#  koşulsuz 'DEFAULT_PHP_VERSION'a düşüyordu — bu bir UYDURMA değerdi (tam
+#  olarak 'web_html' kullanıcı adının uydurulması bug'ıyla AYNI SINIF: bir
+#  şeyin GERÇEKTEN doğrulanmış olduğu izlenimini veren, aslında hiç
+#  doğrulanmamış bir varsayılan). list_all_domains artık '.credentials'sız
+#  ama 'web_<sname>' kullanıcısı VAR olan gerçek domainleri de döndürdüğünden
+#  ('.credentials' eksik = PHP versiyonu operatöre BİLİNMİYOR demektir) bu
+#  fallback burada 'bilinmiyor' — KULLANICI sütunu ise fabrikasyon DEĞİL:
+#  'web_<sname>' her iki kapıdan (.credentials VEYA gerçek sistem kullanıcısı)
+#  geçmiş bir domain için zaten DOĞRU/doğrulanmış kimliktir (safe_name'den
+#  türetilir — _domain_add'in useradd'ı da AYNI kuralı kullanır).
 # ───────────────────────────────────────────────────────────────
 _domain_row() {
     local dir="$1"
     local domain sname php_ver user ssl chroot
     domain=$(basename "$dir")
     sname=$(safe_name "$domain")
-    php_ver="${DEFAULT_PHP_VERSION}"
+    php_ver="bilinmiyor"
     user="web_${sname}"
     ssl="❌"
     chroot="❌"
@@ -2913,8 +3075,15 @@ _domain_row() {
     # (bkz. _domain_render_fpm_unit) — yalnız pool.d'ye bakmak, izolasyona
     # geçmiş (yani DAHA GÜVENLİ) domainleri yanlışlıkla "chroot yok" gösterirdi.
     # _security_audit (lib/security.sh) zaten AYNI iki-yol desenini kullanıyor.
+    # PHP versiyonu 'bilinmiyor' ise (yukarı bkz.) paylaşılan pool.d yolu
+    # KURULAMAZ — uydurma bir sürüm numarasıyla var-olmayan bir yola bakıp
+    # SESSİZCE "❌" dönmek, gerçek bir kontrolmüş gibi görünmesin diye php_ver
+    # önce doğrulanır (assert_php_version); izole yol zaten PHP sürümünden
+    # BAĞIMSIZ olduğundan bu kısıtlamadan ETKİLENMEZ.
     local pool_conf="${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/${sname}.conf"
-    [[ -f "$pool_conf" ]] || pool_conf="${SRVCTL_PHP_POOL_DIR:-/etc/php/${php_ver}/fpm/pool.d}/${sname}.conf"
+    if [[ ! -f "$pool_conf" ]] && assert_php_version "$php_ver"; then
+        pool_conf="${SRVCTL_PHP_POOL_DIR:-/etc/php/${php_ver}/fpm/pool.d}/${sname}.conf"
+    fi
     if [[ -f "$pool_conf" ]]; then
         grep -q "chroot" "$pool_conf" 2>/dev/null && chroot="✅"
     fi
@@ -2935,8 +3104,16 @@ _domain_row() {
 # 'Toplam: N domain' sayacı bunu içeriyordu — aynı sunucuda AYNI ANDA
 # 'security audit' bu dizini HİÇ görmüyordu (iki komut aynı soruya farklı
 # cevap veriyordu). Artık TEK sözleşme: 'list_all_domains()' (kapı:
-# validate_domain + '.credentials' varlığı) — üç tüketici (list/audit/
-# repair --all) AYNI kümeyi görür.
+# validate_domain + ('.credentials' VAR OLMASI VEYA 'web_<sname>' sistem
+# kullanıcısının VARLIĞI) — üç tüketici (list/audit/repair --all) AYNI
+# kümeyi görür.
+#
+# GÜVENLİK DENETİMİ EKİ (MADDE 1 — designwestgate.art HOST bulgusu): ikinci
+# kapı eklendiğinden beri bu tablo artık '.credentials'ı OLMAYAN ama GERÇEK
+# (web kullanıcısı var) domainleri de gösterebilir — bu durumda PHP sütunu
+# 'bilinmiyor' basar (bkz. _domain_row başlık yorumu, uydurma değer YOK) ve
+# aşağıda AYRI bir dipnotla operatöre '.credentials' eksikliğinin onarılması
+# gerektiği AÇIKÇA söylenir (sessizce geçilmez).
 _domain_list() {
     echo ""
     echo -e "  ${BOLD}Kayıtlı Domain'ler${NC}"
@@ -2945,6 +3122,7 @@ _domain_list() {
     divider
 
     local count=0
+    local -a missing_creds=()
     local domain dir row php_ver user ssl chroot
     while IFS= read -r domain; do
         [[ -n "$domain" ]] || continue
@@ -2953,6 +3131,7 @@ _domain_list() {
         IFS='|' read -r domain php_ver user ssl chroot <<< "$row"
         printf "  %-30s %-8s %-15s %-6s %-8s\n" "$domain" "$php_ver" "$user" "$ssl" "$chroot"
         count=$((count + 1))
+        [[ -f "${dir}.credentials" ]] || missing_creds+=("$domain")
     done < <(list_all_domains)
 
     divider
@@ -2983,6 +3162,16 @@ _domain_list() {
     local unmanaged=$((total_dirs - count))
     if [[ "$unmanaged" -gt 0 ]]; then
         echo "  (${unmanaged} dizin listelenmedi: srvctl tarafından yönetilmiyor — ör. nginx'in varsayılan '/var/www/html' dizini. Ayrıntı için: ls ${WEB_ROOT})"
+    fi
+
+    # GÜVENLİK DENETİMİ EKİ (MADDE 1 — designwestgate.art HOST bulgusu): tabloda
+    # görünen ama '.credentials'ı OLMAYAN domainler AYRICA raporlanır — bu,
+    # yarım kalmış bir 'domain add' veya kaybolmuş/silinmiş bir '.credentials'
+    # işaretidir ve sessizce geçilmemesi gereken bir onarım ihtiyacıdır (PHP
+    # sütununda gösterilen 'bilinmiyor' bunun DOĞRUDAN sonucudur).
+    if [[ "${#missing_creds[@]}" -gt 0 ]]; then
+        warn "${#missing_creds[@]} domain '.credentials' dosyasına SAHİP DEĞİL (PHP sütununda 'bilinmiyor' bu yüzden gösteriliyor) — yarım kalmış bir kurulum/kayıp dosya işareti olabilir: ${missing_creds[*]}"
+        warn "  Onarım için: 'srvctl domain repair <domain>' (her biri için tek tek) veya 'srvctl domain repair --all'"
     fi
     echo ""
 }
@@ -3735,6 +3924,66 @@ _domain_rate_limit() {
         mv "$backup" "$conf"
         error "Nginx testi başarısız — değişiklik geri alındı. Profil değişmedi."
     fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  DOMAIN FRAMEWORK — mevcut bir domain'in framework beyanını DEĞİŞTİR
+#
+#  GÜVENLİK DENETİMİ EKİ (MADDE 2 — HOST'ta ölçülen KESİNTİ, Ubuntu 24.04,
+#  v1.0.0→v2.0.0 yükseltmesi): v1.0.0'da 'FRAMEWORK' anahtarı hiç YOKTU; bu
+#  yüzden yükseltme sonrası HİÇBİR eski domain'in '.srvctl-meta'sında bu
+#  anahtar yoktu. '_domain_framework_declared' beyan yokken BOŞ döner ve
+#  '_domain_disable_functions_for ""' SIKI listeyi (putenv DAHİL) uygular.
+#  CodeIgniter 4'ün DotEnv sınıfı (system/Config/DotEnv.php) putenv()
+#  KULLANIR, alternatifi YOKTUR — ölçülen sonuç:
+#    PHP Fatal error: Uncaught Error: Call to undefined function
+#    CodeIgniter\Config\putenv() ... DotEnv.php:98
+#  Site geri gelsin diye '.srvctl-meta'ya ELLE 'FRAMEWORK=ci4' yazmak
+#  ZORUNDA kalındı — 'domain' alt komutları arasında BUNU YAPAN bir komut
+#  YOKTU (add zaten 'add' anında sorar; mevcut bir domain için beyanı
+#  SONRADAN değiştirecek/düzeltecek hiçbir yol yoktu). Bu komut o boşluğu
+#  kapatır.
+#
+#  KARAR — repair'i BURADAN OTOMATİK ÇAĞIRMA: beyan değişikliği TEK BAŞINA
+#  hiçbir şeyi YENİDEN RENDER ETMEZ ('.srvctl-meta' yazmak pool.conf'u
+#  değiştirmez) — pool'un 'disable_functions'ının GERÇEKTEN uygulanması için
+#  'srvctl domain repair <domain>' ÇALIŞTIRILMALIDIR. Bu komut BUNU KENDİSİ
+#  yapmaz (yalnız AÇIKÇA önerir): 'domain repair' PHP-FPM'i (izole unit ya da
+#  paylaşılan master) YENİDEN BAŞLATIR — bir metadata komutunun operatörün
+#  hiç beklemediği bir anda servis kesintisine yol açması SÜRPRİZ olur (aynı
+#  'rate-limit'in nginx reload'ı GİBİ görünse de, o komut zaten sonunda
+#  KENDİSİ reload ediyor çünkü rate-limit değişikliği doğrudan vhost'a
+#  yazılıyor — burada ise iki ayrı komut/iki ayrı karar anı bilinçli olarak
+#  AYRILDI: "beyanı değiştir" ve "servisi yeniden başlat" operatörün AYRI
+#  AYRI onayladığı iki eylem olmalı).
+_domain_framework() {
+    local domain="${1:-}" value="${2:-}"
+    if [[ -z "$domain" || -z "$value" ]]; then
+        error "Kullanım: srvctl domain framework <domain> <ci4|laravel|symfony|none>"
+    fi
+    domain_exists "$domain" || error "Domain bulunamadı: ${domain}"
+
+    case "$value" in
+        ci4|laravel|symfony)
+            write_meta "$domain" "FRAMEWORK" "$value"
+            log_action "domain framework ${domain} → ${value}"
+            success "Framework beyanı güncellendi: ${domain} → ${value}"
+            if [[ "$value" == "ci4" ]]; then
+                warn "GÜVENLİK ÖDÜNÜ: 'ci4' beyanı bu domain'in PHP-FPM pool'unda 'putenv' fonksiyonunu AÇAR (disable_functions listesinden ÇIKARILIR) — bkz. _domain_disable_functions_for başlık yorumu: CodeIgniter 4'ün DotEnv sınıfı putenv() olmadan boot edemez, alternatifi yoktur. Bu BİLİNÇLİ bir ödün olarak kabul edilmiştir (process-spawn primitifleri framework fark etmeksizin HER ZAMAN kapalı kalır) — domain GERÇEKTEN CI4 ÇALIŞTIRMIYORSA bu beyanı yapmayın."
+            fi
+            ;;
+        none)
+            write_meta "$domain" "FRAMEWORK" ""
+            log_action "domain framework ${domain} → (temizlendi)"
+            success "Framework beyanı TEMİZLENDİ: ${domain} (artık AÇIK bir beyan YOK)"
+            warn "Beyan yokken 'disable_functions' SIKI listeye döner (putenv DAHİL kapalı) — domain gerçekten CI4 çalıştırıyorsa boot HATASI verebilir; bu durumda 'srvctl domain framework ${domain} ci4' ile yeniden beyan edin."
+            ;;
+        *)
+            error "Geçersiz framework: '${value}' (ci4|laravel|symfony|none olmalı)"
+            ;;
+    esac
+
+    warn "Bu beyan yalnız '.srvctl-meta'ya yazıldı — PHP-FPM pool'undaki 'disable_functions' listesinin fiilen değişmesi için YENİDEN RENDER edilmesi gerekiyor: 'srvctl domain repair ${domain}' çalıştırın. NOT: 'repair' PHP-FPM'i YENİDEN BAŞLATIR (kısa kesinti) — bu yüzden burada OTOMATİK çağrılmadı, operatör AYRI bir adımda onaylamalı."
 }
 
 # ═══════════════════════════════════════════════════════════════

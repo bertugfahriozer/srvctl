@@ -21,7 +21,7 @@ _srvctl_completions() {
     # 2. seviye — alt komutlar
     case "${COMP_WORDS[1]}" in
         domain)
-            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources staging migrate rate-limit repair worker scheduler"
+            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources staging migrate rate-limit framework repair worker scheduler"
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$domain_cmds" -- "$cur"))
             elif [[ ${COMP_CWORD} -eq 3 ]]; then
@@ -30,6 +30,9 @@ _srvctl_completions() {
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "add" ]]; then
                 # 'domain add' bayrak tamamlama (--redis-queue dahil)
                 COMPREPLY=($(compgen -W "--php= --rate= --sensitive= --framework= --resources= --no-ssl --redis-queue" -- "$cur"))
+            elif [[ ${COMP_CWORD} -eq 4 && "${COMP_WORDS[2]}" == "framework" ]]; then
+                # 'domain framework <domain> <deger>' — beyan değeri tamamlama
+                COMPREPLY=($(compgen -W "ci4 laravel symfony none" -- "$cur"))
             fi
             ;;
         deploy)

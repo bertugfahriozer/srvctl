@@ -306,6 +306,70 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   /etc/php/** r,
   /usr/lib/php/** mr,
 
+  # ─── Chroot İÇİNDEKİ kütüphaneler ('m') — ÜRETİM BULGUSU ───
+  # HOST ölçümü (gerçek üretim sunucusu, Ubuntu 24.04, per-domain FPM unit
+  # enforce moda alındıktan SONRA /var/log/audit/audit.log'da SÜREKLİ):
+  #   apparmor="DENIED" operation="file_mmap"
+  #   name="/var/www/dev.designwestgate.art/lib/x86_64-linux-gnu/libnss_systemd.so.2"
+  #   denied_mask="m"  comm="php-fpm8.4"
+  #
+  # KÖK NEDEN (koddan okundu, TAHMİN EDİLMEDİ — bkz. lib/domain.sh:
+  # '_apply_chroot_php_deps'): FPM'in chroot() jail kökü doğrudan
+  # '{{WEB_ROOT}}/{{DOMAIN}}'dir (pool.conf.tpl'deki 'chroot =' yönergesiyle
+  # AYNI — lib/domain.sh'ta 'base="${WEB_ROOT}/${domain}"'). Bu fonksiyon
+  # chroot'un İÇİNE üç hedefe kopya yapar: (1) php-fpm binary'sinin 'ldd'
+  # bağımlılıkları + ld-linux yükleyicisi ('mkdir -p "${base}${dir}"' —
+  # dirname'i ldd çıktısından gelir, Ubuntu'da tipik olarak
+  # '/lib/x86_64-linux-gnu' ve yükleyici için '/lib64'), (2) PHP eklenti
+  # (.so) dosyaları + ONLARIN bağımlılıkları ('mkdir -p "${base}${ext_dir}"'
+  # — ext_dir 'php -i'nin 'extension_dir'ı, Debian/Ubuntu paketleme
+  # kuralında HER ZAMAN '/usr/lib/php/<api-no>'), (3) NSS ve resolv
+  # modülleri — bu üçüncü hedef TEK TAM SABİT (literal) yoldur:
+  # 'mkdir -p "${base}/lib/x86_64-linux-gnu"' + 'cp -u /lib/x86_64-linux-gnu/
+  # libnss_* ...' — denial'daki 'libnss_systemd.so.2' TAM OLARAK BURADAN
+  # gelir.
+  #
+  # Yukarıdaki '{{WEB_ROOT}}/{{DOMAIN}}/** r,' bloğu bu chroot kopyalarını
+  # da kapsıyor AMA YALNIZ 'r' veriyor — 'm' (mmap) İÇERMİYOR. Dinamik
+  # linker'ın EXEC ANINDA yüklediği çekirdek kütüphaneler başka bir yoldan
+  # (php-fpm binary'sinin kendi 'mrix' izniyle exec-devralma) geçebiliyor,
+  # ama ÇALIŞMA ZAMANINDA dlopen(3) İLE yüklenen NSS modülleri (libnss_
+  # systemd, libnss_files vb. — glibc'nin ihtiyaç oldukça açtığı isteğe
+  # bağlı modüller) yalnız 'r' ile REDDEDİLİYORDU. 'libnss_systemd' isteğe
+  # bağlı olduğundan site ayakta kalıyor (SESSİZ bozulma) — ama kullanıcı/
+  # grup çözümlemesi gereken bir kod yolu (ör. posix_getpwuid()/getent
+  # üzerinden NSS'e düşen bir çağrı) gerçek bir kırılma üretebilirdi.
+  #
+  # YAZMA ('w') VERİLMEDİ: bu dizinler chroot İSKELETİNİN (root:root,
+  # salt okunur) parçasıdır — '_domain_apply_fs_ownership' (lib/domain.sh)
+  # chroot sistem dizinlerini recursive olarak root'a döndürür. 'w' eklemek
+  # ele geçirilmiş bir web_user sürecinin (privdrop SONRASI) kendi
+  # chroot'undaki paylaşılan kütüphaneleri DEĞİŞTİRMESİNE (ya da kötü
+  # niyetli bir '.so' enjekte edip sonraki bir çalıştırmada dlopen ile
+  # yükletmesine) kapı açardı — burada en az yetki (mmap+read) ilkesi
+  # korunuyor.
+  #
+  # YÜRÜTME ('x') VERİLMEDİ: bu chroot'ta ÇALIŞTIRILABİLİR bir dosya
+  # OLMAMALI — HOST'ta ölçüldü: 'usr/sbin', 'usr/bin', 'bin' chroot İÇİNDE
+  # BOŞ (yalnız paylaşılan kütüphaneler '_apply_chroot_php_deps' tarafından
+  # kopyalanıyor, hiçbir yürütülebilir ikili DEĞİL). 'x' vermek burada
+  # işlevsel bir ihtiyacı KARŞILAMAZ (paylaşılan kütüphaneler zaten yalnız
+  # mmap/read ile yüklenir, exec EDİLMEZ) ve tests/test_apparmor_deny_shadow
+  # .sh'ın exec-whitelist kilidini (Dedektör 2 — 'x' izinli TAM yol
+  # kümesini kilitler) GEREKSİZ yere genişletirdi.
+  {{WEB_ROOT}}/{{DOMAIN}}/lib/x86_64-linux-gnu/** mr,
+  {{WEB_ROOT}}/{{DOMAIN}}/lib64/** mr,
+  {{WEB_ROOT}}/{{DOMAIN}}/usr/lib/php/** mr,
+  # Bazı PHP eklenti bağımlılıkları ('_apply_chroot_php_deps'in ikinci
+  # döngüsü, 'ldd "$ext"' ÇALIŞMA ZAMANINDA çözülür — sabit DEĞİL) Ubuntu'nun
+  # usr-merge düzeninde 'usr/lib/x86_64-linux-gnu/' altına kopyalanmış
+  # olarak da raporlanabilir. HANGİ dizgenin fiilen kullanıldığı HOST'ta
+  # doğrulanmalı ('find {{WEB_ROOT}}/{{DOMAIN}}/usr/lib -type f'); bu satır
+  # profile-cli.tpl'deki '/bin/sh' + '/usr/bin/dash' çift-yol savunmacı
+  # deseniyle AYNI mantıkla (zarar YOK, boş/kullanılmayan bir dizin için
+  # 'mr' vermek no-op'tur) önceden eklendi.
+  {{WEB_ROOT}}/{{DOMAIN}}/usr/lib/x86_64-linux-gnu/** mr,
+
   # SSL sertifikaları (harici API çağrıları için)
   /etc/ssl/certs/** r,
   /usr/share/ca-certificates/** r,

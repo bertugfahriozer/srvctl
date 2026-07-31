@@ -52,6 +52,7 @@ _srvctl() {
                         'staging:Staging ortamı oluştur'
                         'migrate:Sunucular arası taşı'
                         'rate-limit:Rate-limit profili değiştir'
+                        'framework:Framework beyanını değiştir/temizle'
                         'repair:Chroot kütüphaneleri tamir et'
                         'worker:Kuyruk worker yönetimi'
                         'scheduler:Zamanlanmış görev yönetimi'
@@ -68,6 +69,15 @@ _srvctl() {
                             '--redis-queue:Redis EVAL/Lua scripting AÇIKÇA iste (Laravel kuyruk/Horizon; Redis 7+ gerekir, bayraksız HER ZAMAN kapalı)'
                         )
                         _describe 'domain add seçeneği' add_flags
+                    elif [[ "${words[2]:-}" == "framework" && ${#words} -ge 4 ]]; then
+                        local -a framework_values
+                        framework_values=(
+                            'ci4:CodeIgniter 4 (putenv AÇIK — bilinçli güvenlik ödünü)'
+                            'laravel:Laravel'
+                            'symfony:Symfony'
+                            'none:Beyanı temizle (sıkı disable_functions listesine dön)'
+                        )
+                        _describe 'framework değeri' framework_values
                     else
                         _describe 'domain işlemi' domain_cmds
                     fi

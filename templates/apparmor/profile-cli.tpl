@@ -142,6 +142,38 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # ─── Sistem Dosyaları (salt okuma) ───
   /etc/php/** r,
   /usr/lib/php/** mr,
+
+  # ─── Chroot kütüphaneleri ('m') — PARİTE/DEFANS-İÇİNDE-DEFANS ───
+  # (profile.tpl'deki AYNI blokla PARALEL tutulur — dosya başı NOT: "yeni
+  # bir yazma yolu eklerken İKİ dosyayı da değiştirmeyi unutmamalı".)
+  #
+  # BU PROFİL (worker/scheduler) chroot'SUZ host yollarında çalışır — systemd
+  # 'User={{WEB_USER}}' ile DAHA BAŞTAN unprivileged UID olarak execve edilir,
+  # chroot() syscall'ı YOK (bkz. templates/systemd/srvctl-worker.service.tpl
+  # satır ~41 NOT'u ve bu dosyanın başındaki "NEDEN AYRI PROFİL?" bloğu). Bu
+  # yüzden worker/scheduler süreci normal işleyişte NSS/glibc paylaşımlı
+  # kütüphanelerini GERÇEK HOST yollarından yükler ('#include <abstractions/
+  # base>' zaten bunu kapsıyor) — aşağıdaki kurallar bu sürecin GÜNLÜK
+  # İŞLEYİŞİ için ZORUNLU DEĞİLDİR.
+  #
+  # YİNE DE EKLENDİ: ÖLÇÜLEN kanıt profile.tpl'de (bkz. o dosyadaki
+  # 'operation="file_mmap" name=".../lib/x86_64-linux-gnu/libnss_systemd.so.2"
+  # denied_mask="m"' bulgusu — kök neden lib/domain.sh:_apply_chroot_php_deps).
+  # Yukarıdaki '{{WEB_ROOT}}/{{DOMAIN}}/** r,' bloğu bu profilde de aynı
+  # chroot kütüphane kopyalarını OKUMAYA zaten izin veriyor (yalnız 'r', 'm'
+  # yok) — iki profilin domain-ağacı bloklarını TUTARLI tutmak ve ileride bu
+  # iki profilin birleştirilmesi/worker'ın bir chroot varyantı alması gibi
+  # bir değişiklikte aynı boşluğun SESSİZCE yeniden keşfedilmesini önlemek
+  # için AYNI 'mr' kuralları burada da tanımlanır. Zarar YOK: bu yollar
+  # zaten '** r,' ile OKUNABİLİR durumda, yalnızca 'm' (mmap) EKLENİYOR —
+  # YAZMA ('w') ya da YÜRÜTME ('x') YOK (gerekçe profile.tpl'dekiyle BİREBİR
+  # aynı: kütüphaneler root:root salt-okunur kalmalı, bu ağaçta yürütülebilir
+  # bir dosya OLMAMALI).
+  {{WEB_ROOT}}/{{DOMAIN}}/lib/x86_64-linux-gnu/** mr,
+  {{WEB_ROOT}}/{{DOMAIN}}/lib64/** mr,
+  {{WEB_ROOT}}/{{DOMAIN}}/usr/lib/php/** mr,
+  {{WEB_ROOT}}/{{DOMAIN}}/usr/lib/x86_64-linux-gnu/** mr,
+
   /etc/ssl/certs/** r,
   /usr/share/ca-certificates/** r,
   /usr/share/zoneinfo/** r,

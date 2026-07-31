@@ -484,14 +484,36 @@ _domain_is_hardened() {
     [[ -f "${SRVCTL_STATE_DIR}/${1}/hardened" ]]
 }
 
-# Sahiplik politikası (PREDIKAT: 0=devam, 1=tamper → çağıran error eder).
-# root-owned değilse: hardened domain → tamper (1); migrate edilmemiş → warn + 0.
+# Sahiplik politikası (PREDİKAT: 0=devam, 1=tamper, 2=eksik → çağıran error eder).
+# root-owned değilse (bu hem "dosya hiç yok" hem "dosya var ama sahiplik/izin
+# bozuk" anlamına gelebilir — assert_root_owned_path ikisini de AYNI '1' ile
+# bildirir, bkz. o fonksiyonun başlık yorumu): hardened domain'de fail-closed
+# reddedilir, migrate edilmemiş domain'de yalnız warn + 0 (devam).
+#
+# GÜVENLİK DENETİMİ EKİ (KUSUR 2 — designwestgate.art HOST bulgusu): fail-
+# closed dalı ARTIK TEK bir '1'e İNDİRGENMİYOR. Öncesinde read_credentials/
+# read_meta bu dalın HER iki alt-durumuna da "root-owned değil (tamper)."
+# diyordu — ama üretimde 'designwestgate.art' için gerçek durum TAMPER
+# DEĞİLDİ: '.credentials' eski bir srvctl sürümünde HİÇ YAZILMAMIŞTI.
+# Operatör bu mesajı görünce sunucusunda kötü niyetli bir müdahale olduğunu
+# sanırdı (yanlış alarm) — ve bu, gerçek bir tamper olayının ciddiyetini de
+# aşındırırdı. Çağıranın DOĞRU mesajı basabilmesi için "hiç yok" (2) ile
+# "var ama bozuk" (1) burada ayrıştırılıyor. NOT: assert_root_owned_path'İN
+# KENDİSİ DEĞİŞMEDİ — paylaşılan bir yardımcı (bkz. lib/plugin.sh; ayrıca
+# tests/test_assert_root_owned.sh açıkça "yok" durumunun da '1' (fail)
+# saydığını kilitliyor) ve o tüketiciler için missing/tamper'ı AYNI
+# reddetmek zaten doğru davranış — ayrım yalnız BU özel (hardened-domain)
+# karar noktasında, çağırana ek bilgi olarak yapılıyor.
+#
 # warn() ARTIK KENDİLİĞİNDEN stderr'e yazar (KARAR 1) — elle '>&2' gerekmez.
 _require_owned_or_warn() {
     local domain="$1" file="$2"
     assert_root_owned_path "$file" && return 0
     if _domain_is_hardened "$domain"; then
-        return 1
+        if [[ -e "$file" ]]; then
+            return 1   # var ama sahiplik/izin bozuk → gerçek tamper
+        fi
+        return 2       # hiç yok → eksik (tamper DEĞİL — bkz. yukarı)
     fi
     warn "Domain '${domain}' henüz hardened değil — 'srvctl security harden-fs ${domain}' önerilir"
     return 0
@@ -651,19 +673,48 @@ service_is_active() {
 #   ❌ FAIL  html: AppArmor enforce DEĞİL
 # Yalnız gürültü değil: 'harden-fs --all' / 'domain repair --all' /
 # 'deploy prune --all' gibi TOPLU komutlar da bu sahte girdiyi işlemeye
-# çalışır. Ayırt edici işaret '.credentials' — 'domain add' her domain için
-# root:600 olarak yazar (bkz. _domain_write_credentials); nginx'in html
-# dizininde bulunmaz.
+# çalışır. Ayırt edici işaret '.credentials' olarak seçildi — 'domain add'
+# her domain için root:600 olarak yazar (bkz. _domain_write_credentials);
+# nginx'in html dizininde bulunmaz.
+#
+# GÜVENLİK DENETİMİ EKİ (REGRESYON — HOST'ta ölçüldü, Ubuntu 24.04 üretim,
+# v1.0.0→v2.0.0 yükseltmesi): '.credentials' kapısı hayaletleri doğru elerken
+# GERÇEK ama EKSİK-KURULMUŞ domainleri de sessizce eliyordu. Ölçülen örnek:
+# 'designwestgate.art' — CANLI, HTTP 200 dönen gerçek bir domain — 'web_
+# designwestgate_art' sistem kullanıcısına, FPM pool'una, nginx vhost'una
+# sahipti AMA '.credentials' dosyası YOKTU (muhtemelen 'domain add' yarıda
+# kesilmiş — bu dosya add akışında GEÇ yazılır). Sonuç: 'domain list' onu
+# göstermiyordu, 'domain repair --all' hayalet sayıp ATLIYORDU, 'security
+# audit' onu HİÇ denetlemiyordu — ve en kötüsü, AppArmor profili hiç
+# oluşturulmamış olduğu halde bu durum HİÇBİR YERDE raporlanmıyordu (MAC
+# korumasız canlı bir site, srvctl'in kendi körlüğü yüzünden görünmez).
+#
+# DÜZELTME: kapı artık İKİ YOLLU (OR) — '.credentials' VAR OLMASI YETERLİ
+# (mevcut davranış KORUNDU) AMA TEK GEÇERLİ YOL DEĞİL: 'web_<sname>' Linux
+# sistem kullanıcısının VARLIĞI da domain'i GERÇEK sayar. Bu ikinci sinyal
+# '_domain_repair_is_ghost' (lib/domain.sh) İLE BİREBİR AYNI gerekçeye
+# dayanır — o fonksiyonun başlık yorumuna bkz.: 'useradd' bu kod tabanında
+# YALNIZCA '_domain_add'in ilk adımında çağrılır, 'repair' (ya da başka
+# hiçbir onarım/denetim akışı) bu kullanıcıyı KENDİSİ ASLA üretemez. Yani bu
+# sinyal kendi kendini doğrulayan bir döngü OLUŞTURAMAZ (nginx'in
+# '/var/www/html'i yine elenir: 'web_html' diye bir sistem kullanıcısı YOK).
+# Sonuç: hayaletler yine elenir, eksik-kurulmuş GERÇEK domainler artık
+# görünür kalır — üç tüketici de (domain list / domain repair --all /
+# security audit) AYNI genişletilmiş kümeyi görür (tek sözleşme korunur).
 list_all_domains() {
-    local dir name
+    local dir name sname
     for dir in "${WEB_ROOT}"/*/; do
         [[ -d "$dir" ]] || continue
         name=$(basename "$dir")
         # Domain adı kuralına uymayan dizinleri ele (savunma derinliği)
         validate_domain "$name" || continue
-        # srvctl tarafından oluşturulmuş mu? (.credentials = domain işareti)
-        [[ -f "${dir}.credentials" ]] || continue
-        printf '%s\n' "$name"
+        sname=$(safe_name "$name")
+        # İki-yollu kapı (OR): '.credentials' VAR OLMASI YETERLİ; DEĞİLSE
+        # 'web_<sname>' sistem kullanıcısının VARLIĞI da domain'i GERÇEK sayar
+        # (gerekçe yukarıda). İkisi de yoksa hayalet — atla.
+        if [[ -f "${dir}.credentials" ]] || id "web_${sname}" &>/dev/null; then
+            printf '%s\n' "$name"
+        fi
     done
 }
 
@@ -682,8 +733,19 @@ list_all_domains() {
 read_credentials() {
     local domain="$1"
     local creds_file="${WEB_ROOT}/${domain}/.credentials"
-    _require_owned_or_warn "$domain" "$creds_file" \
-        || error "Güvenlik: ${creds_file} root-owned değil (tamper). Okuma reddedildi."
+    # GÜVENLİK DENETİMİ EKİ (KUSUR 2 — designwestgate.art): _require_owned_or_warn
+    # artık "eksik" (2) ile "tamper" (1) döndürüyor (bkz. o fonksiyonun başlık
+    # yorumu) — ESKİDEN ikisi de AYNI "(tamper). Okuma reddedildi." mesajını
+    # basıyordu; dosya HİÇ YAZILMAMIŞ bir domain (ör. eski srvctl sürümü) için
+    # bu yanlış alarmdı. 'local _co_rc=$(...)' YAZILMADI (Bash tuzağı: exit
+    # status'u maskeler) — '||' ile yakalanıp ayrı bir değişkende tutuluyor.
+    local _co_rc=0
+    _require_owned_or_warn "$domain" "$creds_file" || _co_rc=$?
+    if [[ "$_co_rc" -eq 2 ]]; then
+        error "Güvenlik: ${creds_file} eksik — bu domain hardened ama '.credentials' hiç oluşturulmamış (ör. eski bir srvctl sürümünde eklenmiş domain). Bu TAMPER DEĞİL. Kurtarma: 'srvctl domain repair ${domain}' dosyayı gözlemlenen durumdan (PHP sürümü, web kullanıcısı) yeniden üretmeyi dener — DB/Redis parolası bilinmiyorsa boş bırakılır, kullanıyorsanız elle tamamlamanız gerekir."
+    elif [[ "$_co_rc" -ne 0 ]]; then
+        error "Güvenlik: ${creds_file} root-owned değil (tamper). Okuma reddedildi."
+    fi
     DOMAIN="" SAFE_NAME="" WEB_USER="" PHP_VERSION=""
     DB_NAME="" DB_USER="" DB_PASS=""
     REDIS_USER="" REDIS_PASS="" REDIS_PREFIX=""
@@ -1093,6 +1155,12 @@ _redis_acl_load() {
 read_meta() {
     local meta_file="${WEB_ROOT}/${1}/.srvctl-meta"
     [[ -f "$meta_file" ]] || return 0
+    # KUSUR 2 NOTU: _require_owned_or_warn artık "eksik" (2) ile "tamper" (1)
+    # ayrımı yapıyor (bkz. core.sh:_require_owned_or_warn) ama BURADA sabit
+    # "(tamper)" mesajı hâlâ DOĞRU — bir satır yukarıdaki '[[ -f ]] || return 0'
+    # dosyanın VAR OLDUĞUNU zaten garanti ettiğinden, bu satıra ulaşıldığında
+    # dönüş değeri asla 2 (eksik) olamaz. Bu guard'ı kaldırırsanız
+    # read_credentials'taki case ayrımını buraya da taşıyın.
     _require_owned_or_warn "$1" "$meta_file" \
         || error "Güvenlik: ${meta_file} root-owned değil (tamper). Okuma reddedildi."
     read_kv_file "$meta_file" RATE_PROFILE SENSITIVE_PATHS

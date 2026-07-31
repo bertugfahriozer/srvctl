@@ -146,18 +146,166 @@ _deploy_http_code() {
 }
 
 # Kabul edilen HTTP kodu mu? PREDİKAT (0=kabul 1=değil). DEPLOY_HEALTH_OK_CODES
-# (core.sh/load_config, boşlukla ayrılmış) TEK doğruluk kaynağıdır — üç çağrı
-# yerinde de (deploy/rollback/health) burası kullanılır; hardcoded regex YOK.
-# 404/403 KASITLI OLARAK varsayılanda yok (composer/vendor kurulmamış bir
-# release nginx 404 dönebilir ve "sağlıklı" sayılıp canlıya alınabilirdi).
+# (core.sh/load_config, boşlukla ayrılmış) GLOBAL TEK doğruluk kaynağıdır —
+# üç çağrı yerinde de (deploy/rollback/health) burası kullanılır; hardcoded
+# regex YOK. 404/403 KASITLI OLARAK varsayılanda yok (composer/vendor
+# kurulmamış bir release nginx 404 dönebilir ve "sağlıklı" sayılıp canlıya
+# alınabilirdi).
+#
+# PER-DOMAIN OVERRIDE (üretim bulgusu): bazı staging/preview siteleri
+# UYGULAMA SEVİYESİNDE HTTP Basic auth ile korunur ve kimliksiz isteğe
+# BİLİNÇLİ olarak 401 döner — bu "site kırık" değil "site doğru davranıyor"
+# demektir. GLOBAL DEPLOY_HEALTH_OK_CODES'u 401 içerecek şekilde gevşetmek
+# TÜM domainlerde gerçek bir 401 arızasını görünmez kılardı; bu yüzden
+# gevşetme TEK bir domain'e '.srvctl-meta' üzerinden hapsedilir (anahtar:
+# HEALTH_OK_CODES — FRAMEWORK/RUN_MIGRATIONS/KEEP_GIT ile AYNI desen,
+# _deploy_read_meta). NOT: bu anahtar 'lib/security.sh:_meta_known_keys'
+# beyaz listesine EKLENMELİDİR — o dosya bu modülün kapsamı DIŞINDA
+# olduğundan (bkz. görev talimatı) buraya sadece TÜKETİCİ tarafı eklendi;
+# whitelist eklemesi ayrıca iletilmelidir, yoksa 'harden-fs --apply' bu
+# anahtarı SESSİZCE atar (meta yeniden yazılırken kaybolur).
+#
+# Tasarım kararı: iki makul yoldan (a) meta anahtarı ile kod listesini
+# GENİŞLETMEK, (b) probe'un '/' yerine uygulamanın sağladığı ayrı bir
+# '/health' yoluna vurması — burada (a) seçildi. Gerekçe: (b) kavramsal
+# olarak daha temiz olurdu ama HER framework/uygulamanın böyle bir uç nokta
+# sağlamasını (ve onu auth gate'inin DIŞINDA tutmasını) GEREKTİRİR — bu
+# operatörün kontrolünde değil, uygulama geliştiricisinin işbirliğine
+# bağlıdır. (a) depoda zaten kurulu per-domain meta-override desenini
+# (FRAMEWORK/RUN_MIGRATIONS/KEEP_GIT) izler, uygulama tarafında HİÇBİR
+# değişiklik gerektirmeden HEMEN çalışır ve geri alınması kolaydır (meta
+# satırını silmek yeterli). (b) ileride ayrıca eklenebilir; ikisi ile
+# ÇELİŞMEZ.
 _deploy_health_ok() {
-    local code="$1" c
-    for c in ${DEPLOY_HEALTH_OK_CODES:-200 301 302}; do
+    local code="$1" domain="${2:-}" c codes
+    codes=$(_deploy_health_codes "$domain")
+    codes="${codes%%|*}"
+    for c in $codes; do
         if [[ "$code" == "$c" ]]; then
             return 0
         fi
     done
     return 1
+}
+
+# Boşlukla ayrılmış bir HTTP kodu listesinin HER ÖĞESİ geçerli mi?
+# PREDİKAT (0=geçerli). core.sh/validate_http_code'u (100-599, 3 haneli)
+# YENİDEN KULLANIR — core.sh/load_config GLOBAL DEPLOY_HEALTH_OK_CODES'u
+# ZATEN aynı fonksiyonla doğruluyor (bkz. load_config); burada TEK fark
+# global taraf geçersizde error() ile ÇIKAR (conf dosyası root-owned/
+# güvenilir), bu taraf ise geçersizde SESSİZCE reddeder (meta web-yazılabilir
+# olabilir — bkz. _deploy_read_meta sahiplik notu; sıkılaştırma her zaman
+# AÇIK ve GEÇERLİ beyan ister, geçersiz beyan asla varsayılanı GENİŞLETMEZ).
+_deploy_health_codes_valid() {
+    local codes="$1" c
+    [[ -n "$codes" ]] || return 1
+    for c in $codes; do
+        validate_http_code "$c" || return 1
+    done
+    return 0
+}
+
+# Domain için EFEKTİF kabul edilen HTTP kodu listesini çözer.
+# stdout: "<kodlar>|override|"  (geçerli per-domain override VARSA)
+#      ya "<kodlar>|default|"   (override yok/domain boş)
+#      ya "<global-kodlar>|default|<ham-geçersiz-değer>" (override VARDI ama
+#         biçimi geçersizdi — global'e düşüldü, ham değer tanılama için
+#         3. alanda taşınır; çağıran bunu bir kerelik uyarıya çevirir, bkz.
+#         _deploy_health_report_override — retry döngüsünde TEKRAR TEKRAR
+#         aynı uyarı basılmasın diye bu fonksiyonun KENDİSİ SESSİZDİR).
+_deploy_health_codes() {
+    local domain="${1:-}"
+    local default_codes="${DEPLOY_HEALTH_OK_CODES:-200 301 302}"
+    if [[ -n "$domain" ]]; then
+        local HEALTH_OK_CODES=""
+        _deploy_read_meta "$domain" HEALTH_OK_CODES
+        if [[ -n "${HEALTH_OK_CODES:-}" ]]; then
+            if _deploy_health_codes_valid "$HEALTH_OK_CODES"; then
+                echo "${HEALTH_OK_CODES}|override|"
+                return 0
+            fi
+            echo "${default_codes}|default|${HEALTH_OK_CODES}"
+            return 0
+        fi
+    fi
+    echo "${default_codes}|default|"
+}
+
+# Görünürlük (görev şartı #2): bir domain'de per-domain HEALTH_OK_CODES
+# override'ı YÜRÜRLÜKTEYSE bunu operatöre AÇIKÇA bildirir — özellikle probe
+# kodunun GLOBAL varsayılanda ölümcül sayılıp bu domain'de KABUL EDİLDİĞİ
+# durumda kodu adıyla anar. warn() (core.sh) stderr'e yazar; bu bilinçli bir
+# güvenlik/erişilebilirlik ödününün deploy/rollback/health çıktısında
+# SESSİZCE kaybolmaması için tercih edildi (success/info değil).
+# ÇAĞRI SÖZLEŞMESİ: retry döngüsünün (_health_probe) İÇİNDEN DEĞİL, probe
+# SONUÇLANDIKTAN SONRA, çağrı başına BİR KEZ çağrılmalıdır — aksi halde her
+# retry denemesinde aynı uyarı tekrarlanırdı.
+_deploy_health_report_override() {
+    local domain="$1" code="$2"
+    [[ -n "$domain" ]] || return 0
+
+    local default_codes="${DEPLOY_HEALTH_OK_CODES:-200 301 302}"
+    local resolved codes src invalid_raw
+    resolved=$(_deploy_health_codes "$domain")
+    codes="${resolved%%|*}"
+    local _rest="${resolved#*|}"
+    src="${_rest%%|*}"
+    invalid_raw="${_rest#*|}"
+
+    if [[ -n "$invalid_raw" ]]; then
+        warn "Geçersiz .srvctl-meta HEALTH_OK_CODES değeri: '${invalid_raw}' — yalnız boşlukla ayrılmış 3 haneli HTTP kodları (100-599) kabul edilir; global ayar (${default_codes}) kullanıldı"
+    fi
+
+    [[ "$src" == "override" ]] || return 0
+
+    warn "Sağlık kontrolü: bu domain için özelleştirilmiş kabul edilen HTTP kodları YÜRÜRLÜKTE (.srvctl-meta: HEALTH_OK_CODES=\"${codes}\" — global varsayılan: \"${default_codes}\")"
+
+    local c is_extra=1
+    for c in $default_codes; do
+        if [[ "$code" == "$c" ]]; then
+            is_extra=0
+            break
+        fi
+    done
+    if [[ "$is_extra" == "1" ]]; then
+        for c in $codes; do
+            if [[ "$code" == "$c" ]]; then
+                warn "Sağlık kontrolü: HTTP ${code} bu domain için (.srvctl-meta: HEALTH_OK_CODES) KABUL EDİLEN kod olarak yapılandırılmış — global varsayılanda bu kod ÖLÜMCÜL sayılırdı. Bu bilinçli bir güvenlik/erişilebilirlik ödünüdür."
+                break
+            fi
+        done
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────
+#  KOORDİNASYON BULGUSU (HOST, dev.designwestgate.art): per-domain
+#  HEALTH_OK_CODES İŞLEVSEL olarak doğru çalışıyordu (401 kabul edildi,
+#  rollback tetiklenmedi) ama görünürlük satırı GERÇEK deploy çıktısında
+#  HİÇ görünmüyordu — oysa '_deploy_health_report_override'ı İZOLE
+#  çağırmak (bkz. tests/test_deploy_health_per_domain.sh) doğru çıktı
+#  üretiyordu. "Halka doğru, zincir yanlış" sınıfı bir hataydı: probe +
+#  görünürlük çağrısı ÜÇ AYRI çağrı yerinde (_deploy_run/_deploy_rollback/
+#  _deploy_health) elle TEKRARLANIYORDU — bu, "bir yerde eklendi, başka
+#  bir yerde unutuldu/güncel değildi" riskini YAPISAL olarak taşıyordu.
+#
+#  DÜZELTME: adım 9'un (probe + görünürlük) TEK KAYNAĞI burası. Üç çağrı
+#  yeri de ARTIK bunu çağırır — aynı iki satırı üç kez elle tekrar etmek
+#  yerine. Bu, "görünürlük çağrısı bir call-site'da eksik kaldı" sınıfı
+#  regresyonu YAPISAL olarak İMKANSIZ hale getirir: değiştirilecek TEK
+#  yer var.
+#
+#  stdout: HTTP kodu (_health_probe ile AYNI sözleşme — çağıran
+#  'code=$(_deploy_health_gate "$domain")' ile yakalar).
+#  KABUL/RED KARARI BURADA VERİLMEZ (bkz. dosya başındaki H6 yorumu:
+#  'code=$(...)' bir ATAMA ifadesidir, son komutun BAŞARISIZ dönüşü
+#  'set -e' altında script'i SESSİZCE öldürebilir) — bu yüzden fonksiyonun
+#  SON komutu her zaman başarılı 'echo'dur; çağıran kararı HER ZAMAN ayrı
+#  bir 'if _deploy_health_ok "$code" "$domain"' ile verir (değişmedi).
+_deploy_health_gate() {
+    local domain="$1"
+    local code; code=$(_health_probe "$domain")
+    _deploy_health_report_override "$domain" "$code"
+    echo "$code"
 }
 
 # Sağlık kontrolü — RETRY'lı. 'systemctl reload' asenkron döner ve
@@ -181,7 +329,7 @@ _health_probe() {
         # dönüyor, ama bu çağrı yine de aynı errexit-maskeleme sınıfına karşı
         # kendi başına sağlam olsun diye korunuyor.
         code=$(_deploy_http_code "$domain") || code="000"
-        if _deploy_health_ok "$code"; then
+        if _deploy_health_ok "$code" "$domain"; then
             break
         fi
         if (( attempt >= retries )); then
@@ -2186,8 +2334,8 @@ _deploy_run() {
 
     # 9. Health check + gerekirse otomatik rollback
     step "9/9" "Sağlık kontrolü..."
-    local code; code=$(_health_probe "$domain")
-    if _deploy_health_ok "$code"; then
+    local code; code=$(_deploy_health_gate "$domain")
+    if _deploy_health_ok "$code" "$domain"; then
         success "Sağlık kontrolü OK (HTTP ${code})"
         _run_hook "${shared_dir}/hooks/post-deploy.sh" "${release_dir}" "${domain}" "${web_user}"
         _deploy_restart_workers "$domain"
@@ -2329,8 +2477,8 @@ _deploy_rollback() {
         || error "Rollback (current) symlink'i kurulamadı: ${base}/current"
     _deploy_reload_fpm "$php_version" "$sname"
 
-    local code; code=$(_health_probe "$domain")
-    if _deploy_health_ok "$code"; then
+    local code; code=$(_deploy_health_gate "$domain")
+    if _deploy_health_ok "$code" "$domain"; then
         success "Rollback başarılı: $(basename "$prev") (HTTP ${code})"
         _deploy_restart_workers "$domain"
         _deploy_notify "Manuel Rollback: ${domain}" "$(basename "$prev") sürümüne dönüldü (HTTP ${code})." "info"
@@ -2348,8 +2496,8 @@ _deploy_health() {
     local domain="$1"
     [[ -z "$domain" ]] && error "Kullanım: srvctl deploy health <domain>"
     domain_exists "$domain" || error "Domain bulunamadı: ${domain}"
-    local code; code=$(_health_probe "$domain")
-    if _deploy_health_ok "$code"; then
+    local code; code=$(_deploy_health_gate "$domain")
+    if _deploy_health_ok "$code" "$domain"; then
         success "${domain} sağlıklı (HTTP ${code})"
     else
         error "${domain} sağlıksız (HTTP ${code})"

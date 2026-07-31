@@ -435,8 +435,8 @@ _check_fpm_isolation() {
 # ───────────────────────────────────────────────────────────────
 #  Cross-module yükleyici: harden-fs/harden-fpm domain.sh'taki
 #  _domain_fs_plan / _domain_apply_fs_ownership / _fs_record_before /
-#  _fs_revert / _domain_render_fpm_unit / _domain_activate_fpm_unit
-#  fonksiyonlarına muhtaç. bin/srvctl `_load_and_run` YALNIZ tek modülü
+#  _fs_revert / _domain_render_fpm_unit / _domain_activate_fpm_unit /
+#  _domain_ensure_credentials fonksiyonlarına muhtaç. bin/srvctl `_load_and_run` YALNIZ tek modülü
 #  source ettiğinden bu fonksiyonlar runtime'da tanımsızdı (command not
 #  found → 127). Testler her iki modülü de source ettiği için bunu
 #  göremiyordu. PREDİKAT: 0=yüklendi, 1=yüklenemedi (çağıran error eder).
@@ -502,7 +502,15 @@ _meta_known_keys() {
     # profilleri). Whitelist'te olmazlarsa 'harden-fs --apply' meta'yı yeniden
     # yazarken bu iki satırı SESSİZCE atar → domain bir sonraki repair/add'de
     # varsayılana döner (izolasyon kapanır, profil 'standard'a düşer).
-    echo "RATE_PROFILE SENSITIVE_PATHS FRAMEWORK RUN_MIGRATIONS KEEP_GIT REDIS_SCRIPTING REDIS_CHANNEL_ISOLATION ISOLATED_FPM RESOURCE_PROFILE"
+    #
+    # HEALTH_OK_CODES: RUN_MIGRATIONS/KEEP_GIT/ISOLATED_FPM ile AYNI kategori
+    # — kod hiçbir zaman 'write_meta' ile YAZMAZ, yalnız operatör elle
+    # '.srvctl-meta'ya koyar ve lib/deploy.sh:_deploy_health_codes OKUR
+    # (per-domain deploy sağlık kontrolü kabul listesi override'ı — ör. Basic
+    # auth arkasındaki staging site 401 döndüğünde). Whitelist'te olmazsa
+    # 'harden-fs --apply' bu satırı SESSİZCE atar, operatörün ayarı kaybolur
+    # ve bir sonraki deploy YİNE otomatik rollback tetikler.
+    echo "RATE_PROFILE SENSITIVE_PATHS FRAMEWORK RUN_MIGRATIONS KEEP_GIT REDIS_SCRIPTING REDIS_CHANNEL_ISOLATION ISOLATED_FPM RESOURCE_PROFILE HEALTH_OK_CODES"
 }
 
 # Anahtar bilinen listede mi? (PREDİKAT: 0=evet)
@@ -521,7 +529,11 @@ _meta_key_known() {
 # AYNI), FRAMEWORK → ci4|laravel|symfony whitelist (_domain_read_framework ile
 # AYNI liste), RUN_MIGRATIONS/KEEP_GIT → validate_bool (core.sh, lib/deploy.sh
 # okuma yeriyle AYNI), REDIS_SCRIPTING → enabled|disabled|unknown ('unknown'
-# _domain_redis_scripting_mode'un kendisinin ürettiği MEŞRU bir değerdir).
+# _domain_redis_scripting_mode'un kendisinin ürettiği MEŞRU bir değerdir),
+# HEALTH_OK_CODES → boşlukla ayrılmış HTTP kodu listesi; HER öğe
+# core.sh/validate_http_code'dan geçmeli — lib/deploy.sh/_deploy_health_codes_valid
+# ile AYNI doğrulayıcı (yeni regex uydurulmadı). Boş değer GEÇERSİZDİR: boş
+# liste hiçbir kodu kabul etmez ve HER deploy'u sessizce geri aldırırdı.
 _meta_validate_value() {
     local key="$1" value="$2"
     case "$key" in
@@ -540,6 +552,18 @@ _meta_validate_value() {
         # Kaynak profili — conf/resource-profiles.conf'ta TANIMLI olmalı.
         # RATE_PROFILE ile aynı desen: profil satırı yoksa değer geçersiz sayılır.
         RESOURCE_PROFILE) [[ -n "$(resource_profile_line "$value" 2>/dev/null)" ]] ;;
+        # Per-domain deploy sağlık kontrolü kabul listesi override'ı —
+        # lib/deploy.sh:_deploy_health_codes_valid ile AYNI doğrulama: her
+        # öğe validate_http_code'dan geçmeli, boş değer REDDEDİLİR (boş
+        # liste hiçbir kodu kabul etmez → her deploy geri alınır).
+        HEALTH_OK_CODES)
+            local c
+            [[ -n "$value" ]] || return 1
+            for c in $value; do
+                validate_http_code "$c" || return 1
+            done
+            return 0
+            ;;
         *)               return 1 ;;
     esac
 }
@@ -943,20 +967,49 @@ _security_harden_fs() {
             *)        domain="$arg" ;;
         esac
     done
-    local targets=() d
+
+    # GÜVENLİK DENETİMİ EKİ (KUSUR 1 İLE AYNI SINIF — bkz. _security_harden_fpm
+    # ve lib/domain.sh:_domain_repair '--all' bloğundaki BİREBİR AYNI gerekçe):
+    # '_harden_fs_dry/apply' -> '_domain_read_framework' -> 'read_meta' zinciri,
+    # hardened+tamper'lı bir '.srvctl-meta'da error() (=exit) çağırabilir.
+    # Çıplak çağrıda bu TÜM '--all' toplu işlemini sessizce yarıda keser — bir
+    # sonraki domain hiç işlenmez, özet asla basılmaz. Alt-kabuk ('( ... )')
+    # 'exit'i kabuğa hapseder; dönüş kodu normal şekilde '$?' ile gelir, döngü
+    # KESİLMEDEN devam eder. Tek-domain çağrısı BİLEREK subshell'siz bırakıldı
+    # (orada koşulsuz exit zaten doğru/beklenen davranıştır).
     if $all; then
-        mapfile -t targets < <(list_all_domains)
-    else
-        [[ -z "$domain" ]] && error "Kullanım: srvctl security harden-fs <domain>|--all [--apply|--revert]"
-        targets=("$domain")
+        # 'mapfile' YERİNE 'while read < <(...)' (lib/domain.sh:_domain_repair
+        # '--all' bloğuyla AYNI idiom, bkz. CLAUDE.md "Bash tuzakları" —
+        # 'cmd | while read' subshell'de çalışır ama '< <(cmd)' çalışmaz):
+        # 'mapfile' bash 4+ builtin'idir; Ubuntu 22.04/24.04'te sorun yok ama
+        # bu tekilleştirme ayrıca kodu macOS dev makinesinin eski bash 3.2'sinde
+        # de test edilebilir kılar (repoda BAŞKA hiçbir yerde 'mapfile'a
+        # gerek yoktu, bkz. domain.sh).
+        local -a failed=()
+        local total=0 d
+        while IFS= read -r d; do
+            [[ -n "$d" ]] || continue
+            total=$((total + 1))
+            case "$mode" in
+                dry)    ( _harden_fs_dry "$d" )    || failed+=("$d") ;;
+                apply)  ( _harden_fs_apply "$d" )  || failed+=("$d") ;;
+                revert) ( _harden_fs_revert "$d" ) || failed+=("$d") ;;
+            esac
+        done < <(list_all_domains)
+        if [[ "${#failed[@]}" -gt 0 ]]; then
+            warn "harden-fs TAMAMLANAMADI: ${#failed[@]}/${total} domain başarısız: ${failed[*]}"
+            warn "Her biri için ayrıntılı hata yukarıda — tek tek 'srvctl security harden-fs <domain> --apply' ile tekrar deneyin."
+            return 1
+        fi
+        return 0
     fi
-    for d in "${targets[@]}"; do
-        case "$mode" in
-            dry)    _harden_fs_dry "$d" ;;
-            apply)  _harden_fs_apply "$d" ;;
-            revert) _harden_fs_revert "$d" ;;
-        esac
-    done
+
+    [[ -z "$domain" ]] && error "Kullanım: srvctl security harden-fs <domain>|--all [--apply|--revert]"
+    case "$mode" in
+        dry)    _harden_fs_dry "$domain" ;;
+        apply)  _harden_fs_apply "$domain" ;;
+        revert) _harden_fs_revert "$domain" ;;
+    esac
 }
 
 # Dry-run: hedef modeli + mevcut durumu yaz, hiçbir şeye dokunma.
@@ -1077,18 +1130,53 @@ _security_harden_fpm() {
             *)       domain="$arg" ;;
         esac
     done
-    local targets=() d
-    if $all; then mapfile -t targets < <(list_all_domains)
-    else [[ -z "$domain" ]] && error "Kullanım: srvctl security harden-fpm <domain>|--all [--apply]"; targets=("$domain"); fi
     # NOT: 'cond && apply || dry' YAZMA — bu yapı `set -e`'yi tüm çağrı zinciri
     # boyunca devre dışı bırakır (apply içindeki her hata sessizce yutulur).
-    for d in "${targets[@]}"; do
-        if [[ "$mode" == "apply" ]]; then
-            _harden_fpm_apply "$d"
-        else
-            _harden_fpm_dry "$d"
+
+    # GÜVENLİK DENETİMİ EKİ (KUSUR 1 — designwestgate.art, bkz.
+    # lib/domain.sh:_domain_repair '--all' bloğundaki BİREBİR AYNI gerekçe):
+    # '_harden_fpm_apply' -> '_derive_php' -> 'read_credentials' zinciri,
+    # hardened+'.credentials'sız bir domainde error() (=exit) çağırabilir
+    # (KUSUR 3 kurtarması '_domain_ensure_credentials' eklendikten SONRA bile
+    # — ör. domain.sh yüklenemezse, ya da GERÇEK bir tamper). Çıplak çağrıda
+    # bu TÜM '--all' toplu işlemini sessizce yarıda keser: bir sonraki domain
+    # hiç işlenmez, "TAMAMLANAMADI" özeti asla basılmaz (tam olarak
+    # 'set -euo pipefail' altında korunmasız '$(...)' başarısızlığının
+    # davranışı). Alt-kabuk ('( ... )') 'exit'i kabuğa hapseder; dönüş kodu
+    # normal şekilde '$?' ile gelir, döngü KESİLMEDEN devam eder. Tek-domain
+    # çağrısı (aşağıda) BİLEREK subshell'siz bırakıldı — orada koşulsuz exit
+    # zaten doğru/beklenen davranıştır (bkz. lib/domain.sh:_domain_repair'in
+    # tekil yolu — AYNI ayrım).
+    if $all; then
+        # 'mapfile' YERİNE 'while read < <(...)' — bkz. _security_harden_fs'teki
+        # BİREBİR AYNI gerekçe (lib/domain.sh:_domain_repair '--all' idiomu;
+        # 'mapfile' bash 4+ gerektirir, bu tekilleştirme macOS dev makinesinin
+        # eski bash 3.2'sinde de test edilebilirliği korur).
+        local -a failed=()
+        local total=0 d
+        while IFS= read -r d; do
+            [[ -n "$d" ]] || continue
+            total=$((total + 1))
+            if [[ "$mode" == "apply" ]]; then
+                ( _harden_fpm_apply "$d" ) || failed+=("$d")
+            else
+                ( _harden_fpm_dry "$d" ) || failed+=("$d")
+            fi
+        done < <(list_all_domains)
+        if [[ "${#failed[@]}" -gt 0 ]]; then
+            warn "harden-fpm TAMAMLANAMADI: ${#failed[@]}/${total} domain başarısız: ${failed[*]}"
+            warn "Her biri için ayrıntılı hata yukarıda — tek tek 'srvctl security harden-fpm <domain> --apply' ile tekrar deneyin."
+            return 1
         fi
-    done
+        return 0
+    fi
+
+    [[ -z "$domain" ]] && error "Kullanım: srvctl security harden-fpm <domain>|--all [--apply]"
+    if [[ "$mode" == "apply" ]]; then
+        _harden_fpm_apply "$domain"
+    else
+        _harden_fpm_dry "$domain"
+    fi
 }
 
 # Dry-run: ne oluşturulacağını yaz, dokunma.
@@ -1107,6 +1195,16 @@ _harden_fpm_apply() {
     local domain="$1" sname php_ver
     sname=$(safe_name "$domain")
     domain_exists "$domain" || { warn "Domain yok: ${domain}"; return 0; }
+    # KUSUR 3 (designwestgate.art): '.credentials' hiç yoksa aşağıdaki
+    # '_derive_php' -> 'read_credentials' (core.sh) hardened bir domainde
+    # fail-closed 'tamper' reddi verip error() ile ÇIKAR — bu tam olarak
+    # audit'in FAIL dediği domain'i sertleştirecek komutun KENDİSİNİ bloke
+    # ediyordu (bkz. lib/domain.sh:_domain_ensure_credentials başlık yorumu).
+    # Yalnız dosya GERÇEKTEN eksikse üretir, var olana DOKUNMAZ. Cross-module
+    # çağrı: bu fonksiyonun tek çağıranı '_security_harden_fpm', başında
+    # '_security_load_domain_lib' ile lib/domain.sh'ı ZATEN yüklemiş olur
+    # (aşağıdaki '_domain_render_fpm_unit' çağrısıyla AYNI ön-koşul).
+    _domain_ensure_credentials "$domain"
     php_ver=$(_derive_php "$domain" "${DEFAULT_PHP_VERSION}")
     _domain_render_fpm_unit "$domain" "$php_ver"
 
