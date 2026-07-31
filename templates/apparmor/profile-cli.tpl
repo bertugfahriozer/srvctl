@@ -158,9 +158,84 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # binary'ye 'x' vermiyor; bu iki satır yalnız audit log'unu susturan
   # dokümantasyondu, gerçek bir ek kısıtlama SAĞLAMIYORDU. '/usr/sbin/**' ve
   # '/sbin/**' için böyle bir çakışma YOK (bu profilde o yollara hiçbir
-  # allow verilmedi) — o iki satır AYNEN KORUNUYOR.
-  deny /usr/sbin/** x,
-  deny /sbin/** x,
+  # allow verilmedi) — o iki satır KORUNUYOR, ama bu turda 'audit deny'e
+  # ÇEVRİLDİ (bkz. profile.tpl'deki HOST ölçümü notu — AYNI gerekçe:
+  # kural yokluğu zaten loglanıyor, düz 'deny' yalnızca tespit sinyalini
+  # SİLİYORDU, koruma EKLEMİYORDU).
+  audit deny /usr/sbin/** x,
+  audit deny /sbin/** x,
+
+  # ─── BİLİNÇLİ SUSTURMA: '/usr/bin/stty' (HOST ölçümü, srvctl-jammy VM) ───
+  # Yukarıdaki mantığın TEK istisnası. worker/scheduler ilk kez ayağa
+  # kaldırılıp ('srvctl domain worker ... start', 'srvctl domain
+  # scheduler ... start') gerçek Laravel queue:work + schedule:run ile
+  # ölçüldüğünde audit.log'da SÜREKLİ bir akış görüldü: 'operation="exec"
+  # name="/usr/bin/stty" comm="php{{PHP_VERSION}}"' (bazı kayıtlarda
+  # comm="sh" — yani '/bin/sh' allow'u DOĞRU çalışıyor, sh kendi İÇİNDE
+  # stty'yi çağırmaya çalışıyor). Kaynak: Symfony Console'un terminal
+  # genişliğini yoklaması ('stty -a' — scheduler dakikada bir tetiklendiği
+  # için KALICI bir kaynak). Ölçülen hız: 2 dakikada 8 kayıt = dakikada 4,
+  # TEK domain için. Hedef ölçek 100 domain'de: 4/dk × 100 = 400 kayıt/dk
+  # ≈ 576.000 kayıt/gün — GERÇEK sinyal SIFIR (Symfony sessizce 80x50
+  # varsayılanına düşüyor; queue:work/schedule:run işlevsel olarak
+  # ETKİLENMİYOR). Bu tam olarak düz 'deny'nin DOĞRU kullanım vakasıdır:
+  # bilinen-zararsız + yüksek frekanslı + işlevsel olarak önemsiz bir
+  # tekrarı susturup audit kanalını (ve 100-domain ölçekte disk/rotate
+  # baskısını) temiz tutmak. 'stty'ye meşru bir ihtiyaç YOK (yalnızca
+  # terminal genişliği sorgusu; bilgi sızdırmıyor, ayrıcalık kazandırmıyor)
+  # — allow VERMEK yerine SUSTURMAK tercih edildi: 'x' izni verilseydi
+  # exec whitelist'i (tests/test_apparmor_deny_shadow.sh dedektör 2)
+  # gereksiz yere genişlerdi. Bu istisna tests/test_apparmor_deny_shadow.sh
+  # içinde AÇIKÇA (gerekçeli) beyaz listeye alınmıştır — biri farklı bir
+  # binary için sessizce ikinci bir düz 'deny' eklerse test KIRILIR.
+  deny /usr/bin/stty x,
+
+  # ─── Kaybolan guardrail'i KAPAT: adlandırılmış /usr/bin + /bin deny
+  #     listesi (güvenlik denetimi bulgusu) ───
+  # Yukarıdaki paragrafta anlatıldığı gibi 'deny /usr/bin/** x,' ve
+  # 'deny /bin/** x,' TAMAMEN kaldırıldı (BUG 1 — php{{PHP_VERSION}}
+  # kendi-kendini-exec ve /bin/sh, /usr/bin/dash kabuk alt-süreçleriyle
+  # ÇAKIŞIYORDU). Bu, teknik olarak DOĞRU bir düzeltmeydi ama bir yan etki
+  # yarattı: bu iki dizin artık HİÇBİR deny kuralıyla korunmuyor —
+  # ileride biri bu profile geniş bir 'x' allow'u (ör. bir abstraction
+  # include) eklerse hiçbir şey onu durdurmaz. Aşağıdaki liste bu boşluğu,
+  # mevcut 'rix'/'mrix' allow'larıyla ÇAKIŞMAYAN adlandırılmış binary'lerle
+  # kapatır: worker/scheduler ele geçirilirse (Laravel queue:work /
+  # schedule:run kod yürütme zinciri üzerinden) en çok tercih edilecek
+  # "living-off-the-land" araçları — interaktif/ters kabuklar (bash),
+  # veri sızdırma/ters bağlantı araçları (curl, wget, nc/nc.*/ncat, socat,
+  # rsync, ssh, scp), betik yorumlayıcılar (python3*, perl, ruby, node —
+  # alternatif payload çalıştırma yolu), tek-binary çok-araçlı kaçış
+  # kitleri (busybox), encode/decode yardımcıları (base64, xxd — payload
+  # gizleme), derleyici/linker (gcc*, ld — yerinde exploit derleme),
+  # process-spawn/persist primitifleri (find -exec, xargs, env, setsid,
+  # nohup — kısıtlı kabuktan kaçış ve arka planda kalıcılık) ve
+  # zamanlanmış görev mekanizmaları (at, crontab — srvctl'in KENDİ
+  # zamanlayıcısı systemd timer'dır, bunlara ihtiyaç YOKTUR).
+  #
+  # ÇAKIŞMA YOK: listede 'sh', 'dash' ya da 'php' ile başlayan hiçbir ad
+  # YOK — yukarıdaki üç 'rix'/'mrix' allow'uyla (php{{PHP_VERSION}},
+  # /bin/sh, /usr/bin/dash) kesişmez; BUG 1'deki 'deny her zaman allow'u
+  # ezer' tuzağına TEKRAR düşülmez (statik kilit:
+  # tests/test_apparmor_deny_shadow.sh). '/bin' Ubuntu 22.04/24.04'te
+  # merged-usr ile '/usr/bin'e sembolik linktir (kernel d_path çözümü
+  # gerçek hedefi verir); yine de aynı listeyi HER İKİ yol için de
+  # tanımlıyoruz — defense-in-depth ve olası merge-dışı/legacy düzenlerle
+  # uyum için (tek bir dizinde eksik bırakmak sessiz bir kapsam boşluğu
+  # doğurur).
+  #
+  # 'audit deny' KULLANILDI, düz 'deny' DEĞİL — TEK istisna yukarıdaki
+  # ölçülmüş '/usr/bin/stty' vakasıdır. Diğer TÜM isimler için: bu isimler
+  # zaten default-deny ile kapalı; amaç SESSİZCE engellemek değil, bir
+  # sömürü denemesini TESPİT ETMEKTİR — HOST ölçümü (bkz. profile.tpl'deki
+  # NOT) "audit'lemek gürültü yaratır" varsayımını BU PROFİLİN blanket
+  # satırları (/usr/sbin/**, /sbin/** — yukarıda 'audit deny'e ÇEVRİLDİ)
+  # için ÇÜRÜTTÜ (64 dk'da yalnızca 3 exec denial, hepsi kasıtlı prob);
+  # 'stty' TEK gerçek yüksek-frekanslı/zararsız istisnadır ve YUKARIDA
+  # AYRI, gerekçeli bir düz 'deny' satırıyla ele alındı — bu listenin
+  # kendisinde düz 'deny' YOKTUR.
+  audit deny /usr/bin/{bash,curl,wget,nc,nc.*,ncat,socat,python3*,perl,ruby,node,ssh,scp,rsync,busybox,base64,xxd,gcc*,ld,find,xargs,env,setsid,nohup,at,crontab} x,
+  audit deny /bin/{bash,curl,wget,nc,nc.*,ncat,socat,python3*,perl,ruby,node,ssh,scp,rsync,busybox,base64,xxd,gcc*,ld,find,xargs,env,setsid,nohup,at,crontab} x,
 
   deny /home/** rwx,
   deny /root/** rwx,

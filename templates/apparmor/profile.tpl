@@ -12,10 +12,29 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   # ═══════════════════════════════════════════════
   #  AppArmor Profile: {{DOMAIN}}
   #  User: {{WEB_USER}}
-  #  Bu profil, systemd'nin AppArmorProfile= yönergesiyle TÜM
-  #  srvctl-fpm-{{SAFE_NAME}}.service sürecine (master + chroot'lu/setuid
-  #  düşürülmüş worker'lar) uygulanır. Aynı profil worker/scheduler
-  #  unit'lerine de (srvctl-worker/srvctl-scheduler) atanır.
+  #  Bu profil, systemd'nin AppArmorProfile= yönergesiyle YALNIZCA
+  #  srvctl-fpm-{{SAFE_NAME}}.service sürecine (FPM master + kendi
+  #  forkladığı chroot'lu/setuid düşürülmüş worker'lar — php-fpm'in İÇ
+  #  worker havuzu, ayrı bir systemd unit'i DEĞİL) uygulanır.
+  #
+  #  DÜZELTME (güvenlik denetimi bulgusu): bu blokta ÖNCEDEN "Aynı profil
+  #  worker/scheduler unit'lerine de (srvctl-worker/srvctl-scheduler)
+  #  atanır" YAZIYORDU — bu YANLIŞTI ve denetçiyi yanıltıyordu. Gerçekte
+  #  srvctl-worker-{{SAFE_NAME}}@*.service ve srvctl-scheduler-{{SAFE_NAME}}
+  #  .service/.timer (Laravel queue:work / schedule:run gibi systemd
+  #  job'ları) AYRI bir profil kullanır: srvctl-{{SAFE_NAME}}-cli (bkz.
+  #  templates/apparmor/profile-cli.tpl ve templates/systemd/
+  #  srvctl-worker.service.tpl / srvctl-scheduler.service.tpl'deki
+  #  'AppArmorProfile=srvctl-<safe>-cli' yönergesi). BU profil (tiresiz
+  #  'srvctl-{{SAFE_NAME}}') YALNIZ FPM master unit'inin
+  #  'AppArmorProfile=srvctl-<safe>' yönergesiyle eşleşir.
+  #  Bu ayrım kritiktir: aşağıdaki 'capability chown/dac_override/setuid/
+  #  setgid/sys_chroot/kill' SADECE FPM master'ın chroot+privilege-drop
+  #  için ZORUNLU olduğu BU profildedir — worker/scheduler'ın -cli
+  #  profilinde bu capability'lerin HİÇBİRİ YOKTUR (en az yetki ilkesi,
+  #  bkz. profile-cli.tpl başlık notu "NEDEN AYRI PROFİL?"). Eski (yanlış)
+  #  yorum "worker zaten aynı capability'lere sahip, ayrıca kısıtlamaya
+  #  gerek yok" gibi hatalı bir güvenlik kararına yol açabilirdi.
   # ═══════════════════════════════════════════════
 
   # ─── Capability: chroot+privilege-drop için ZORUNLU ───
@@ -30,6 +49,58 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   capability setgid,
   capability sys_chroot,
   capability kill,
+
+  # ─── ÇÖZÜLMÜŞ BULGU: periyodik 'capability net_admin' denial'ı SUSTURULDU
+  #     (HOST ölçümü, srvctl-jammy VM, AppArmor 3.0.4 — kök neden DOĞRULANDI) ───
+  # ÖNCEKİ sürümde bu blok "AÇIK ARAŞTIRMA NOTU" idi (kök neden HOST'ta
+  # doğrulanmadan susturulmamıştı). HOST'ta eşlenik SYSCALL kaydı (AYNI
+  # audit event id) incelenerek kök neden KESİN olarak teşhis edildi:
+  #
+  #   type=AVC     apparmor="DENIED" operation="capable" profile="srvctl-<sname>"
+  #                pid=<master> comm="php-fpm{{PHP_VERSION}}" capability=12 capname="net_admin"
+  #   type=SYSCALL syscall=208 SYSCALL=setsockopt success=no exit=-1
+  #                a0=b a1=1 a2=20 ... exe="/usr/sbin/php-fpm{{PHP_VERSION}}" ppid=1 uid=0
+  #
+  # Çözümleme: a1=1 = SOL_SOCKET, a2=0x20 = 32 = SO_SNDBUFFORCE — bu soket
+  # seçeneği çekirdekte AÇIKÇA CAP_NET_ADMIN ister (SO_SNDBUF'ın rlimit'i
+  # AŞABİLEN "force" varyantı). ÖNCEKİ hipotez (glibc getaddrinfo()/
+  # __check_pf() → chroot'ta /proc yokluğu → netlink) ÇÜRÜTÜLDÜ: denial'ı
+  # üreten süreç FPM MASTER'ın KENDİSİ ('master=..., chroot=/' — chroot'lu
+  # DEĞİL) ve syscall socket/bind/connect değil setsockopt'tur.
+  #
+  # GERÇEK KAYNAK: unit 'Type=notify' (NotifyAccess=main); php-fpm master
+  # systemd'ye sd_notify() ile durum bildirir (php-fpm'in 'systemd_interval'
+  # global direktifi, varsayılan 10 sn — ilk gözlemlenen ~10 sn'lik ritmin
+  # kaynağı budur). sd_notify'ın soket tamponu büyütme yardımcısı ÖNCE
+  # SO_SNDBUFFORCE dener, izin reddedilince SESSİZCE SO_SNDBUF'a düşer.
+  #
+  # ZARARSIZ OLDUĞUNUN KANITI: unit 'active', 'NRestarts: 0' — Type=notify
+  # başlatma BAŞARILI (READY=1 systemd'ye ulaşmasaydı unit 'activating'de
+  # takılı kalırdı, TimeoutStartSec sonunda 'failed' olurdu). Yani reddedilen
+  # çağrının fallback'i ÇALIŞIYOR, işlev kaybı YOK. Ölçülen hacim: 64
+  # dakikada 848 kayıt — TÜM AppArmor DENIED kayıtlarının ~%98'i; bu akış
+  # aşağıdaki adlandırılmış 'audit deny' listelerinin tespit sinyalini
+  # FİİLEN BOĞUYORDU.
+  #
+  # CAP_NET_ADMIN NEDEN VERİLMİYOR (susturuluyor ama İZİN VERİLMİYOR):
+  # bu capability netfilter/iptables kurallarını değiştirme, ağ arayüzü
+  # yapılandırma, promiscuous mod açma gibi yetkiler taşır — bir web
+  # sunucusu sürecinde GERÇEK bir yetki yükseltme yüzeyidir. Tek ihtiyaç
+  # zararsız bir soket-tamponu optimizasyonudur ve KENDİ FALLBACK'İ zaten
+  # var (SO_SNDBUF); capability vermek riski ödülsüz büyütür. BİRİ İLERİDE
+  # "denial var, capability ekleyelim" diye düzeltmeye kalkarsa: HAYIR —
+  # doğru hareket bu satırı SUSTURMAK, capability EKLEMEK DEĞİL.
+  #
+  # 'deny' (audit'siz) KULLANILDI, 'audit deny' DEĞİL — bu, profile-cli.tpl
+  # 'deki '/usr/bin/stty' ile TAM AYNI sınıf: bilinen kök neden + yüksek
+  # frekans (848/861, ölçülen ~%98) + sıfır işlevsel etki (fallback var) +
+  # aşağıdaki tespit katmanını (adlandırılmış 'audit deny' listeleri)
+  # boğan gürültü. Düz 'deny'nin DOĞRU kullanım vakası (bkz. dosya
+  # sonundaki 'deny' vs 'audit deny' NOTU). Statik kilit: tests/
+  # test_apparmor_deny_shadow.sh'taki CAPABILITY-deny beyaz listesi
+  # (dosyaya özgü, tek üye: 'profile.tpl:net_admin') — biri farklı bir
+  # capability için sessizce ikinci bir düz deny eklerse test KIRILIR.
+  deny capability net_admin,
 
   # ─── Kendi binary'si — reload (SIGUSR2) için 'x' (inherit-execute) ZORUNLU ───
   # DÜZELTME (kanıt: gerçek Ubuntu 22.04 VM). Önceki analiz "AppArmorProfile=
@@ -246,10 +317,77 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   # saldırı yüzeyini GENİŞLETMEZ (tek allow hâlâ yalnızca
   # php-fpm{{PHP_VERSION}} binary'sinin TAM YOLUNA, glob'suz tanımlı).
   # '/usr/bin/**', '/bin/**', '/sbin/**' için böyle bir çakışma YOK (bu
-  # profilde o yollara hiçbir allow verilmedi) — üç satır AYNEN KORUNUYOR.
-  deny /usr/bin/** x,
-  deny /bin/** x,
-  deny /sbin/** x,
+  # profilde o yollara hiçbir allow verilmedi) — üç satır KORUNUYOR, ama
+  # bu turda 'audit deny'e ÇEVRİLDİ (bkz. aşağıdaki HOST ölçümü notu).
+  audit deny /usr/bin/** x,
+  audit deny /bin/** x,
+  audit deny /sbin/** x,
+
+  # ─── Kaybolan guardrail'i KAPAT + HOST ölçümüyle DÜZELTME: 'deny'
+  #     YERİNE 'audit deny' (güvenlik denetimi bulgusu) ───
+  # Yukarıdaki 'deny /usr/sbin/** x,' satırının TAMAMEN kaldırılması (BUG
+  # 1 düzeltmesi, yukarıdaki NOT) teknik olarak DOĞRUYDU ama bir yan etki
+  # yarattı: bu dizin artık HİÇBİR deny kuralıyla korunmuyordu — ileride
+  # biri bu profile geniş bir 'x' allow'u (ör. yeni bir abstraction
+  # include) eklerse hiçbir şey onu durdurmaz. Aşağıdaki liste bu boşluğu,
+  # php-fpm ile ÇAKIŞMAYAN adlandırılmış binary'lerle kapatır — bu unit
+  # privdrop ÖNCESİ root çalıştığından (üstteki NOT) /usr/sbin altında ele
+  # geçirilmiş bir root süreç için en yüksek riski taşıyan araçlar seçildi:
+  # kullanıcı/grup yönetimi (useradd/userdel/usermod/groupadd/groupdel/
+  # groupmod/adduser/deluser — kalıcı erişim için yeni hesap/grup üyeliği
+  # açar), parola/sudoers dosyalarını DOĞRUDAN düzenleyen araçlar
+  # (visudo/vipw/vigr/chpasswd/newusers), ağ keşfi (tcpdump), güvenlik
+  # duvarı manipülasyonu (iptables/ip6tables/ufw), posta rölesi üzerinden
+  # dışarı sızdırma/spam (sendmail/exim4/postfix) ve coreutils 'chroot'
+  # binary'si (php-fpm'in kendi chroot() SYSCALL'ıyla karıştırılmasın —
+  # bu, ayrı bir kaçış/pivot aracı olarak dışlanıyor).
+  #
+  # ÇAKIŞMA YOK: listedeki hiçbir ad 'php-fpm' ile başlamıyor/eşleşmiyor —
+  # bu yüzden yukarıdaki (satır ~55) tek 'x' allow'umuzla kesişmez; BUG
+  # 1'deki 'deny her zaman allow'u ezer' tuzağına TEKRAR düşülmez (statik
+  # kilit: tests/test_apparmor_deny_shadow.sh).
+  #
+  # 'deny' vs 'audit deny' — HOST ÖLÇÜMÜYLE DÜZELTİLEN KARAR (bu şablonun
+  # ÖNCEKİ sürümü burada YANLIŞTI): srvctl-jammy VM'de (AppArmor 3.0.4)
+  # gerçek bir ölçüm yapıldı — chroot'a bilinçli olarak yerleştirilmiş bir
+  # '/bin/sh' + '/usr/sbin/sendmail' kopyası exec edilmeye çalışıldı.
+  # Sonuç: AppArmor bunu default-deny (bu iki yol için PROFİLDE HİÇBİR
+  # KURAL YOK) ile engelledi VE audit.log'a 'type=AVC apparmor="DENIED"
+  # operation="exec"' olarak YAZDI. Yani KURAL YOKLUĞU zaten loglanıyor —
+  # AppArmor'ın belgelenen davranışı şudur: yalnızca AÇIK bir 'deny'
+  # kuralı (audit niteleyicisi OLMADAN) audit mesajını BASTIRIR; kural
+  # yokluğu normal implicit-deny yoludur ve LOGLANIR. Önceki sürümdeki
+  # gerekçe ("blanket satırları düz deny'de bırakmak audit gürültüsünü
+  # azaltır") bu yüzden TERSİNE İŞLİYORDU: '/usr/bin/**' vb. için var olan
+  # düz 'deny' kuralları, KURAL HİÇ OLMASAYDI zaten loglanacak exec
+  # denemelerini SESSİZLEŞTİRİYORDU — koruma EKLEMİYOR (default-deny
+  # zaten kapatıyor), yalnızca TESPİT SİNYALİNİ SİLİYORDU; tam da
+  # korumak istediğimiz yerde.
+  #
+  # "Audit'lemek log şişirir" gerekçesi de aynı VM ölçümünde ÇÜRÜTÜLDÜ: 64
+  # dakikalık gerçek işletimde (tam bir Laravel deploy'u + CI4 + trafik
+  # dahil) toplam 861 AppArmor kaydından yalnızca 3'ü 'operation="exec"'
+  # idi — ve o 3'ü de bu ölçüm için BİLİNÇLİ yerleştirilen probe'du. Yani
+  # BU PROFİLDE normal işletimde exec denial hacmi PRATİKTE SIFIR; bu
+  # satırları 'audit deny'e çevirmenin ölçülebilir bir log-hacmi maliyeti
+  # YOK. (Karşı örnek profile-cli.tpl'de VAR — worker/scheduler'da
+  # Symfony Console'un 'stty -a' yoklaması yüksek frekanslı, GERÇEK
+  # gürültü üretiyor; bkz. o dosyadaki '/usr/bin/stty' istisnası. Ölçüm
+  # olmadan "gürültü" varsayımı YAPILMAMALI — bazen doğru çıkar (stty),
+  # bazen tersine çıkar (bu profildeki eski blanket satırlar).)
+  #
+  # SONUÇ: bu şablonda PATH-tabanlı ('x' izni içeren) düz (audit'siz)
+  # 'deny' kuralı YOKTUR — görmek istediğimiz her şey ya 'audit deny' ya
+  # da kuralın TAMAMEN YOKLUĞUdur (statik kilit: tests/
+  # test_apparmor_deny_shadow.sh, path-tabanlı "plain exec-deny"
+  # invariant'ı — bu profil için istisna listesi BOŞTUR). TEK istisna
+  # PATH-tabanlı DEĞİL, CAPABILITY-tabanlıdır: yukarıdaki 'deny capability
+  # net_admin,' — kök nedeni HOST'ta DOĞRULANMIŞ (SO_SNDBUFFORCE/
+  # sd_notify, fallback var), bilinen-zararsız, yüksek frekanslı bir
+  # denial (bkz. capability bloğundaki ÇÖZÜLMÜŞ BULGU). Bu da ayrı bir
+  # CAPABILITY-deny beyaz listesiyle (tests/test_apparmor_deny_shadow.sh,
+  # tek üye: 'profile.tpl:net_admin') statik olarak kilitlenmiştir.
+  audit deny /usr/sbin/{useradd,userdel,usermod,groupadd,groupdel,groupmod,adduser,deluser,visudo,vipw,vigr,chpasswd,newusers,tcpdump,iptables,ip6tables,ufw,sendmail,exim4,postfix,chroot} x,
 
   # ─── Ağ Erişimi ───
   network inet stream,

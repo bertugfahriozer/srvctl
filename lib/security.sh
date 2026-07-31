@@ -29,6 +29,17 @@ _audit_in_slice() {
     [[ "$1" == *"$2"* ]]
 }
 
+# systemctl list-units (--all --no-legend --plain <glob>) METNİNİ parse eder;
+# yalnız ACTIVE sütunu (3.) 'active' olan unit adlarını (1. sütun) basar.
+# Saf: systemctl'e DOKUNMAZ, yalnız METNİ işler — worker/scheduler audit'i
+# (aşağıda) template/instance unit'lerin (srvctl-worker-<sname>@*.service)
+# HANGİLERİNİN gerçekten koştuğunu bu parser üzerinden bulur; 'failed'/
+# 'inactive' instance'lar (ör. eski/çökmüş bir kuyruk) elenir — bunlar için
+# PID aranıp FAIL üretilmemeli, çünkü çalışmıyor olmaları bir hata değildir.
+_audit_parse_active_units() {
+    awk '$3=="active"{print $1}' <<< "$1"
+}
+
 # /proc/<pid>/attr/current İLK SATIRI TAM OLARAK '<profile> (enforce)' mi?
 # (0=evet). Format: 'srvctl-example_com (enforce)\n' (complain modunda
 # '(complain)', hiç attach değilse 'unconfined\n'). _audit_aa_enforced (aa-status
@@ -43,6 +54,93 @@ _audit_aa_attr_enforced() {
     local first_line
     first_line="$(printf '%s' "$text" | head -n1)"
     [[ "$first_line" == "${profile} (enforce)" ]]
+}
+
+# ─── Scheduler enforcement KARARI (saf; BULGU kapanışı — worker/scheduler
+# audit'i hiç yoktu) ───
+# Scheduler unit'i (srvctl-scheduler-<sname>.service) 'oneshot'tur ve TIMER
+# tarafından dakikada bir tetiklenir (bkz. templates/systemd/srvctl-scheduler.
+# service.tpl/.timer.tpl) — servis çoğu zaman 'inactive (dead)' görünür, bu
+# yüzden "FPM'deki gibi canlı bir PID bekle" yaklaşımı YANLIŞ olur: timer
+# aktifken servis PID'i neredeyse HER ZAMAN yoktur ve bu bir arıza DEĞİLDİR.
+#
+# KARAR: PID mevcutsa (audit tam da tetiklenme anına denk geldiyse) GERÇEK
+# attach (/proc/<pid>/attr/current) tercih edilir — bu en güçlü kanıttır.
+# PID yoksa (asıl/normal durum), DOLAYLI doğrulamaya düşülür: profilin
+# sistem genelinde enforce modda YÜKLÜ olup olmadığına (aa-status metni)
+# bakılır. Bu meşrudur çünkü AppArmor'da enforce/complain modu PROFİLİN
+# kendisinin özelliğidir (belirli bir PID'in DEĞİL) — profil enforce modda
+# yüklüyse, timer bir sonraki tetiklemede exec ettiği süreci de o profille
+# (ve o modda) confine eder. "Servis o an ölü" ile "hiç doğrulanamadı"
+# farklı şeylerdir: PID yokluğu FAIL üretmez, ama profil complain'e düşmüşse
+# (ya da hiç yüklü değilse) dolaylı kontrol de FAIL üretir.
+#
+# PREDİKAT: 0=enforce doğrulandı, 1=değil. Girdi olarak GERÇEK PID/aa-status
+# ÇAĞRISI YAPMAZ — çağıran (_check_scheduler_aa) veriyi toplar, bu fonksiyon
+# yalnız KARARI verir (test edilebilirlik için ayrıştırıldı).
+#
+# YARIŞ DURUMU DÜZELTMESİ (koordinatör bulgusu, gerçek VM ölçümü): worker DA
+# artık bu fonksiyonu kullanıyor (bkz. _check_worker_aa) — isim tarihsel
+# olarak 'scheduler' ama karar tamamen GENELDİR ("PID var mı" + "varsa attr
+# OKUNABİLDİ Mİ"). Sebep: PID yakalanıp attr okunmaya çalışılırken süreç
+# tam ARADA ölebilir (scheduler oneshot'ta saniyeden kısa çalıştığı için bu
+# YAYGIN; worker'da Restart=on-failure ile YENİDEN BAŞLARKEN dar ama mümkün
+# bir pencere). Bu durumda attr_text BOŞ gelir — has_pid=1 + attr_text=""
+# ile çağrılırsa _audit_aa_attr_enforced boş metni "enforce DEĞİL" sayar ve
+# YANLIŞ FAIL üretilirdi (100 domain sıralı denetlenirken bu her audit
+# koşusunda tekrarlanabilir bir gürültü kaynağıydı). ÇÖZÜM ÇAĞIRANDA: attr
+# okunamazsa çağıran has_pid=0 İLE çağırır (aşağıdaki case'e düşer) — yani
+# "attr HİÇ okunamadı" (kanıt yok, süreç kaçırıldı) ile "attr okundu ve
+# enforce DEĞİL" (gerçek bulgu) BURADA KARIŞMAZ; ayrım çağıranın has_pid
+# değerini NASIL belirlediğinde yatar (bkz. _check_worker_aa/
+# _check_scheduler_aa: attr boşsa has_pid=0'a DÜŞÜLÜR, 1 OLARAK KALMAZ).
+_audit_scheduler_enforced() {
+    local has_pid="$1" attr_text="$2" aa_status_text="$3" profile="$4"
+    if [[ "$has_pid" == "1" ]]; then
+        _audit_aa_attr_enforced "$attr_text" "$profile"
+    else
+        _audit_aa_enforced "$aa_status_text" "$profile"
+    fi
+}
+
+# ─── FPM izolasyon durumu KARARI (saf; koordinatör bulgusu — audit hiçbir
+# domainin PAYLAŞILAN havuzda mı yoksa izole unit'te mi çalıştığını
+# kontrol etmiyordu) ───
+# GEREKÇE: AppArmorProfile=/SystemCallFilter=/NoNewPrivileges= YALNIZ
+# 'srvctl-fpm-<sname>.service' (per-domain, T7a) unit'inde tanımlıdır.
+# Paylaşılan 'php<ver>-fpm.service' dağıtımın KENDİ unit'idir — bunların
+# HİÇBİRİNİ taşımaz. Bir domain paylaşılan havuza düşerse (izolasyon hiç
+# denenmemiş/başarısız olmuş/eski bir domain hiç migrate edilmemiş) MAC
+# katmanının TAMAMINI SESSİZCE kaybeder (Chankro zincirindeki 'exec deny'
+# tam olarak buna dayanır — disable_functions CLI'da uygulanmaz, onu
+# durduran TEK şey AppArmor'ın exec deny'idir).
+#
+# ÜÇ YOLDAN BİRİYLE bu duruma düşülür: (a) operatör conf/srvctl.conf'ta
+# DOMAIN_ISOLATED_FPM=false vermiş (BİLİNÇLİ tercih), (b) 'domain add'
+# sırasında izolasyon başarısız olmuş (lib/domain.sh: "Per-domain FPM
+# izolasyonu BAŞARISIZ..." — akış DEVAM eder, domain paylaşılan pool'da
+# kalır), (c) T7a öncesi eklenip hiç migrate edilmemiş eski domainler.
+# (a) BİLİNÇLİ bir tercihtir — kullanıcı kendi kararını FAIL olarak
+# GÖRMEMELİ (ama görünmez de olmamalı, bu yüzden WARN). (b)/(c) SESSİZ
+# SAPMADIR — bunlar asıl hedeftir, FAIL üretilir.
+#
+# KARAR: izole (config VAR + unit AKTİF) → "PASS". Değilse (paylaşılan
+# havuzda) → operatör DOMAIN_ISOLATED_FPM=false'ı AÇIKÇA vermişse "WARN",
+# aksi halde (varsayılan true iken sessizce izole OLAMAMIŞ) "FAIL".
+#
+# Girdi: <config_exists:0|1> <unit_active:0|1> <isolated_setting:true|false>
+# Çıktı (stdout): "PASS"|"WARN"|"FAIL" — çağıran (_check_fpm_isolation)
+# bunu _pass/_fail/_warn_result'a yönlendirir. Saf: systemctl/dosya
+# sistemine DOKUNMAZ (fixture ile test edilir, bkz. tests/test_audit_parsers.sh).
+_audit_fpm_isolation_verdict() {
+    local config_exists="$1" unit_active="$2" isolated_setting="$3"
+    if [[ "$config_exists" == "1" && "$unit_active" == "1" ]]; then
+        echo "PASS"
+    elif [[ "$isolated_setting" == "false" ]]; then
+        echo "WARN"
+    else
+        echo "FAIL"
+    fi
 }
 
 # ─── Domain'in GERÇEK FPM master PID'ini tespit eder (fail-closed) ───
@@ -70,6 +168,53 @@ _audit_domain_fpm_pid() {
     return 1
 }
 
+# Verilen PID için '/proc/<pid>/attr/current' yolunu üretir (stdout). Test-
+# seam: SRVCTL_PROC_DIR override edilebilir — SRVCTL_SYSTEMD_DIR/SRVCTL_FPM_DIR
+# ile AYNI desen (bkz. CLAUDE.md "Test-seams for macOS dev"). Varsayılan
+# GERÇEK '/proc' — HOST'ta davranış DEĞİŞMEZ. Worker/scheduler'ın YARIŞ
+# DURUMU düzeltmesi (bkz. _check_worker_aa/_check_scheduler_aa) bu sayede
+# fixture'la test edilebiliyor: gerçek Linux'ta '/proc/<pid>' PID süreç
+# çıktıktan hemen sonra kaybolur — macOS'ta '/proc' hiç YOKTUR, bu yüzden
+# gerçek 'complain' senaryosu SRVCTL_PROC_DIR olmadan test edilemezdi.
+_audit_proc_attr_path() {
+    printf '%s/%s/attr/current\n' "${SRVCTL_PROC_DIR:-/proc}" "$1"
+}
+
+# Verilen systemd unit'inin MainPID'ini döner (stdout, 0=bulundu). Boş/'0'
+# ise unit çalışmıyor demektir (predikat: 1). _audit_domain_fpm_pid ile AYNI
+# ilkel katman — worker instance'ları VE scheduler service'i için ORTAK
+# kullanılır (bkz. _check_worker_aa/_check_scheduler_aa, _security_audit).
+_audit_unit_mainpid() {
+    local unit="$1" pid
+    pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null)"
+    [[ -n "$pid" && "$pid" != "0" ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+# ─── Domain'in ÇALIŞAN worker instance unit adlarını tespit eder ───
+# (fail-closed; BULGU kapanışı). PREDİKAT DEĞİL: satır satır unit adı basar
+# (0=en az bir instance aktif), hiçbiri aktif değilse boş çıktı + 1 döner —
+# bu NORMAL bir durumdur (her domain kuyruk worker'ı kullanmaz; bkz.
+# _check_worker_aa'nın bunu FAIL SAYMAMASI).
+#
+# TÜM aktif instance'lar döner (TEK BİRİ DEĞİL): worker template unit'i TEK
+# bir dosyadır (srvctl-worker-<sname>@.service) ve AppArmorProfile= yönergesi
+# o dosyada BİR KEZ tanımlıdır, ama AppArmor attach'ı exec() ANINDA sabitlenir
+# — bir instance, unit dosyası (ör. 'domain repair' ile profil enforce'a
+# alınmadan ÖNCE) başlatılmış olabilir ve o PID'in mevcut attr'ı, SONRADAN
+# başlatılan bir instance'tan FARKLI olabilir (profil dosyası aynı olsa bile,
+# eski instance'ın exec-time confinement'ı DEĞİŞMEZ). Tek instance'a bakmak bu
+# drift'i KAÇIRIR — bu yüzden glob'daki HEPSİ kontrol edilir.
+_audit_domain_active_worker_units() {
+    local sname="$1"
+    local glob="srvctl-worker-${sname}@*.service" out
+    out="$(systemctl list-units --all --no-legend --plain "$glob" 2>/dev/null || true)"
+    local units
+    units="$(_audit_parse_active_units "$out")"
+    [[ -n "$units" ]] || return 1
+    printf '%s\n' "$units"
+}
+
 # ───────────────────────────────────────────────────────────────
 #  Eval'siz kontrol çalıştırıcı (saf, test edilebilir).
 #  Kullanım: _security_run_check <on_ok_fn> <on_bad_fn> <label> <cmd...>
@@ -83,6 +228,208 @@ _security_run_check() {
     else
         "$on_bad" "$label"
     fi
+}
+
+# ───────────────────────────────────────────────────────────────
+#  Worker/scheduler '-cli' profili AppArmor enforcement — BULGU kapanışı.
+#  ÖNCEDEN: audit worker/scheduler süreçlerini HİÇ görmüyordu ('grep -n
+#  "worker\|scheduler" lib/security.sh' sıfır sonuç veriyordu). '-cli' profili
+#  worker/scheduler için TEK gerçek MAC kısıtıdır — CLI SAPI'de
+#  'disable_functions' UYGULANMAZ (global ini yalnız fpm/conf.d/'ye yazılır,
+#  cli/php.ini'de bu direktif BOŞTUR). Profil sessizce complain moda düşerse
+#  worker/scheduler fiilen konfine olmaz ve hiçbir çıktı bunu söylemezdi
+#  (sessiz güvenlik kaybı). Aşağıdaki iki fonksiyon FPM bloğuyla AYNI deseni
+#  (PID → /proc/<pid>/attr/current → _audit_aa_attr_enforced) worker/
+#  scheduler'a özgü ÜÇ farkla uygular:
+#
+#    1) Worker template/instance'tır — TÜM aktif instance'lar kontrol edilir,
+#       tek biri DEĞİL (bkz. _audit_domain_active_worker_units yorumu:
+#       exec-time attach drift'i tek-instance kontrolünü kaçırır).
+#    2) Scheduler oneshot+timer'dır — servis çoğu zaman ölüdür (dead).
+#       "PID bekle" burada YANLIŞ olur; timer aktifse ama PID yoksa DOLAYLI
+#       doğrulamaya (aa-status — bkz. _audit_scheduler_enforced) düşülür.
+#    3) YARIŞ DURUMU (koordinatör bulgusu, gerçek VM ölçümüyle doğrulandı):
+#       PID yakalanıp '/proc/<pid>/attr/current' okunmaya çalışılırken süreç
+#       TAM ARADA ölebilir — scheduler oneshot'ta bu YAYGINDIR (ölçülen
+#       gerçek çalışma süresi <1sn), worker'da Restart=on-failure ile
+#       yeniden başlarken DAHA DAR ama yine de mümkündür. Bu durumda attr
+#       BOŞ gelir; "attr HİÇ okunamadı" (kanıt yok, süreç kaçırıldı) ile
+#       "attr okundu ve enforce DEĞİL" (gerçek bulgu) KARIŞTIRILMAMALIDIR —
+#       aksi halde 100 domain sıralı denetlenirken HER audit koşusunda
+#       rastgele bir domaine YANLIŞ FAIL ("... repair çalıştırın" — ki
+#       repair hiçbir şeyi düzeltmez) düşme olasılığı ihmal edilebilir
+#       değildir. ÇÖZÜM: attr boşsa (dosya okunamadı/süreç orada değil)
+#       has_pid=0'A DÜŞÜLÜR — yani "PID hiç yokmuş gibi" DOLAYLI aa-status
+#       doğrulamasına geri çekilir (bkz. _audit_scheduler_enforced —
+#       AppArmor'da enforce/complain PROFİLİN özelliğidir, PID'in değil, bu
+#       yüzden bu geri çekiliş sessiz güvenlik kaybını YİNE yakalar). Yalnız
+#       attr GERÇEKTEN okunup profil UYUŞMUYORSA (complain/başka profil)
+#       FAIL üretilir.
+#
+#  HER İKİSİNDE DE: worker/scheduler HİÇ tanımlı/aktif DEĞİLSE (çoğu domain
+#  kuyruk/zamanlayıcı KULLANMAZ) bu NORMALDİR — FAIL/WARN ÜRETİLMEZ, sessizce
+#  atlanır. Ama "unit tanımlı VE aktif ama profil enforce DEĞİL" durumu
+#  KESİNLİKLE FAIL'dir.
+#
+#  Kullanım: _check_worker_aa/_check_scheduler_aa <on_pass_fn> <on_fail_fn>
+#            <on_warn_fn> <domain> <sname>
+#  _security_run_check ile AYNI eval'siz/explicit-injection deseni: TOP-LEVEL
+#  (modül kapsamında, _security_audit'e nested DEĞİL) tanımlanmıştır ki
+#  _security_audit'i (tüm OS/servis kontrolleriyle) hiç çalıştırmadan,
+#  doğrudan kendi sayaç/callback'leriyle birim test edilebilsin (bkz.
+#  tests/test_worker_scheduler_audit.sh).
+# ───────────────────────────────────────────────────────────────
+_check_worker_aa() {
+    local on_pass="$1" on_fail="$2" on_warn="$3" domain="$4" sname="$5"
+    local cli_profile="srvctl-${sname}-cli"
+    local units
+    units="$(_audit_domain_active_worker_units "$sname")" || return 0   # aktif instance yok — NORMAL, sessizce atla
+
+    local unit
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        local raw_pid=""
+        if ! raw_pid="$(_audit_unit_mainpid "$unit")"; then
+            "$on_warn" "${domain}: worker PID alınamadı (${unit}) — AppArmor doğrulanamadı"
+            continue
+        fi
+
+        local pid="" has_pid=0 attr="" aa_text=""
+        attr="$(cat "$(_audit_proc_attr_path "$raw_pid")" 2>/dev/null || true)"
+        if [[ -n "$attr" ]]; then
+            has_pid=1
+            pid="$raw_pid"
+        fi
+        # attr BOŞSA (yarış — bkz. yukarıdaki (3) numaralı madde): has_pid=0
+        # KALIR, DOLAYLI (aa-status) doğrulamaya GERİ ÇEKİLİR. "PID hiç
+        # alınamadı" (yukarıdaki on_warn dalı) İLE KARIŞTIRILMASIN: BURADA
+        # PID ALINDI, yalnız attr okunamadı — bu daha da güçlü bir "süreç
+        # tam o an kayboldu" kanıtıdır, yine de WARN/FAIL yerine dolaylı
+        # kontrole düşmek sessiz güvenlik kaybını hâlâ yakalar.
+        if [[ "$has_pid" == "0" ]]; then
+            if command -v aa-status &>/dev/null; then
+                aa_text="$(aa-status 2>/dev/null || true)"
+            else
+                "$on_warn" "${domain}: worker AppArmor doğrulanamadı (${unit}, PID ${raw_pid} attr okunamadı, aa-status yok)"
+                continue
+            fi
+        fi
+
+        if _audit_scheduler_enforced "$has_pid" "$attr" "$aa_text" "$cli_profile"; then
+            if [[ "$has_pid" == "1" ]]; then
+                "$on_pass" "${domain}: worker AppArmor enforce (${unit}, PID ${pid})"
+            else
+                "$on_pass" "${domain}: worker AppArmor profili enforce modda (dolaylı doğrulama — ${unit}, PID ${raw_pid} attr okunamadı)"
+            fi
+        else
+            if [[ "$has_pid" == "1" ]]; then
+                "$on_fail" "${domain}: worker AppArmor enforce DEĞİL (${unit}, PID ${pid}: '${attr}') — 'srvctl domain repair ${domain}' çalıştırın"
+            else
+                "$on_fail" "${domain}: worker AppArmor profili enforce modda DEĞİL (${unit}) — 'srvctl domain repair ${domain}' çalıştırın"
+            fi
+        fi
+    done <<< "$units"
+}
+
+_check_scheduler_aa() {
+    local on_pass="$1" on_fail="$2" on_warn="$3" domain="$4" sname="$5"
+    local cli_profile="srvctl-${sname}-cli"
+    local timer="srvctl-scheduler-${sname}.timer" svc="srvctl-scheduler-${sname}.service"
+    systemctl is-active --quiet "$timer" 2>/dev/null || return 0   # timer aktif değil — NORMAL
+
+    local pid="" has_pid=0 attr="" aa_text=""
+    local svc_pid=""
+    if svc_pid="$(_audit_unit_mainpid "$svc")"; then
+        attr="$(cat "$(_audit_proc_attr_path "$svc_pid")" 2>/dev/null || true)"
+        if [[ -n "$attr" ]]; then
+            has_pid=1
+            pid="$svc_pid"
+        fi
+        # attr BOŞSA (yarış — PID yakalandı ama oneshot servis /proc
+        # okunmadan ÖNCE bitti, bkz. yukarıdaki büyük yorumun (3) numaralı
+        # maddesi): has_pid=0 KALIR, aşağıda DOLAYLI (aa-status) doğrulamaya
+        # GERİ ÇEKİLİR — "attr hiç okunamadı" (kanıt yok) FAIL SAYILMAZ.
+    fi
+
+    if [[ "$has_pid" == "0" ]]; then
+        if command -v aa-status &>/dev/null; then
+            aa_text="$(aa-status 2>/dev/null || true)"
+        else
+            "$on_warn" "${domain}: scheduler AppArmor doğrulanamadı (aa-status yok, servis şu an ölü/PID yakalanamadı)"
+            return 0
+        fi
+    fi
+
+    if _audit_scheduler_enforced "$has_pid" "$attr" "$aa_text" "$cli_profile"; then
+        if [[ "$has_pid" == "1" ]]; then
+            "$on_pass" "${domain}: scheduler AppArmor enforce (PID ${pid} doğrulandı)"
+        else
+            "$on_pass" "${domain}: scheduler AppArmor profili enforce modda (dolaylı doğrulama — timer aktif, servis şu an ölü/yakalanamadı)"
+        fi
+    else
+        if [[ "$has_pid" == "1" ]]; then
+            "$on_fail" "${domain}: scheduler AppArmor enforce DEĞİL (PID ${pid}: '${attr}') — 'srvctl domain repair ${domain}' çalıştırın"
+        else
+            "$on_fail" "${domain}: scheduler AppArmor profili enforce modda DEĞİL (timer aktif) — 'srvctl domain repair ${domain}' çalıştırın"
+        fi
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────
+#  FPM izolasyon durumu kontrolü — koordinatör bulgusu (bkz.
+#  _audit_fpm_isolation_verdict başlık yorumu — GEREKÇE/skor mantığı
+#  orada). Kullanım: _check_fpm_isolation <on_pass_fn> <on_fail_fn>
+#  <on_warn_fn> <domain> <sname> — AYNI explicit-injection deseni.
+#
+#  Test-seam: SRVCTL_FPM_DIR/SRVCTL_SYSTEMD_DIR — lib/domain.sh'taki AYNI
+#  desen (_domain_render_fpm_unit vb.) — varsayılan '/etc/srvctl/fpm' /
+#  '/etc/systemd/system', HOST'ta davranış DEĞİŞMEZ.
+# ───────────────────────────────────────────────────────────────
+_check_fpm_isolation() {
+    local on_pass="$1" on_fail="$2" on_warn="$3" domain="$4" sname="$5"
+    local fpm_dir="${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}"
+    local conf="${fpm_dir}/${sname}.conf"
+    local unit="srvctl-fpm-${sname}.service"
+
+    local config_exists=0 unit_active=0
+    [[ -f "$conf" ]] && config_exists=1
+    systemctl is-active --quiet "$unit" 2>/dev/null && unit_active=1
+
+    # Gerçekten izole + aktifse EFEKTİF ayara hiç bakmaya GEREK YOK — PASS
+    # verilir (bkz. _audit_fpm_isolation_verdict: bu dal isolated_setting'DEN
+    # BAĞIMSIZDIR). Domain.sh'ı (bir sonraki adım) YÜKLEMEDEN önce bu kısa
+    # devreyi yapmak, 100 domainlik bir kurulumda ZATEN izole olan
+    # (çoğunluk) domainler için gereksiz cross-module sourcing'i atlar.
+    if [[ "$config_exists" == "1" && "$unit_active" == "1" ]]; then
+        "$on_pass" "${domain}: FPM izole unit'te çalışıyor (srvctl-fpm-${sname}.service — AppArmor/seccomp/NoNewPrivileges kapsamında)"
+        return 0
+    fi
+
+    # İZOLE DEĞİL — WARN/FAIL ayrımı artık EFEKTİF ayara dayanır: GLOBAL
+    # DOMAIN_ISOLATED_FPM > per-domain '.srvctl-meta' ISOLATED_FPM override
+    # (bkz. _audit_effective_isolated_fpm başlık yorumu — koordinatör VM'de
+    # meta'nın root:root 644 olup web kullanıcısınca YAZILAMADIĞINI, yani
+    # bu okumaya güvenmenin GÜVENLİ olduğunu doğruladı).
+    #
+    # domain.sh yüklenemezse (bozuk kurulum — normalde BEKLENMEZ) efektif
+    # değer BİLİNMEZ: SESSİZCE global değere düşüp per-domain override'ı
+    # görmezden GELMEK, bilinçli bir WARN'ı FAIL'e yükseltebilir — bu yüzden
+    # burada "kanıt yok" WARN üretilir, FAIL DEĞİL (attr-okunamadı yarış
+    # durumundaki AYNI fail-closed/kanıt ayrımı — bkz. _check_worker_aa).
+    local isolated_setting=""
+    if ! isolated_setting="$(_audit_effective_isolated_fpm "$domain")"; then
+        "$on_warn" "${domain}: FPM paylaşılan havuzda görünüyor ama efektif izolasyon ayarı doğrulanamadı (domain.sh yüklenemedi — global/.srvctl-meta ISOLATED_FPM override okunamadı, kanıt yok) — 'srvctl security harden-fpm ${domain} --apply' önerilir"
+        return 0
+    fi
+
+    case "$(_audit_fpm_isolation_verdict "$config_exists" "$unit_active" "$isolated_setting")" in
+        WARN)
+            "$on_warn" "${domain}: FPM PAYLAŞILAN havuzda çalışıyor (efektif ISOLATED_FPM=false — global veya bu domain'in '.srvctl-meta'sında BİLİNÇLİ olarak ayarlanmış — bu domain için AppArmor/seccomp/NoNewPrivileges YOK)"
+            ;;
+        *)
+            "$on_fail" "${domain}: FPM PAYLAŞILAN havuzda çalışıyor — AppArmor/seccomp/NoNewPrivileges kaybı (paylaşılan php-fpm master'ında bunların HİÇBİRİ tanımlı değil) — 'srvctl security harden-fpm ${domain} --apply' çalıştırın"
+            ;;
+    esac
 }
 
 # ───────────────────────────────────────────────────────────────
@@ -104,6 +451,34 @@ _security_load_domain_lib() {
     source "$lib" || return 1
     declare -F _domain_fs_plan >/dev/null 2>&1 \
         && declare -F _domain_render_fpm_unit >/dev/null 2>&1
+}
+
+# ─── Domain'in EFEKTİF DOMAIN_ISOLATED_FPM değerini döner (koordinatör
+# takibi — _check_fpm_isolation'ın kapsam sınırının kapanışı) ───
+# ÖNCEDEN _check_fpm_isolation yalnız GLOBAL DOMAIN_ISOLATED_FPM'e
+# bakıyordu; bir domain kendi '.srvctl-meta'sında BİLİNÇLİ olarak
+# ISOLATED_FPM=false taşısa bile (global true iken) bu onu FAIL ediyordu —
+# "bilinçli tercihi sessiz sapmadan ayır" ilkesinin bir seviye aşağıda
+# İHLALİYDİ. Koordinatör gerçek VM'de doğruladı: '.srvctl-meta' root:root
+# 644 — domain'in KENDİ web kullanıcısı bu dosyaya YAZAMAZ (Permission
+# denied), yani meta'ya güvenmek (validate_bool ile doğrulanmış OKUMA)
+# GÜVENLİDİR; kendi FAIL'ini WARN'a düşürecek bir saldırı yüzeyi AÇMAZ.
+#
+# lib/domain.sh:_domain_isolated_fpm_effective TEK doğruluk kaynağıdır:
+# .srvctl-meta ISOLATED_FPM override > global DOMAIN_ISOLATED_FPM. Cross-
+# module erişim _security_load_domain_lib (bu dosyada ZATEN kurulu
+# konvansiyon, bkz. harden-fs/harden-fpm) ile guard'lı source edilir.
+#
+# PREDİKAT: 0=efektif değer GÜVENİLİR biçimde okundu (stdout: true|false).
+# 1=domain.sh yüklenemedi/fonksiyon tanımsız — bu durumda stdout BOŞTUR ve
+# ÇAĞIRAN (_check_fpm_isolation) bunu "kanıt yok" sayıp WARN üretmelidir;
+# SESSİZCE global değere düşüp per-domain override'ı görmezden GELMEMELİDİR
+# (aksi halde bilerek bir WARN durumunu FAIL'e yükseltmiş oluruz).
+_audit_effective_isolated_fpm() {
+    local domain="$1"
+    _security_load_domain_lib || return 1
+    declare -F _domain_isolated_fpm_effective >/dev/null 2>&1 || return 1
+    _domain_isolated_fpm_effective "$domain"
 }
 
 # ─── .srvctl-meta beyaz liste (O1 TAM kapanışı — denetim DALGA 5) ───
@@ -384,6 +759,12 @@ _security_audit() {
         _check "${domain}: chroot aktif" \
             bash -c "grep -q chroot '/etc/srvctl/fpm/${sname}.conf' 2>/dev/null || grep -q chroot '/etc/php/${php_ver}/fpm/pool.d/${sname}.conf' 2>/dev/null"
 
+        # FPM izolasyon durumu (koordinatör bulgusu — bkz. _check_fpm_isolation
+        # tanım yorumu): PAYLAŞILAN havuza düşmüş bir domain AppArmor/seccomp/
+        # NoNewPrivileges'in TAMAMINI sessizce kaybeder; bu HİÇBİR kontrol
+        # tarafından yakalanmıyordu.
+        _check_fpm_isolation _pass _fail _warn_result "$domain" "$sname"
+
         # ─── AppArmor/seccomp/cgroups — GERÇEK enforcement (T7b, denetim
         #     DALGA 5 — K1/Y4 kapanışı) ───
         # ÖNCEDEN: yalnız 'aa-status | grep' (VARLIK testi — bu profil
@@ -434,6 +815,14 @@ _security_audit() {
                 _fail "${domain}: cgroups slice attach DEĞİL (PID ${_fpm_pid})"
             fi
         fi
+
+        # Worker/scheduler '-cli' profili enforcement (BULGU kapanışı — bkz.
+        # yukarıdaki (_security_run_check yanındaki) _check_worker_aa/
+        # _check_scheduler_aa tanım yorumu). Her ikisi de kendi domain/
+        # kuyruk-tanımsızlık durumunu SESSİZCE atlar; burada FAIL/WARN sayımı
+        # yalnız "tanımlı+aktif ama enforce değil" durumunda artar.
+        _check_worker_aa _pass _fail _warn_result "$domain" "$sname"
+        _check_scheduler_aa _pass _fail _warn_result "$domain" "$sname"
 
         # Dosya izinleri
         local perm
