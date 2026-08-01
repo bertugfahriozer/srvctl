@@ -43,52 +43,98 @@
 #
 # KOMUT/ENJEKSİYON SÖZLEŞMESİ (ÇOK ÖNEMLİ — şablonların KENDİ başlık
 # yorumunda da belgelenmiştir, bkz. srvctl-cron.service.tpl):
-#   ExecStart=/bin/sh -c '{{CRON_COMMAND}}'  — yani CRON_COMMAND KASITLI
-#   OLARAK bir KABUK dizgesidir (crontab satırındaki komut kısmıyla AYNI
-#   semantik: '&&'/'|'/';'/yönlendirme/'$DEĞİŞKEN' BEKLENİR — aksi halde
-#   crontab'tan taşınan hiçbir gerçek iş çalışmazdı). systemd'nin Exec
-#   satırı ayrıştırıcısı KABUK DEĞİLDİR (yalnız boşlukla böler) — bu yüzden
-#   '/bin/sh -c' sarmalaması şablonun KENDİSİNDE sabit. render_template
-#   (core.sh) yalnız satırsonu/CR'yi reddeder; tek/çift tırnak, '$',
-#   backtick gibi kabuk metakarakterlerini KAÇIRMAZ (bilerek — genel bir
-#   string-replace katmanıdır). Bu yüzden İKİ kaçış adımı TAMAMEN BU MODÜLE
+#   ExecStart={{FLOCK_PREFIX}}/bin/sh -c '{{CRON_COMMAND}}'  — yani
+#   CRON_COMMAND KASITLI OLARAK bir KABUK dizgesidir (crontab satırındaki
+#   komut kısmıyla AYNI semantik: '&&'/'|'/';'/yönlendirme/'$DEĞİŞKEN'
+#   BEKLENİR — aksi halde crontab'tan taşınan hiçbir gerçek iş çalışmazdı).
+#   '/bin/sh -c' sarmalaması şablonun KENDİSİNDE sabit.
+#
+#   ÜÇÜNCÜ HOST BULGUSU (GERÇEK üretim sunucusunda ölçüldü — ÖNCEKİ İKİ
+#   AppArmor katmanından SONRA): 'echo tirnak testi' benzeri, TEK TIRNAK
+#   İÇEREN her komut 'sh[...]: Unterminated quoted string' (status=2) ile
+#   ÇÖKÜYORDU; tırnaksız komutlar (ör. 'php -v') SORUNSUZ çalışıyordu — yani
+#   hata AppArmor/DAC değil, SAF bir kaçış (escaping) hatasıydı. Kök neden
+#   İKİ KATLIYDI:
+#     (a) systemd'nin ExecStart= AYRIŞTIRICISI bir KABUK DEĞİLDİR (systemd
+#         bunu KENDİ tokenizer'ıyla, systemd.syntax(7) "Quoting" bölümünün
+#         kurallarına göre parse eder) AMA "yalnız boşlukla böler" DE
+#         DEĞİLDİR — tek VE çift tırnağı destekler, VE (POSIX kabuğun
+#         AKSİNE) '\' ters-eğik-çizgiyi tek tırnak İÇİNDE bile bir kaçış
+#         karakteri olarak işler (C-tarzı kaçış tablosu: '\\'→'\', "\\'"→
+#         "'", '\"'→'"', '\s'→boşluk, ...). ESKİ kod, POSIX kabuğun
+#         "' → '\''" (kapat/kaçırılmış-tırnak/aç) desenini kullanıyordu —
+#         bu systemd'nin KENDİ tokenizer'ında farklı yorumlanıyor (systemd
+#         '\'' içindeki '\''i "kaçırılmış tek tırnak" sanıp tırnağı
+#         KAPATMIYOR), bu yüzden ÇIKTI systemd tarafında dengesiz/bozuk
+#         kalıyordu.
+#     (b) ESKİ tasarım flock'u KENDİ '-c' bayrağıyla çağırıyordu
+#         ('flock ... -c '<komut>''  — flock'un '-c'si komutu KENDİSİ
+#         '/bin/sh -c' ile çalıştırır), bu da şablonun DIŞ '/bin/sh -c'sı
+#         İLE BİRLİKTE İKİ İÇ İÇE "kabuk betiği gömme" bağlamı yaratıyordu —
+#         bu modül de (yanlış) POSIX kaçışını İKİ KEZ uyguluyordu. Katman
+#         sayısı yanlış olmasaydı bile (a)'daki algoritma hatası TEK
+#         KATMANDA DA bozuk sonuç üretirdi (bkz. tests/test_cron_add.sh /
+#         test_cron_schedule.sh HOST-doğrulama testleri — GERÇEK systemd
+#         tokenizer'ını taklit eder, ara bir 'sh -c "$satır"' KULLANMAZ; bir
+#         ÖNCEKİ turda tam da bu ara kabuk katmanı YANLIŞ-NEGATİF üretmişti).
+#
+#   DÜZELTME — KATMAN SAYISI 2→1 VE DOĞRU ALGORİTMA:
+#     flock artık KENDİ '-c' bayrağıyla DEĞİL, exec-form ile çağrılır:
+#     'flock [-n] [-E kod] <kilit-dosyası> <komut> [argüman...]' — bu formda
+#     flock HİÇBİR METNİ YENİDEN AYRIŞTIRMAZ, kendisine VERİLEN argv'yi
+#     OLDUĞU GİBİ execve() eder (fork+exec+wait, exit kodunu devralır). Bu,
+#     flock'un KENDİ iç kabuk çağrısını TAMAMEN ORTADAN KALDIRIR — geriye
+#     TEK bir "metni bir kabuk bağlamına göm" noktası kalır: şablonun dış
+#     '/bin/sh -c '{{CRON_COMMAND}}''. FLOCK_PREFIX token'ı (_cron_add
+#     tarafından üretilir) ya boş dizgedir (sistem cron'u VEYA flock
+#     yoksa — satır doğrudan '/bin/sh' ile başlar) ya da
+#     "/usr/bin/flock -n -E 75 '<kaçırılmış-kilit-yolu>' " (sondaki BOŞLUK
+#     KASITLI — '/bin/sh'den ÖNCE ayraç).
+#
+#   render_template (core.sh) yalnız satırsonu/CR'yi reddeder; tek/çift
+#   tırnak, '$', backtick gibi kabuk metakarakterlerini KAÇIRMAZ (bilerek —
+#   genel bir string-replace katmanıdır). Bu yüzden kaçış TAMAMEN BU MODÜLE
 #   (aşağıdaki _cron_escape_* fonksiyonları) YÜKLENİR:
-#     1) TEK TIRNAK kaçışı (POSIX ' → '\''): CRON_COMMAND, şablonda TEK
-#        TIRNAK içine yerleştirildiğinden (ExecStart=/bin/sh -c '...'),
-#        ham metindeki HER tek tırnak bu desenle genişletilmek ZORUNDADIR —
-#        aksi halde metin ERKEN sonlanır ve geri kalanı systemd'nin Exec
-#        satırı sözdizimine SIZAR (en kötü durumda unit YÜKLENEMEZ/parse
-#        hatası verir; render_template'in newline/CR reddi sayesinde YENİ
-#        bir '[Section]'/'Key=' satırı ASLA enjekte edilemez — blast radius
-#        Exec satırının KENDİSİYLE sınırlıdır).
-#     2) '%' İKİLEMESİ: systemd, kabuğu görmeden ÖNCE ExecStart= (VE
-#        Description=) satırının TAMAMINDA KENDİ '%' specifier
-#        genişletmesini yapar (ör. '%h','%i') — ham komutta/açıklamada
-#        literal '%' varsa BU MODÜL onu '%%' olarak İKİLEMEK ZORUNDADIR.
-#   Bu iki adım _cron_add()'de UYGULANIR (bkz. o fonksiyonun "Kabuk
-#   sarmalama + kaçış" bölümü) — sıra: (a) [yalnız domain+flock] komut
-#   flock ile sarmalanır (bkz. aşağıdaki DEPLOY KİLİDİ notu, kendi İÇ
-#   tek-tırnak kaçışıyla), (b) TÜM gövdeye TEK TIRNAK kaçışı (dış bağlam
-#   için), (c) EN SON adım olarak '%' ikilemesi (hiçbir kaçış '%' üretmez/
-#   tüketmez, bu yüzden sıralama güvenlidir).
+#     1) _cron_escape_unit_squote: CRON_COMMAND (VE FLOCK_PREFIX'in İÇİNDEKİ
+#        kilit yolu) şablonda TEK TIRNAK içine yerleştirildiğinden
+#        (ExecStart=...'/bin/sh -c '...''), ham metin systemd'nin KENDİ
+#        C-tarzı kaçış kurallarına göre kaçırılmak ZORUNDADIR: ÖNCE HER '\'
+#        → '\\' (aksi halde systemd, SONRAKİ karakteri KENDİ kaçış
+#        tablosuna göre yanlış yorumlar), SONRA HER "'" → "\'" (systemd'nin
+#        TEK bilinen tek-tırnak kaçışı — POSIX'in "'\''" deseni SYSTEMD'DE
+#        ÇALIŞMAZ, yukarıdaki HOST bulgusu). Sıra ÖNEMLİDİR: ters-eğik-çizgi
+#        ÖNCE kaçırılmazsa, ikinci adımda ÜRETİLEN yeni '\' karakterleri
+#        YANLIŞLIKLA tekrar işlenirdi.
+#     2) '%' İKİLEMESİ (_cron_escape_percent): systemd, kabuğu görmeden ÖNCE
+#        ExecStart= (VE Description=) satırının TAMAMINDA KENDİ '%'
+#        specifier genişletmesini yapar (ör. '%h','%i') — ham komutta/
+#        açıklamada literal '%' varsa BU MODÜL onu '%%' olarak İKİLEMEK
+#        ZORUNDADIR. Bu adım tek-tırnak kaçışından SONRA uygulanır (1)
+#        hiçbir '\'/"'" üretmez/tüketmez, (2) hiçbir '%' üretmez/tüketmez —
+#        bu yüzden sıralama güvenlidir/commütatiftir).
+#   Her iki adım da _cron_add()'de UYGULANIR (bkz. o fonksiyonun "Kabuk
+#   sarmalama + kaçış" bölümü) — CRON_COMMAND ve (varsa) kilit yolu HER
+#   BİRİ KENDİ tek-tırnak span'i İÇİN AYRI AYRI, ama TEK KEZ kaçırılır.
 #
 # DEPLOY KİLİDİ (görev talebi — deploy sürerken domain cron'u ÇALIŞMAMALI):
 #   lib/deploy.sh:_deploy_lock 'flock -n 9' ile ${SRVCTL_LOCK_DIR:-/run/srvctl}/
 #   deploy-<sname>.lock dosyasını kilitler. Bu modül AYNI kilit dosyasını
-#   KARŞI taraftan kullanır: domain cron'unun kabuk gövdesi
-#   'flock -n -E 75 <kilit-dosyası> -c '<komut>'' İLE SARMALANIR — kilit
-#   deploy tarafından TUTULUYORSA flock komutu HİÇ ÇALIŞTIRMADAN 75
-#   (sysexits.h EX_TEMPFAIL — "geçici, yeniden dene") ile çıkar. '_on-failure'
-#   handler'ı bu KODU ÖZEL OLARAK tanır: log_action ile KAYDEDER ama
-#   send_notification ÇAĞIRMAZ (bu bir GERÇEK başarısızlık DEĞİL, beklenen
-#   bir atlama — deploy sırasında HER dakika bildirim spam'i istenmez). Bir
-#   SONRAKİ planlı tetiklemede (deploy muhtemelen bitmiş olacağından) normal
-#   şekilde tekrar dener — 'otomatik tekrar YOK' kuralına AYKIRI DEĞİLDİR
-#   (bu, systemd timer'ın zaten planlanmış BİR SONRAKİ çalışmasıdır, ekstra
-#   bir retry DEĞİL). 'flock' yoksa (çok minimal bir imaj) bu koruma
-#   ATLANIR ve operatör 'cron add' sırasında AÇIKÇA uyarılır (lib/deploy.sh
-#   ile AYNI graceful-degrade deseni). Sistem cron'ları ('--system') bir
-#   domain'e bağlı OLMADIĞINDAN bu sarmalamayı HİÇ ALMAZ.
+#   KARŞI taraftan kullanır: ExecStart, FLOCK_PREFIX ile
+#   'flock -n -E 75 '<kilit-dosyası>' /bin/sh -c '<komut>'' ŞEKLİNDE
+#   SARMALANIR — kilit deploy tarafından TUTULUYORSA flock komutu HİÇ
+#   ÇALIŞTIRMADAN 75 (sysexits.h EX_TEMPFAIL — "geçici, yeniden dene") ile
+#   çıkar. '_on-failure' handler'ı bu KODU ÖZEL OLARAK tanır: log_action ile
+#   KAYDEDER ama send_notification ÇAĞIRMAZ (bu bir GERÇEK başarısızlık
+#   DEĞİL, beklenen bir atlama — deploy sırasında HER dakika bildirim
+#   spam'i istenmez). Bir SONRAKİ planlı tetiklemede (deploy muhtemelen
+#   bitmiş olacağından) normal şekilde tekrar dener — 'otomatik tekrar YOK'
+#   kuralına AYKIRI DEĞİLDİR (bu, systemd timer'ın zaten planlanmış BİR
+#   SONRAKİ çalışmasıdır, ekstra bir retry DEĞİL). 'flock' yoksa (çok
+#   minimal bir imaj) bu koruma ATLANIR (FLOCK_PREFIX boş kalır) ve operatör
+#   'cron add' sırasında AÇIKÇA uyarılır (lib/deploy.sh ile AYNI
+#   graceful-degrade deseni). Sistem cron'ları ('--system') bir domain'e
+#   bağlı OLMADIĞINDAN bu sarmalamayı HİÇ ALMAZ (FLOCK_PREFIX her zaman
+#   boştur).
 #
 # YAZMA İZNİ (ProtectSystem=strict + ReadWritePaths=): domain cron'u
 # WORKING_DIR (WEB_ROOT/<domain>/current) DEĞİL, DOMAIN_ROOT'un TAMAMINA
@@ -535,14 +581,32 @@ _cron_apparmor_flock_ok() {
 #  KAÇIŞ YARDIMCILARI (bkz. dosya başındaki UZUN sözleşme yorumu)
 # ═══════════════════════════════════════════════
 
-# POSIX tek-tırnak kaçışı: her ' → '\'' (4 karakter). Değişkenler tek
-# başlarına birer karakter TUTAR — nested tırnak/backslash karmaşasından
-# kaçınmak için (bu dosyada bu tuzağa birden fazla kez düşüldü) doğrudan
-# harf harf birleştirilir, hiçbir yerde iç içe tırnak AÇILMAZ.
-_cron_escape_singlequote() {
-    local s="$1" q="'" bs='\'
-    local repl="${q}${bs}${q}${q}"
-    printf '%s' "${s//$q/$repl}"
+# systemd BİRİM DOSYASI tek-tırnaklı bir "item" için kaçış — BU POSIX KABUK
+# KAÇIŞI DEĞİLDİR (bkz. dosya başı "ÜÇÜNCÜ HOST BULGUSU" yorumu). systemd
+# ExecStart= gibi değerleri systemd.syntax(7)'nin "Quoting" bölümündeki
+# C-tarzı kaçış tablosuyla kendi ayrıştırıcısıyla çözer; bu tabloda TEK
+# bilinen tek-tırnak kaçışı "\'" tir (POSIX'in "'\''" deseni SYSTEMD'DE
+# ÇALIŞMAZ — GERÇEK üretim sunucusunda 'Unterminated quoted string' ile
+# ÖLÇÜLDÜ). Aynı tabloda ters-eğik-çizgi TEK TIRNAK İÇİNDE BİLE kaçış
+# karakteridir (POSIX kabuğun AKSİNE) — bu yüzden ham metindeki HER '\'
+# ÖNCE '\\' olarak KENDİSİ kaçırılmak ZORUNDADIR, aksi halde systemd
+# SONRAKİ karakteri kendi tablosuna göre (yanlış) yorumlar. Sıra ÖNEMLİDİR:
+# ÖNCE '\' → '\\', SONRA "'" → "\'" — tersi sırada ikinci adımın ÜRETTİĞİ
+# yeni '\' karakterleri yanlışlıkla BİRİNCİ adım tarafından tekrar
+# işlenmiş OLURDU (burada sıra zaten doğru: birinci adım BİTTİKTEN sonra
+# ikinci adım çalışır, ikinci adımın çıktısı bir daha BİRİNCİ adımdan
+# GEÇMEZ).
+#
+# BASH 'pattern' TUZAĞI: "${s//$bs/...}" gibi PATTERN tarafında TIRNAKSIZ
+# bir değişken kullanmak, değişkenin İÇERİĞİNİ (tek bir '\') bir glob
+# kaçış karakteri gibi yorumlatıp EŞLEŞMEYİ SESSİZCE BOZAR (ampirik
+# doğrulandı) — bu yüzden PATTERN tarafındaki HER değişken referansı
+# "$bs"/"$q" ŞEKLİNDE TIRNAKLANIR (bkz. aşağıdaki iki satır).
+_cron_escape_unit_squote() {
+    local s="$1" bs='\' q="'"
+    s="${s//"$bs"/$bs$bs}"
+    s="${s//"$q"/$bs$q}"
+    printf '%s' "$s"
 }
 
 # systemd '%' specifier ikilemesi (ExecStart= VE Description= için).
@@ -841,15 +905,28 @@ _cron_add() {
     fi
 
     # ── Kabuk sarmalama + kaçış (bkz. dosya başındaki UZUN sözleşme yorumu) ──
-    local shell_body
+    # TEK KATMANLI TASARIM: flock KENDİ '-c' bayrağıyla (iç kabuk çağırma)
+    # DEĞİL, exec-form ile ('flock <bayraklar> <kilit-dosyası> <komut>
+    # [argüman...]') kullanılır — flock hiçbir metni yeniden AYRIŞTIRMAZ,
+    # kendisine verilen argv'yi execve() eder. FLOCK_PREFIX (ExecStart'ın
+    # BAŞINA, '/bin/sh'den ÖNCE eklenir) boş kalabilir (sistem cron'u ya da
+    # flock yoksa) — bu durumda ExecStart doğrudan '/bin/sh' ile başlar
+    # (syscron şablonuyla BİREBİR AYNI biçim).
+    local flock_prefix=""
     if [[ "$is_system" != "true" ]]; then
         local lock_dir="${SRVCTL_LOCK_DIR:-/run/srvctl}"
         if command -v flock >/dev/null 2>&1; then
             secure_dir "$lock_dir" 700
-            local inner lockfile_q
-            inner=$(_cron_escape_singlequote "$command")
-            lockfile_q=$(_cron_escape_singlequote "${lock_dir}/deploy-${sname}.lock")
-            shell_body="flock -n -E 75 '${lockfile_q}' -c '${inner}'"
+            local lock_path lock_escaped
+            lock_path="${lock_dir}/deploy-${sname}.lock"
+            lock_escaped=$(_cron_escape_percent "$(_cron_escape_unit_squote "$lock_path")")
+            # Sondaki BOŞLUK KASITLI: FLOCK_PREFIX doluyken '/usr/bin/flock
+            # ... <kilit-dosyası>' İLE '/bin/sh' arasını ayırır. '/usr/bin/
+            # flock' MUTLAK yol OLARAK sabit — templates/apparmor/
+            # profile-cli.tpl'İN whitelist'i de AYNI mutlak yolu ('/usr/bin/
+            # flock rix,') bekler, bare 'flock' systemd'nin KENDİ arama
+            # yoluna (PATH benzeri ama AYNI DEĞİL) bel bağlardı.
+            flock_prefix="/usr/bin/flock -n -E 75 '${lock_escaped}' "
             info "Deploy kilidi entegrasyonu aktif: 'srvctl deploy ${domain}' sürerken bu cron ÇALIŞMAZ (çıkış kodu 75 ile sessizce atlanır, bildirim GÖNDERİLMEZ)."
 
             # AppArmor ön-kontrolü (koordinatör HOST bulgusu, İKİ katman —
@@ -864,15 +941,12 @@ _cron_add() {
                 warn "AppArmor profili GÜNCEL DEĞİL: /etc/apparmor.d/srvctl-${sname}-cli 'flock' exec VE/YA DA deploy kilidi dosyası ('/run/srvctl/deploy-${sname}.lock') izinlerinden birini İÇERMİYOR — bu cron çalıştığında 'Permission denied' (ör. 126) ile BAŞARISIZ OLUR. Düzeltme: 'srvctl domain repair ${domain}' (profili yeniden render edip AppArmor'a yeniden yükler), sonra 'srvctl cron run ${domain} ${name}' ile doğrulayın."
             fi
         else
-            shell_body="$command"
             warn "flock bulunamadı — bu cron deploy ile ÇAKIŞMAYA KARŞI KORUNMUYOR (lib/deploy.sh:_deploy_lock ile AYNI sınırlama)"
         fi
-    else
-        shell_body="$command"
     fi
 
     local cron_command_final description_final
-    cron_command_final=$(_cron_escape_percent "$(_cron_escape_singlequote "$shell_body")")
+    cron_command_final=$(_cron_escape_percent "$(_cron_escape_unit_squote "$command")")
     description_final=$(_cron_escape_percent "$description")
 
     mkdir -p "$sysd_dir"
@@ -908,6 +982,7 @@ _cron_add() {
             "WORKING_DIR=${working_dir}" "CRON_NAME=${name}" \
             "CRON_DESCRIPTION=${description_final}" "CRON_COMMAND=${cron_command_final}" \
             "RUNTIME_MAX=${timeout}" "DOMAIN_ROOT=${domain_root}" \
+            "FLOCK_PREFIX=${flock_prefix}" \
             > "$svc_file"
         _cron_assert_no_leftover_tokens "$svc_file"
 

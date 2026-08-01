@@ -84,7 +84,7 @@ a_out=$(render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.service.tpl" \
     SAFE_NAME=example_com DOMAIN=example.com WEB_USER=web_example_com \
     WORKING_DIR=/var/www/example.com/current CRON_NAME=cache-clear \
     CRON_DESCRIPTION="Cache temizligi" CRON_COMMAND="php artisan cache:clear" \
-    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com)
+    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com FLOCK_PREFIX=)
 
 assert_not_contains    "$a_out" "{{"                                     "A: leftover token yok"
 assert_contains        "$a_out" "Type=oneshot"                            "A: Type=oneshot (çakışma engeli — job coalescing)"
@@ -105,6 +105,37 @@ assert_contains        "$a_out" "StandardOutput=journal"                  "A: ç
 assert_contains        "$a_out" "StandardError=journal"                   "A: hata journal'a"
 assert_contains        "$a_out" "After=network.target srvctl-fpm-example_com.service" "A: FPM'den sonra sıralama"
 assert_directive_absent "$a_out" "Restart"                                "A: AKTİF Restart= yönergesi YOK (otomatik tekrar yasağı)"
+
+# ── A2) FLOCK_PREFIX DOLU İKEN — deploy kilidi sarmalaması ExecStart'ın
+#    BAŞINA, '/bin/sh'DEN ÖNCE eklenir (GERÇEK üretim sunucusunda ölçülen
+#    çift-kaçış hatasının düzeltmesi: flock artık KENDİ '-c' bayrağıyla
+#    DEĞİL, exec-form ile TEK KATMANLI çağrılır — bkz. lib/cron.sh dosya
+#    başı yorumu).
+a_out_flock=$(render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.service.tpl" \
+    SAFE_NAME=example_com DOMAIN=example.com WEB_USER=web_example_com \
+    WORKING_DIR=/var/www/example.com/current CRON_NAME=cache-clear \
+    CRON_DESCRIPTION="Cache temizligi" CRON_COMMAND="php artisan cache:clear" \
+    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com \
+    "FLOCK_PREFIX=/usr/bin/flock -n -E 75 '/run/srvctl/deploy-example_com.lock' ")
+assert_not_contains "$a_out_flock" "{{" "A2: leftover token yok (FLOCK_PREFIX doluyken)"
+assert_contains "$a_out_flock" \
+    "ExecStart=/usr/bin/flock -n -E 75 '/run/srvctl/deploy-example_com.lock' /bin/sh -c 'php artisan cache:clear'" \
+    "A2: FLOCK_PREFIX doluyken ExecStart TEK satırda flock+sh -c'yi doğru sırayla İÇERİYOR"
+assert_not_contains "$a_out_flock" "-c '/usr/bin/flock" \
+    "A2: flock KENDİ '-c' bayrağıyla ÇAĞRILMIYOR (exec-form — iç kabuk katmanı YOK)"
+
+# ── ENTEGRASYON RİSKİ — lib/cron.sh FLOCK_PREFIX BESLEMEYİ UNUTURSA (yeni
+#    token, sibling görev güncellemeli): sonuç SESSİZ bir bozukluk DEĞİL,
+#    literal '{{FLOCK_PREFIX}}' render çıktısında KALIR —
+#    _cron_assert_no_leftover_tokens (lib/cron.sh) BUNU YAKALAYIP
+#    fail-closed hata verir.
+a_out_missing_flock=$(render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.service.tpl" \
+    SAFE_NAME=example_com DOMAIN=example.com WEB_USER=web_example_com \
+    WORKING_DIR=/var/www/example.com/current CRON_NAME=cache-clear \
+    CRON_DESCRIPTION="Cache temizligi" CRON_COMMAND="php artisan cache:clear" \
+    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com)
+assert_contains "$a_out_missing_flock" "{{FLOCK_PREFIX}}" \
+    "ENTEGRASYON: lib/cron.sh FLOCK_PREFIX beslemeyi UNUTURSA render_template bunu literal bırakır (leftover-token guard'ının yakalayacağı sinyal)"
 
 # ═══════════════════════════════════════════════════════════════
 # B) srvctl-cron.timer.tpl — A'yı tetikler

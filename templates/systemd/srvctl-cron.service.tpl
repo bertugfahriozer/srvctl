@@ -1,7 +1,11 @@
 # TOKENS: SAFE_NAME DOMAIN WEB_USER WORKING_DIR CRON_NAME CRON_DESCRIPTION
-#         CRON_COMMAND RUNTIME_MAX DOMAIN_ROOT
+#         CRON_COMMAND RUNTIME_MAX DOMAIN_ROOT FLOCK_PREFIX
 # Besleyen: lib/cron.sh (ayrı bir görevde yazılıyor) — bu şablonun TOKEN
 # listesi görev tanımının SÖZLEŞMESİDİR, tek taraflı GENİŞLETİLMEMELİDİR.
+# FLOCK_PREFIX (GERÇEK üretim sunucusunda ölçülen bir kaçış hatasından
+# SONRA EKLENDİ — bkz. ExecStart= yorumu): ya boş dizgedir (sistem cron'u
+# taşımaz, ya da flock yoksa) ya da "/usr/bin/flock -n -E 75
+# '<kaçırılmış-kilit-yolu>' " (sonda BOŞLUK VAR — '/bin/sh'den önce ayraç).
 # DOMAIN_ROOT = '${WEB_ROOT}/${domain}' — worker.service.tpl/
 # scheduler.service.tpl İLE BİREBİR AYNI besleme deseni (bkz.
 # lib/domain.sh:_domain_render_worker_unit). BU TOKEN SONRADAN EKLENDİ
@@ -55,33 +59,51 @@ WorkingDirectory={{WORKING_DIR}}
 # CRON_COMMAND, kullanıcının klasik crontab satırındaki KOMUT kısmıdır —
 # '&&' / '|' / ';' / yönlendirme / '$DEĞİŞKEN' gibi KABUK semantiği
 # BEKLENİR (aksi halde crontab'tan taşınan hiçbir gerçek iş çalışmaz).
-# systemd'nin ExecStart= ayrıştırıcısı KABUK DEĞİLDİR (yalnız boşlukla
-# böler, '&&'/'|'/yönlendirmeyi TANIMAZ) — bu yüzden '/bin/sh -c' SARMALAMA
-# ZORUNLUDUR.
+# systemd'nin ExecStart= ayrıştırıcısı bir KABUK DEĞİLDİR (KENDİ
+# tokenizer'ıyla ayrıştırır — bkz. systemd.syntax(7) "Quoting"; redirection/
+# pipe/'&&' TANIMAZ) — bu yüzden '/bin/sh -c' SARMALAMA ZORUNLUDUR.
+#
+# GERÇEK üretim sunucusunda ÖLÇÜLEN HOST BULGUSU: TEK TIRNAK İÇEREN her
+# komut ('echo tirnak testi' gibi) 'sh: Unterminated quoted string'
+# (status=2) ile ÇÖKÜYORDU — tırnaksız komutlar SORUNSUZDU, yani AppArmor/
+# DAC değil, SAF bir kaçış hatasıydı. Kök neden: systemd'nin OWN
+# tokenizer'ı, POSIX kabuğun AKSİNE, ters-eğik-çizgiyi TEK TIRNAK İÇİNDE
+# BİLE bir kaçış karakteri sayar (C-tarzı kaçış tablosu — '\\'→'\',
+# "\\'"→"'", ...) — POSIX'in "' → '\''" deseni bu tokenizer'da FARKLI
+# yorumlanıp tırnağı dengesiz bırakıyordu. Bunun ÜZERİNE eski tasarım
+# flock'u KENDİ '-c' bayrağıyla (İKİNCİ bir iç kabuk çağrısı) sarmaladığı
+# İÇİN aynı (yanlış) kaçış İKİ KEZ uygulanıyordu — İKİ ayrı hata üst üste
+# binmişti (yanlış algoritma + gereksiz ikinci katman).
 #
 # render_template (core.sh) yalnız değerin satırsonu/CR içermediğini
 # doğrular; TEK/ÇİFT TIRNAK, '$', ters-eğik-çizgi, backtick gibi KABUK
 # METAKARAKTERLERİNİ KAÇIRMAZ (bilerek — core.sh generic bir string-replace
 # katmanıdır, şablon-özel kaçış mantığı TAŞIMAZ). Bu yüzden aşağıdaki
-# SARMALAMA SÖZLEŞMESİ lib/cron.sh'A YÜKLENİR (görev tanımı da bunu teyit
-# ediyor: "lib/cron.sh tarafında da doğrulama olacak"):
-#   1) CRON_COMMAND burada TEK TIRNAK içine yerleştirilir. lib/cron.sh,
-#      kullanıcıdan aldığı HAM komuttaki her TEK TIRNAK'ı POSIX kabuk
-#      kaçış deseniyle GENİŞLETMEK ZORUNDADIR: ' → '\'' (örn. "it's" →
-#      "it'\''s"). Bu, KEYFİ metni TEK TIRNAKLI bir kabuk bağlamına
-#      yerleştirmenin TEK eksiksiz/güvenli yoludur — çift tırnak YETERSİZ
-#      kalır çünkü '$', backtick, '\' o bağlamda HÂLÂ kabuk tarafından
-#      yorumlanır.
-#   2) systemd, kabuğu görmeden ÖNCE ExecStart= satırının TAMAMINDA KENDİ
+# SARMALAMA SÖZLEŞMESİ lib/cron.sh'A YÜKLENİR:
+#   1) FLOCK_PREFIX (yeni token — bkz. dosya başı TOKENS notu): flock artık
+#      KENDİ '-c'siyle DEĞİL, exec-form ile çağrılır ('flock <bayraklar>
+#      <kilit-dosyası> <komut> [argüman...]') — flock hiçbir metni yeniden
+#      AYRIŞTIRMAZ, argv'yi OLDUĞU GİBİ execve() eder. Böylece TEK bir
+#      "metni kabuk bağlamına göm" noktası kalır: aşağıdaki '/bin/sh -c
+#      '...''. FLOCK_PREFIX boşsa (sistem cron'u/flock yok) satır doğrudan
+#      '/bin/sh' ile başlar.
+#   2) CRON_COMMAND burada TEK TIRNAK içine yerleştirilir. lib/cron.sh,
+#      kullanıcıdan aldığı HAM komuttaki HER '\' karakterini ÖNCE '\\'
+#      olarak, SONRA HER "'" karakterini "\'" olarak kaçırmak ZORUNDADIR
+#      (_cron_escape_unit_squote — systemd.syntax(7)'nin C-tarzı kaçış
+#      tablosu; POSIX'in "'\''" deseni YUKARIDAKİ HOST bulgusu nedeniyle
+#      KULLANILMAZ). FLOCK_PREFIX içindeki kilit dosyası yolu da AYNI
+#      fonksiyonla, KENDİ tek-tırnak span'i için AYRICA kaçırılır.
+#   3) systemd, kabuğu görmeden ÖNCE ExecStart= satırının TAMAMINDA KENDİ
 #      '%' SPECIFIER genişletmesini yapar (ör. '%h', '%i') — bu şablondan
 #      BAĞIMSIZ, systemd.unit(5)'in temel davranışıdır ve yalnız
 #      ExecStart'a değil Description= gibi diğer değerlere de UYGULANIR.
 #      Ham komutta/açıklamada literal '%' varsa lib/cron.sh bunu '%%'
 #      olarak İKİLEMELİDİR — aksi halde unit YÜKLENEMEZ (systemd tanınmayan
 #      specifier'da fail-closed davranır) ya da specifier YANLIŞ genişler.
-# Bu iki kaçış adımı render_template'in string-replace doğasıyla BU
+# Bu kaçış adımları render_template'in string-replace doğasıyla BU
 # ŞABLONDA UYGULANAMAZ — bu yüzden SÖZLEŞME olarak burada belgeleniyor.
-ExecStart=/bin/sh -c '{{CRON_COMMAND}}'
+ExecStart={{FLOCK_PREFIX}}/bin/sh -c '{{CRON_COMMAND}}'
 
 Slice=srvctl-{{SAFE_NAME}}.slice
 # worker/scheduler İLE AYNI gerekçe: FPM'in chroot/setuid'li profili

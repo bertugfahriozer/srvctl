@@ -28,6 +28,90 @@ source "${REPO_ROOT}/lib/cron.sh"
 _run_isolated() { ( "$@" ); }
 ex() { [[ -e "$1" ]] && echo var || echo yok; }
 
+# ═══════════════════════════════════════════════════════════════
+# systemd'nin GERÇEK ExecStart= tokenizer'ının (systemd.syntax(7)
+# "Quoting" bölümü) MİNİMAL bir modeli — GERÇEK üretim sunucusunda ölçülen
+# çift-kaçış hatasının test harness'inin KENDİSİ tarafından maskelendiği
+# bir ÖNCEKİ turdan sonra ZORUNLU kılındı: "gerçek /bin/sh ile test ettim"
+# denemesi, test harness'inin KENDİ ekstra 'sh -c "$satır"' katmanı YÜZÜNDEN
+# yanlış-negatif vermişti (systemd ARA bir kabuk KULLANMAZ, KENDİ
+# tokenizer'ıyla doğrudan argv üretir). Bu fonksiyon systemd'nin KENDİ
+# davranışını taklit eder: ExecStart= değerini (specifier '%%' ikilemesi
+# ÇÖZÜLMÜŞ hâliyle) boşluğa göre böler, tek/çift tırnağı TOGGLE eder, VE —
+# POSIX kabuğun AKSİNE — ters-eğik-çizgiyi TEK TIRNAK İÇİNDE BİLE bir kaçış
+# karakteri sayar (C-tarzı kaçış tablosunun bu testte gereken alt kümesi:
+# '\\','\'',\",\\s,\\n,\\t,\\r — bkz. lib/cron.sh:_cron_escape_unit_squote
+# yorumu). Sonuç, ARA bir kabuk KULLANILMADAN (namerefs 'local -n' macOS
+# /bin/bash 3.2'de YOK — bkz. lib/deploy.sh:_deploy_php_parse_token
+# yorumu) GLOBAL 'REPLY_ARGV' dizisine yazılır; çağıran bunu DOĞRUDAN
+# "${REPLY_ARGV[@]}" olarak çalıştırabilir (execve benzeri, yeniden
+# ayrıştırma YOK).
+REPLY_ARGV=()
+_systemd_split_execstart() {
+    local val="$1"
+    REPLY_ARGV=()
+    local n=${#val} i=0 c nc
+    local cur="" have_cur=0
+    local in_squote=0 in_dquote=0
+    while (( i < n )); do
+        c="${val:i:1}"
+        if [[ $in_squote -eq 0 && $in_dquote -eq 0 ]]; then
+            if [[ "$c" == ' ' || "$c" == $'\t' ]]; then
+                if (( have_cur )); then
+                    REPLY_ARGV+=("$cur")
+                    cur="" have_cur=0
+                fi
+                i=$((i+1))
+                continue
+            fi
+        fi
+        have_cur=1
+        if [[ "$c" == '\' && $((i+1)) -lt $n ]]; then
+            nc="${val:i+1:1}"
+            case "$nc" in
+                '\') cur+='\' ;;
+                "'") cur+="'" ;;
+                '"') cur+='"' ;;
+                s) cur+=' ' ;;
+                n) cur+=$'\n' ;;
+                t) cur+=$'\t' ;;
+                r) cur+=$'\r' ;;
+                *) cur+="$nc" ;;
+            esac
+            i=$((i+2))
+            continue
+        fi
+        if [[ "$c" == "'" && $in_dquote -eq 0 ]]; then
+            if (( in_squote )); then in_squote=0; else in_squote=1; fi
+            i=$((i+1))
+            continue
+        fi
+        if [[ "$c" == '"' && $in_squote -eq 0 ]]; then
+            if (( in_dquote )); then in_dquote=0; else in_dquote=1; fi
+            i=$((i+1))
+            continue
+        fi
+        cur+="$c"
+        i=$((i+1))
+    done
+    if (( have_cur )); then
+        REPLY_ARGV+=("$cur")
+    fi
+}
+
+# Verilen .service dosyasından ExecStart= satırını okuyup GERÇEK systemd
+# argv'sine ayırır (yukarıdaki tokenizer ile) — sonuç GLOBAL REPLY_ARGV'de.
+_extract_execstart_argv() {
+    local svc_file="$1" line val
+    line=$(grep -m1 '^ExecStart=' "$svc_file" 2>/dev/null)
+    val="${line#ExecStart=}"
+    # systemd specifier '%%' ikilemesinin GERİ ALINMASI — ExecStart satırının
+    # TAMAMINDA, tırnak/kaçış ayrıştırmasından BAĞIMSIZ bir ÖN adım (bkz.
+    # lib/cron.sh dosya başı yorumu: '%' hiçbir kaçış üretmez/tüketmez).
+    val="${val//%%/%}"
+    _systemd_split_execstart "$val"
+}
+
 systemctl_log="${WEB_ROOT}/.systemctl.log"
 : > "$systemctl_log"
 systemctl() {
@@ -69,7 +153,7 @@ assert_contains "$svc_content" "TimeoutStartSec=120" "1) --timeout RUNTIME_MAX'a
 # Beklenen değer ELLE YAZILMAZ (kırılgan/hataya açık) — _cron_add'in KENDİ
 # kullandığı GERÇEK fonksiyonlarla (test_cron_schedule.sh'taki uçtan uca
 # testle AYNI mantık) hesaplanır.
-expected_execstart="ExecStart=/bin/sh -c '$(_cron_escape_percent "$(_cron_escape_singlequote 'echo "it'"'"'s 50% done"')")'"
+expected_execstart="ExecStart=/bin/sh -c '$(_cron_escape_percent "$(_cron_escape_unit_squote 'echo "it'"'"'s 50% done"')")'"
 assert_contains "$svc_content" "$expected_execstart" \
     "1) ExecStart: tek tırnak + '%' ikilemesi UÇTAN UCA doğru kaçırıldı"
 

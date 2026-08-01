@@ -219,12 +219,26 @@ assert_ok  _cron_ident_ok "$(printf 'a%.0s' $(seq 1 50))"
 #     ARASINDAKİ EN KRİTİK SINIR — koordinatör talebiyle AYRICA vurgulandı)
 # ═══════════════════════════════════════════════
 
-assert_eq "$(_cron_escape_singlequote "it's a test")" "it'\\''s a test" \
-    "tek-tırnak kaçışı: TEK tırnak doğru genişletiliyor"
-assert_eq "$(_cron_escape_singlequote "a'b'c")" "a'\\''b'\\''c" \
-    "tek-tırnak kaçışı: BİRDEN FAZLA tek tırnak doğru genişletiliyor"
-assert_eq "$(_cron_escape_singlequote "no quotes here")" "no quotes here" \
+# NOT — SÖZLEŞME DEĞİŞTİ: eskiden komut İKİ kabuk katmanından geçiyordu
+# (dıştaki 'sh -c' + içteki 'flock ... -c') ve kaçış İKİ KEZ uygulanıyordu.
+# Bu, GERÇEK üretim sunucusunda ölçülen bir hataya yol açtı: birinci geçişin
+# ürettiği dizi ikinci geçişte yeniden işlenip dengesiz kalıyordu —
+#   komut: echo 'tirnak testi'
+#   sonuç: sh: testi''''': 1: Syntax error: Unterminated quoted string (exit 2)
+# Çözüm: flock artık ExecStart'ın BAŞINA prefix olarak geliyor (FLOCK_PREFIX
+# token'ı), kabuk katmanı BİRE indi ve kaçış TEK KEZ uygulanıyor.
+#
+# Kaçış artık POSIX kabuk kuralı ('\'') DEĞİL, systemd'nin UNIT DOSYASI
+# kuralı: tek tırnak içinde '\' → '\\' ve "'" → "\'". Çünkü tırnakları
+# kaldıran taraf kabuk değil systemd'nin kendi ayrıştırıcısıdır.
+assert_eq "$(_cron_escape_unit_squote "it's a test")" "it\\'s a test" \
+    "tek-tırnak kaçışı: TEK tırnak systemd kuralıyla kaçırılıyor"
+assert_eq "$(_cron_escape_unit_squote "a'b'c")" "a\\'b\\'c" \
+    "tek-tırnak kaçışı: BİRDEN FAZLA tek tırnak doğru kaçırılıyor"
+assert_eq "$(_cron_escape_unit_squote "no quotes here")" "no quotes here" \
     "tek-tırnak kaçışı: tırnak yoksa DEĞİŞMEZ"
+assert_eq "$(_cron_escape_unit_squote 'a\b')" 'a\\b' \
+    "ters bölü kaçışı: '\\' ikileniyor (systemd onu kaçış karakteri sayar)"
 assert_eq "$(_cron_escape_percent "50% tamamlandı")" "50%% tamamlandı" \
     "'%' ikilemesi: literal '%' doğru ikileniyor (systemd specifier savunması)"
 assert_eq "$(_cron_escape_percent "no percent")" "no percent" \
@@ -238,6 +252,31 @@ assert_eq "$(_cron_escape_percent "no percent")" "no percent" \
 # (EN SON adım, systemd'nin specifier genişletmesine karşı). Sonucu GERÇEK
 # bir /bin/sh'a vererek (yalnız string eşitliği DEĞİL) orijinal komutun
 # AYNEN çalıştığını doğruluyoruz.
+# systemd'nin TEK TIRNAKLI unit argümanını açma kuralının test-yerel
+# emülatörü. NEDEN ELLE YAZILDI: bu hatayı iki kez KAÇIRDIK, iki seferde de
+# aynı sebeple — doğrulama sırasında araya KENDİ kabuk katmanımızı koyduk
+# (bir kez testte 'sh -c "$satır"', bir kez elle SSH heredoc + bash -c ile).
+# O fazladan katman, systemd'nin YAPMADIĞI bir kabuk yorumu ekleyip dizgiyi
+# değiştirdiği için test/ölçüm "çalışıyor" derken üretim patlıyordu.
+# Burada systemd'nin ayrıştırmasını AÇIKÇA taklit ediyoruz: tırnak içindeki
+# '\\' → '\' ve "\'" → "'". Tek geçişte, soldan sağa — çünkü iki ayrı
+# değiştirme yapmak '\\'' gibi dizilerde birinci geçişin çıktısını ikinci
+# geçişin yeniden işlemesine yol açar (bozulan eski tasarımın aynı hatası).
+_systemd_unquote_single() {
+    local s="$1" out="" i=0 c n
+    while (( i < ${#s} )); do
+        c="${s:i:1}"
+        if [[ "$c" == '\' ]]; then
+            n="${s:i+1:1}"
+            case "$n" in
+                '\'|"'") out+="$n"; i=$((i + 2)); continue ;;
+            esac
+        fi
+        out+="$c"; i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
+
 raw_cmd='echo "it'"'"'s a test with 50% completion"'
 # raw_cmd, GERÇEKTEN çalıştırıldığında ne üretir? (beklenen sonuç — kaçıştan
 # TAMAMEN bağımsız, referans değer)
@@ -245,7 +284,7 @@ expected=$(sh -c "$raw_cmd" 2>/dev/null)
 assert_eq "$expected" "it's a test with 50% completion" \
     "test fixture'ı doğru kuruldu: raw_cmd GERÇEKTEN tek tırnak + '%' içeriyor"
 
-cron_command_value=$(_cron_escape_percent "$(_cron_escape_singlequote "$raw_cmd")")
+cron_command_value=$(_cron_escape_percent "$(_cron_escape_unit_squote "$raw_cmd")")
 # systemd, ExecStart satırını ('/bin/sh -c '{{CRON_COMMAND}}'' — ŞABLONUN
 # KENDİSİ, bkz. srvctl-cron.service.tpl) ayrıştırırken HEM '%' specifier
 # ikilemesini GERİ ALIR HEM DE tek tırnakları KABUK-BENZERİ KURALLARLA
@@ -253,11 +292,24 @@ cron_command_value=$(_cron_escape_percent "$(_cron_escape_singlequote "$raw_cmd"
 # YOK — '%' geri alma ELLE simüle edilir; tek-tırnak kaldırma İSE gerçek bir
 # kabuğa (dıştaki 'sh -c') DEĞERİ ŞABLONDAKİ GİBİ TEK TIRNAK İÇİNE KOYARAK
 # devredilir (yalnız string manipülasyonu DEĞİL, GERÇEK kabuk ayrıştırması).
+# systemd'nin ExecStart satırını işleme sırası (şablon:
+# 'ExecStart={{FLOCK_PREFIX}}/bin/sh -c '{{CRON_COMMAND}}''):
+#   1) '%' specifier genişletmesi — '%%' tekrar tek '%' olur
+#   2) tek tırnaklı argümanın açılması — argv[2] olarak /bin/sh'a verilir
 after_systemd_percent_undo="${cron_command_value//%%/%}"
-simulated_unit_execstart="/bin/sh -c '${after_systemd_percent_undo}'"
-reconstructed=$(sh -c "$simulated_unit_execstart" 2>/dev/null)
+argv2=$(_systemd_unquote_single "$after_systemd_percent_undo")
+
+# ÖNCE round-trip: systemd'nin açması ham komutu BİREBİR geri vermeli.
+# Bu assertion, kabuk hiç çalıştırılmadan kaçış zincirinin doğruluğunu
+# kanıtlar — bozuk çift kaçış tam olarak BURADA yakalanırdı.
+assert_eq "$argv2" "$raw_cmd" \
+    "uçtan uca: kaçış→systemd açması round-trip'i ham komutu BİREBİR geri veriyor"
+
+# SONRA gerçek çalıştırma: argv[2] tam olarak systemd'nin vereceği değer;
+# araya BAŞKA bir kabuk yorumu KOYULMUYOR (yanlış-negatifin kaynağı buydu).
+reconstructed=$(sh -c "$argv2" 2>/dev/null)
 assert_eq "$reconstructed" "$expected" \
-    "uçtan uca: tek-tırnak+'%' İÇEREN komut, çift kaçıştan sonra GERÇEK kabukta (şablonun '/bin/sh -c '\''...'\''' bağlamı simüle edilerek) orijinaliyle AYNI şekilde çalışıyor"
+    "uçtan uca: tek-tırnak+'%' içeren komut, systemd'nin vereceği argv[2] ile GERÇEK kabukta orijinaliyle AYNI çalışıyor"
 
 # ═══════════════════════════════════════════════
 #  7) UNIT ADLANDIRMA — çakışmayan ad uzayı (cron/cronfail, syscron/syscronfail)

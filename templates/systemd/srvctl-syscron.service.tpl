@@ -32,12 +32,19 @@ TimeoutStartSec={{RUNTIME_MAX}}
 # ─── ExecStart: kabuk sarmalama + komut enjeksiyonu SÖZLEŞMESİ ───
 # srvctl-cron.service.tpl başlığındaki UZUN yorumla BİREBİR AYNI sözleşme
 # geçerlidir (özet): (1) CRON_COMMAND TEK TIRNAK içine yerleştirilir —
-# lib/cron.sh, ham komuttaki her tek tırnağı ' → '\'' olarak KAÇIRMAK
-# ZORUNDADIR (TEK eksiksiz/güvenli gömme yöntemi bu). (2) systemd, ExecStart
-# satırının TAMAMINDA KENDİ '%' specifier genişletmesini YAPAR (kabuktan
-# BAĞIMSIZ) — ham komutta literal '%' varsa lib/cron.sh bunu '%%' olarak
-# İKİLEMELİDİR. render_template (core.sh) yalnız satırsonu/CR'yi reddeder,
-# bu iki kaçışı YAPMAZ — SORUMLULUK lib/cron.sh'TADIR.
+# lib/cron.sh, ham komuttaki HER '\' karakterini ÖNCE '\\' olarak, SONRA
+# HER "'" karakterini "\'" olarak kaçırmak ZORUNDADIR
+# (_cron_escape_unit_squote — systemd.syntax(7)'nin C-tarzı kaçış tablosu;
+# POSIX kabuğun "' → '\''" deseni systemd'nin KENDİ tokenizer'ında ÇALIŞMAZ
+# — GERÇEK üretim sunucusunda 'Unterminated quoted string' ile ÖLÇÜLDÜ,
+# bkz. srvctl-cron.service.tpl). (2) systemd, ExecStart satırının
+# TAMAMINDA KENDİ '%' specifier genişletmesini YAPAR (kabuktan BAĞIMSIZ) —
+# ham komutta literal '%' varsa lib/cron.sh bunu '%%' olarak İKİLEMELİDİR.
+# render_template (core.sh) yalnız satırsonu/CR'yi reddeder, bu kaçışları
+# YAPMAZ — SORUMLULUK lib/cron.sh'TADIR. Sistem cron'u FLOCK_PREFIX
+# TAŞIMAZ (bir domain'e bağlı olmadığından deploy kilidi anlamsızdır — bkz.
+# lib/cron.sh dosya başı yorumu) — ExecStart HER ZAMAN doğrudan '/bin/sh'
+# ile başlar.
 ExecStart=/bin/sh -c '{{CRON_COMMAND}}'
 
 # Restart= BİLİNÇLİ OLARAK KULLANILMIYOR (görev tanımı madde 5) — domain
