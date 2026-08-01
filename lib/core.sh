@@ -32,9 +32,53 @@ warn()    { echo -e "  ${YELLOW}⚠${NC}  $*" >&2; }
 error()   { echo -e "  ${RED}✗${NC}  $*" >&2; exit 1; }
 step()    { echo -e "  ${CYAN}[${1}]${NC} ${2}"; }
 
+# srvctl olay günlüğü. HER ZAMAN 0 döner ve stderr'e HİÇBİR ŞEY sızdırmaz.
+#
+# GEREKÇE (güvenlik denetimi — "sessiz fail-closed" sınıfı): bu fonksiyon
+# ARTIK güvenlik olaylarının (bkz. security_event/security_error) kalıcı iz
+# bırakma yoludur ve secure_file/secure_dir gibi ÇOK sık çağrılan
+# yardımcıların İÇİNDEN tetiklenebilir. Eski hâli 'mkdir -p' başarısız
+# olduğunda (yazılamayan/olmayan log dizini, macOS geliştirme kutusu, test
+# harness'ı) HEM stderr'e ham bir 'mkdir: Permission denied' basıyor HEM DE
+# sıfırdan farklı dönüyordu — 'set -e' altında bu, LOG YAZAMAMANIN ASIL
+# KOMUTU ÖLDÜRMESİ demekti. Loglama bir yan etkidir; asla akışı düşürmemeli
+# ve asla operatörün gördüğü çıktıyı kirletmemelidir.
 log_action() {
-    mkdir -p "$(dirname "${SRVCTL_LOG}")"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$(whoami)] $*" >> "${SRVCTL_LOG}"
+    local dir
+    dir=$(dirname "${SRVCTL_LOG}")
+    mkdir -p "$dir" 2>/dev/null || return 0
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(whoami)" "$*" \
+        >> "${SRVCTL_LOG}" 2>/dev/null || return 0
+    return 0
+}
+
+# ─── GÜVENLİK OLAYI RAPORLAMA (İKİ KANAL: operatör + kalıcı iz) ───
+#
+# ÖLÇÜLEN KUSUR (bu depoda TEKRARLAYAN hata sınıfı — "sessiz fail-closed"):
+# deploy kilidi sembolik bağ saldırısı fail-closed reddedildiğinde davranış
+# DOĞRUYDU ama olay YALNIZ stderr'de, YALNIZ o anlık terminalde yaşıyordu:
+#   * stdout'a 0 bayt yazılıyordu (ölçüldü — bkz. tests/
+#     test_lock_symlink_visibility.sh),
+#   * '/usr/local/srvctl/logs/srvctl.log' dosyasına HİÇ satır düşmüyordu
+#     (ölçüldü) — çünkü bu yolun HİÇBİR yerinde 'log_action' YOKTU.
+# Sonuç: biri root'a keyfi chown/truncate primitifi denediğinde operatörün
+# elinde SONRADAN bakılabilecek HİÇBİR kanıt kalmıyordu. Reddetmek yetmez;
+# güvenlik olayı KAYDEDİLMELİDİR.
+#
+# İki fonksiyon, İKİ farklı akış kararı için:
+#   security_event  → warn (stderr) + log_action, AKIŞ DEVAM EDER (0 döner).
+#   security_error  → log_action + error (stderr) ve ÇIKAR (exit 1).
+# İkisi de log satırını 'GÜVENLİK' önekiyle yazar — 'grep GÜVENLİK
+# /usr/local/srvctl/logs/srvctl.log' tek komutla tüm olayları verir.
+security_event() {
+    warn "$*"
+    log_action "GÜVENLİK OLAYI: $*"
+    return 0
+}
+
+security_error() {
+    log_action "GÜVENLİK REDDİ: $*"
+    error "$*"
 }
 
 # ─── Ayırıcılar ───
@@ -565,10 +609,19 @@ _require_owned_or_warn() {
 # bir '-h' karşılığı YOKTUR; bu yüzden kontrol chmod'dan hemen ÖNCE tekrar
 # yapılır ve asıl savunma, kilit ağacında dizinin artık domain kullanıcısına
 # YAZILABİLİR OLMAMASIDIR — bkz. _srvctl_lock_ensure.)
+#
+# GÖRÜNÜRLÜK (güvenlik denetimi — "sessiz fail-closed" düzeltmesi): red
+# ARTIK 'warn' DEĞİL 'security_event' ile bildirilir. Fark, olayın srvctl
+# olay günlüğüne de DÜŞMESİDİR: reddin kendisi doğru davranıştı ama olay
+# terminal kapandığında BUHARLAŞIYORDU (ölçüldü: srvctl.log'a 0 satır).
+# Ayrıca bağın HEDEFİ de yazılır — operatörün ihlali inceleyebilmesi için
+# "hangi dosyaya yönlendirilmek istendi" bilgisi ZORUNLUDUR.
 _reject_symlink() {
     local path="$1" kind="$2"
     [[ -L "$path" ]] || return 0
-    warn "Güvenlik: '${path}' bir sembolik bağ — ${kind} mod/sahiplik uygulaması REDDEDİLDİ (symlink saldırısı olabilir)"
+    local target=""
+    target=$(readlink "$path" 2>/dev/null) || target=""
+    security_event "SEMBOLİK BAĞ REDDEDİLDİ (${kind}): '${path}' bir sembolik bağ${target:+ → hedef: '${target}'} — mod/sahiplik uygulaması YAPILMADI. Bu, root'a KEYFİ bir dosyayı chown/truncate ettirme girişimi olabilir; ilgili domain için 'srvctl domain repair <domain>' çalıştırın ve hedef dosyanın sahipliğini/içeriğini DOĞRULAYIN."
     return 1
 }
 
@@ -670,22 +723,33 @@ _srvctl_lock_file_path() {
 }
 
 # Kilit ağacını güvenli izinlerle KURAR/ONARIR ve domain alt dizininin
-# YOLUNU stdout'a yazar. Başarısızlıkta (ör. bir bileşen sembolik bağ ise)
-# 1 döner ve HİÇBİR ŞEY yazmaz — çağıran fail-closed davranmalıdır.
+# YOLUNU stdout'a yazar. Başarısızlıkta 1 döner ve stdout'a HİÇBİR ŞEY
+# yazmaz — çağıran fail-closed davranmalıdır.
+#
+# GÖRÜNÜRLÜK SÖZLEŞMESİ (güvenlik denetimi düzeltmesi): HİÇBİR başarısızlık
+# dalı SESSİZ DEĞİLDİR. Eskiden her adım çıplak '|| return 1' idi; symlink
+# dalında en azından _reject_symlink konuşuyordu, ama mkdir/chmod'un
+# başarısız olduğu dallarda operatöre yalnız ham 'mkdir: ...' satırı
+# ulaşıyor, srvctl loguna HİÇBİR iz düşmüyordu. Artık HANGİ adımın
+# düştüğü hem stderr'e hem olay günlüğüne yazılır.
 _srvctl_lock_ensure() {
     local sname="$1" web_user="$2"
     local base="${SRVCTL_LOCK_DIR:-/run/srvctl}"
     local dom_dir; dom_dir=$(_srvctl_lock_dir_path "$sname")
     local lock_file; lock_file=$(_srvctl_lock_file_path "$sname")
 
-    secure_dir "$base" 711 || return 1
-    secure_dir "${base}/locks" 711 || return 1
+    secure_dir "$base" 711 \
+        || { security_event "Kilit ağacı KURULAMADI (adım 1/4 — taban dizin): '${base}'"; return 1; }
+    secure_dir "${base}/locks" 711 \
+        || { security_event "Kilit ağacı KURULAMADI (adım 2/4 — locks dizini): '${base}/locks'"; return 1; }
     # 710 root:web_<sname> — sahiplik ROOT'ta; domain kullanıcısına yalnız
     # GEÇİŞ (--x) hakkı kalır (unlink/create YOK).
-    secure_dir "$dom_dir" 710 "root:${web_user}" || return 1
+    secure_dir "$dom_dir" 710 "root:${web_user}" \
+        || { security_event "Kilit ağacı KURULAMADI (adım 3/4 — domain kilit dizini): '${dom_dir}'"; return 1; }
     # Kilit dosyası ROOT tarafından ÖN-OLUŞTURULUR (flock(1) artık kendisi
     # yaratamaz — yukarıdaki (b) maddesi).
-    secure_file "$lock_file" 660 "root:${web_user}" || return 1
+    secure_file "$lock_file" 660 "root:${web_user}" \
+        || { security_event "Kilit ağacı KURULAMADI (adım 4/4 — kilit dosyası): '${lock_file}'"; return 1; }
 
     printf '%s' "$dom_dir"
     return 0

@@ -117,18 +117,30 @@ Slice=srvctl-{{SAFE_NAME}}.slice
 # chroot capability'lerine ihtiyacı YOKTUR.
 AppArmorProfile=srvctl-{{SAFE_NAME}}-cli
 
-# ZAMAN AŞIMI (görev tanımı madde 2): kaçak/asılı bir job SUNUCUYU
-# TÜKETMEDEN öldürülmeli. NOT — Type=oneshot İÇİN BİLİNEN bir tuzak: eğer
-# yalnız RuntimeMaxSec ayarlanır da TimeoutStartSec varsayılanında
-# (DefaultTimeoutStartSec, tipik olarak 90s) bırakılırsa, oneshot bir
-# servis "başlangıcı" ExecStart TAMAMEN BİTENE kadar 'activating' sayılır
-# — yani RUNTIME_MAX 90 saniyeden BÜYÜKSE job SESSİZCE 90. saniyede
-# TimeoutStartSec tarafından öldürülür, RuntimeMaxSec HİÇ DEVREYE GİRMEDEN
-# (systemd sürümüne göre RuntimeMaxSec'in oneshot'un 'activating' evresini
-# kapsayıp kapsamadığı belirsizdir — bu şablon HER İKİ mekanizmayı da AYNI
-# değere sabitleyerek bu belirsizliğe bel BAĞLAMAZ). Bu yüzden İKİSİ BİRDEN
-# ayarlanır:
-RuntimeMaxSec={{RUNTIME_MAX}}
+# ─── ZAMAN AŞIMI — 'Type=oneshot' İÇİN TEK DOĞRU YÖNERGE ───
+#
+# ⚠ BURAYA 'RuntimeMaxSec=' EKLEMEYİN. Bir kez eklendi, ÜRETİMDE ÖLÇÜLDÜ ve
+# GERİ ALINDI. systemd HER ÇALIŞTIRMADA journal'a şunu basıyordu:
+#     srvctl-cron-<...>.service: RuntimeMaxSec= has no effect in
+#     combination with Type=oneshot. Ignoring.
+# Yani yönerge YOK SAYILIYORDU (etkin zaman sınırını TimeoutStartSec
+# uyguluyordu — davranış zaten DOĞRUYDU). TUZAK: 'systemctl show' hâlâ
+# 'RuntimeMaxUSec=1h' gösterir; property okuması BURADA YANILTICIDIR, asıl
+# kanıt journal uyarısıdır.
+#
+# NEDEN KALDIRILDI (kozmetik DEĞİL): koordinatörün ölçümünde son 40 journal
+# satırının 15'i bu uyarıydı. 100 domain × günlük cron'da bu gürültü GERÇEK
+# hataları görünmez yapar — bu oturumda avladığımız "sinyal kaybı" hata
+# sınıfının ta kendisi.
+#
+# NEDEN 'TimeoutStartSec' DOĞRU OLAN: 'Type=oneshot' bir servisin
+# "başlangıcı" ExecStart TAMAMEN BİTENE kadar sürer (unit 'activating'
+# kalır). Bu evreyi sınırlayan yönerge TimeoutStartSec'tir. Ayarlanmazsa
+# 'DefaultTimeoutStartSec' (tipik 90s) devreye girer ve RUNTIME_MAX'tan
+# BAĞIMSIZ olarak job'u 90. saniyede SESSİZCE öldürür — bu depoda daha önce
+# GERÇEKLEŞMİŞ bir hata sınıfıdır, bu yüzden yönerge AÇIKÇA yazılır.
+# RUNTIME_MAX token'ı KORUNUR (token envanteri DEĞİŞMEDİ) — yalnız tek bir
+# yönergeyi besler.
 TimeoutStartSec={{RUNTIME_MAX}}
 
 # ─── Sertleştirme — worker/scheduler İLE BİREBİR AYNI blok/gerekçe ───

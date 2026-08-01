@@ -95,8 +95,13 @@ assert_contains        "$a_out" "User=web_example_com"                    "A: do
 assert_contains        "$a_out" "Group=web_example_com"                   "A: domain grubu"
 assert_contains        "$a_out" "WorkingDirectory=/var/www/example.com/current" "A: WorkingDirectory"
 assert_contains        "$a_out" "ExecStart=/bin/sh -c 'php artisan cache:clear'" "A: /bin/sh -c sarmalama (kabuk semantiği)"
-assert_contains        "$a_out" "RuntimeMaxSec=120"                       "A: RuntimeMaxSec (kaçak job zaman aşımı)"
-assert_contains        "$a_out" "TimeoutStartSec=120"                     "A: TimeoutStartSec (oneshot 90s varsayılan tuzağı bertaraf)"
+assert_contains        "$a_out" "TimeoutStartSec=120"                     "A: TimeoutStartSec (oneshot'ta ETKİN olan zaman aşımı; 90s varsayılan tuzağı bertaraf)"
+# ÜRETİM BULGUSU: 'RuntimeMaxSec=' Type=oneshot ile systemd tarafından YOK
+# SAYILIR ve HER çalıştırmada journal'a "has no effect ... Ignoring." uyarısı
+# basar (ölçüldü: son 40 journal satırının 15'i). Yönerge KALDIRILDI —
+# zaman sınırı TimeoutStartSec ile uygulanıyor. Bu iddia, birinin "timeout
+# eksik" diye geri eklemesini engelleyen REGRESYON KAPISIDIR.
+assert_directive_absent "$a_out" "RuntimeMaxSec"                          "A: [REGRESYON KAPISI] AKTİF RuntimeMaxSec= YOK (oneshot'ta yok sayılır + journal gürültüsü)"
 assert_contains        "$a_out" "RemainAfterExit=yes"                     "A: RemainAfterExit (son durum görünürlüğü)"
 assert_contains        "$a_out" "NoNewPrivileges=true"                    "A: NoNewPrivileges"
 assert_contains        "$a_out" "ProtectSystem=strict"                    "A: ProtectSystem=strict"
@@ -197,8 +202,8 @@ c_out=$(render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-syscron.service.tpl"
 assert_not_contains     "$c_out" "{{"                                      "C: leftover token yok"
 assert_contains         "$c_out" "Type=oneshot"                            "C: Type=oneshot (çakışma engeli)"
 assert_contains         "$c_out" "ExecStart=/bin/sh -c '/usr/local/bin/backup.sh --full'" "C: /bin/sh -c sarmalama"
-assert_contains         "$c_out" "RuntimeMaxSec=3600"                      "C: RuntimeMaxSec"
-assert_contains         "$c_out" "TimeoutStartSec=3600"                    "C: TimeoutStartSec (90s tuzağı bertaraf)"
+assert_contains         "$c_out" "TimeoutStartSec=3600"                    "C: TimeoutStartSec (oneshot'ta ETKİN olan zaman aşımı; 90s tuzağı bertaraf)"
+assert_directive_absent "$c_out" "RuntimeMaxSec"                           "C: [REGRESYON KAPISI] AKTİF RuntimeMaxSec= YOK (oneshot'ta yok sayılır + journal gürültüsü)"
 assert_contains         "$c_out" "RemainAfterExit=yes"                     "C: RemainAfterExit"
 assert_contains         "$c_out" "NoNewPrivileges=true"                    "C: NoNewPrivileges (root için de düşük riskli sertleştirme)"
 assert_contains         "$c_out" "PrivateTmp=yes"                          "C: PrivateTmp (klasik root-cron /tmp yarışına karşı)"

@@ -147,8 +147,12 @@ assert_not_contains "$svc_content" "{{" "1) .service içinde leftover token YOK"
 assert_contains "$svc_content" "Description=srvctl Cron (${d} / cache_clear): Cache temizligi" "1) Description doğru render edildi"
 assert_contains "$svc_content" "WorkingDirectory=${WEB_ROOT}/${d}/current" "1) WorkingDirectory = WEB_ROOT/<domain>/current"
 assert_contains "$svc_content" "User=web_${sname}" "1) domain kullanıcısı olarak çalışıyor"
-assert_contains "$svc_content" "RuntimeMaxSec=120" "1) --timeout RUNTIME_MAX'a doğru geçti (RuntimeMaxSec)"
-assert_contains "$svc_content" "TimeoutStartSec=120" "1) --timeout RUNTIME_MAX'a doğru geçti (TimeoutStartSec — 90sn tuzağı bertaraf)"
+assert_contains "$svc_content" "TimeoutStartSec=120" "1) --timeout RUNTIME_MAX'a doğru geçti (TimeoutStartSec — oneshot'ta ETKİN olan yönerge, 90sn tuzağı bertaraf)"
+# 'RuntimeMaxSec=' KALDIRILDI (üretim: systemd Type=oneshot ile yok sayıp
+# HER çalıştırmada journal'a uyarı basıyordu). RUNTIME_MAX token'ı duruyor,
+# yalnız TimeoutStartSec'i besliyor.
+assert_eq "$(printf '%s\n' "$svc_content" | grep -c '^RuntimeMaxSec=')" "0" \
+    "1) [REGRESYON KAPISI] render edilmiş unit'te AKTİF RuntimeMaxSec= satırı YOK"
 # Kaçış sözleşmesi: tek tırnak + '%' AYNI ANDA içeren komut doğru kaçırıldı mı?
 # Beklenen değer ELLE YAZILMAZ (kırılgan/hataya açık) — _cron_add'in KENDİ
 # kullandığı GERÇEK fonksiyonlarla (test_cron_schedule.sh'taki uçtan uca

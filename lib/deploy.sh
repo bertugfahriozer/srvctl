@@ -751,11 +751,18 @@ _deploy_lock() {
     # FAIL-CLOSED: ağaç güvenli biçimde kurulamıyorsa (ör. bir bileşen
     # sembolik bağ) deploy DEVAM ETMEZ — eskiden dönüş değeri hiç
     # kontrol edilmiyordu.
+    #
+    # GÖRÜNÜRLÜK (güvenlik denetimi düzeltmesi — bkz. core.sh:security_error):
+    # 'error' YERİNE 'security_error' kullanılır. Fark: red srvctl olay
+    # günlüğüne de DÜŞER. Üretimde ölçülen kusur tam buydu — reddin kendisi
+    # doğruydu ama olay yalnız o anlık terminalde yaşıyor, srvctl.log'a HİÇ
+    # satır düşmüyordu; saldırı denemesinin SONRADAN kanıtlanabilir bir izi
+    # KALMIYORDU.
     local lock_dir=""
     lock_dir=$(_deploy_lock_dir "$sname" "$web_user") \
-        || error "Kilit dizini güvenli biçimde hazırlanamadı (yukarıdaki uyarıya bakın) — 'srvctl domain repair ${domain}' çalıştırın"
+        || security_error "DEPLOY REDDEDİLDİ (${domain}): deploy kilit ağacı güvenli biçimde hazırlanamadı (gerekçe yukarıdaki 'GÜVENLİK OLAYI' satırında). Çözüm: 'srvctl domain repair ${domain}'"
     [[ -n "$lock_dir" ]] \
-        || error "Kilit dizini yolu hesaplanamadı: ${domain}"
+        || security_error "DEPLOY REDDEDİLDİ (${domain}): kilit dizini yolu hesaplanamadı"
     local lock_path="${lock_dir}/deploy-${sname}.lock"
 
     # ─── SYMLINK KAPISI (fail-closed) ───
@@ -763,14 +770,27 @@ _deploy_lock() {
     # İKİNCİ KATMANDIR — root ayrıcalığıyla açılacak yolun bir sembolik bağ
     # OLMADIĞI, açmadan ÖNCE doğrulanır.
     if [[ -L "$lock_path" ]]; then
-        error "Güvenlik: kilit dosyası bir SEMBOLİK BAĞ (${lock_path}) — deploy REDDEDİLDİ. Bu, domain kullanıcısının root'a keyfi dosya chown/truncate ettirme girişimidir; 'srvctl domain repair ${domain}' ile temizleyin."
+        local _lt=""
+        _lt=$(readlink "$lock_path" 2>/dev/null) || _lt=""
+        security_error "DEPLOY REDDEDİLDİ (${domain}): kilit dosyası bir SEMBOLİK BAĞ — '${lock_path}'${_lt:+ → hedef: '${_lt}'}. Bu, domain kullanıcısının ('${web_user}') root'a keyfi dosya chown/truncate ettirme girişimidir. Yapmanız gereken: 1) 'srvctl domain repair ${domain}' ile bağı temizleyin, 2) hedef dosyanın sahipliğini/içeriğini DOĞRULAYIN, 3) 'srvctl security audit' çalıştırın."
     fi
 
     # '9>' DEĞİL '9>>': '>' hedefi TRUNCATE eder ve tam da bu, sömürünün
     # "keyfi dosya sıfırlama" (ör. /etc/shadow) yarısıydı. Append kipi
     # flock() için BİREBİR aynı işlevi görür (yalnız fd gerekir) ama
     # HİÇBİR içeriği yok etmez — primitif kökten kaldırılır.
-    exec 9>>"$lock_path" || return 0
+    #
+    # '|| security_event ...; return 0' — eski hâli ÇIPLAK '|| return 0' idi:
+    # kilit AÇILAMADIĞINDA deploy TEK KELİME ETMEDEN kilitsiz devam ediyordu
+    # (sessiz fail-open). Karar DEĞİŞMEDİ (eşzamanlılık koruması kaybı bir
+    # ayrıcalık yükseltmesi değildir, deploy'u durdurmak orantısız olurdu)
+    # ama artık SESSİZ DEĞİL. NOT: 'exec' bir özel builtin'dir; yönlendirme
+    # hatasında etkileşimsiz kabuk çoğu durumda ZATEN kendi hatasıyla
+    # sonlanır — bu dal bir savunma derinliğidir, tek dayanak değil.
+    exec 9>>"$lock_path" || {
+        security_event "Deploy kilidi AÇILAMADI (${domain}): '${lock_path}' — bu deploy eşzamanlılık koruması OLMADAN sürüyor. 'srvctl domain repair ${domain}' önerilir."
+        return 0
+    }
 
     # ─── AÇIŞ SONRASI DOĞRULAMA (Linux) ───
     # '-L' kontrolü ile 'exec 9>>' arasındaki teorik yarışı kapatır: fd 9
@@ -792,7 +812,7 @@ _deploy_lock() {
         if [[ -n "$_fd_target" && "$_fd_target" != "$lock_path" \
               && ( -z "$_expected_phys" || "$_fd_target" != "$_expected_phys" ) ]]; then
             exec 9>&-
-            error "Güvenlik: kilit fd'si beklenen yola bağlanmadı (beklenen '${lock_path}', gerçek '${_fd_target}') — deploy REDDEDİLDİ."
+            security_error "DEPLOY REDDEDİLDİ (${domain}): kilit fd'si beklenen yola bağlanmadı (beklenen '${lock_path}', gerçek '${_fd_target}') — açış ile kontrol arasında bir yarış/değiştirme girişimi olabilir. Çözüm: 'srvctl domain repair ${domain}' + 'srvctl security audit'."
         fi
     fi
 

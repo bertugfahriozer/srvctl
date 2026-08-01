@@ -22,11 +22,16 @@ Type=oneshot
 #
 # ÇAKIŞMA ENGELİ / ZAMAN AŞIMI: srvctl-cron.service.tpl'deki (domain
 # kapsamlı) AYNI gerekçe BİREBİR geçerlidir — Type=oneshot + tekil unit adı
-# job coalescing sağlar (systemd.unit(5) "Merging of jobs"), RuntimeMaxSec
-# İLE TimeoutStartSec'in AYNI değere sabitlenmesi Type=oneshot'un
-# 'DefaultTimeoutStartSec' (varsayılan ~90s) tuzağını (uzun süren bir job'un
-# RUNTIME_MAX'a ulaşmadan 90. saniyede sessizce öldürülmesi) bertaraf eder.
-RuntimeMaxSec={{RUNTIME_MAX}}
+# job coalescing sağlar (systemd.unit(5) "Merging of jobs"); zaman sınırını
+# ise TimeoutStartSec uygular (oneshot'ta ExecStart bitene kadar unit
+# 'activating' kalır; ayarlanmazsa 'DefaultTimeoutStartSec' ~90s job'u
+# sessizce öldürür).
+#
+# ⚠ BURAYA 'RuntimeMaxSec=' EKLEMEYİN — 'Type=oneshot' ile systemd onu YOK
+# SAYAR ve HER çalıştırmada journal'a "RuntimeMaxSec= has no effect in
+# combination with Type=oneshot. Ignoring." basar (üretimde ölçüldü, bkz.
+# srvctl-cron.service.tpl'deki uzun not). Yönerge KALDIRILDI; RUNTIME_MAX
+# token'ı KORUNUR ve tek başına TimeoutStartSec'i besler.
 TimeoutStartSec={{RUNTIME_MAX}}
 
 # ─── ExecStart: kabuk sarmalama + komut enjeksiyonu SÖZLEŞMESİ ───

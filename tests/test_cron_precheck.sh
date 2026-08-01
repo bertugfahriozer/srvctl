@@ -21,7 +21,7 @@
 # GERÇEK 'aa-exec' bu macOS geliştirme makinesinde YOKTUR — prob, üretim
 # kodundaki SRVCTL_CRON_PROBE_FN test-seam'i ile enjekte edilir; aday ÇÖZÜMÜ
 # (PATH araması) ve "hangi dizinler çalıştırılarak denenebilir" filtresi ise
-# GERÇEKTEN çalışır (SRVCTL_CRON_PROBE_DIRS sahte bir dizine kilitlenir, ki
+# GERÇEKTEN çalışır (SRVCTL_TEST_CRON_PROBE_DIRS sahte bir dizine kilitlenir, ki
 # test hermetik olsun ve host'un /usr/bin içeriğine BAĞLI OLMASIN).
 set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -53,7 +53,7 @@ systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; return 0; }
 FAKEBIN="$(mktemp -d)"
 OUTBIN="$(mktemp -d)"
 export PATH="${FAKEBIN}:${OUTBIN}:${PATH}"
-export SRVCTL_CRON_PROBE_DIRS="${FAKEBIN}"
+export SRVCTL_TEST_CRON_PROBE_DIRS="${FAKEBIN}"
 
 # 'date' stub'ı GERÇEK /bin/date'e devreder — sidecar CREATED_AT gibi
 # yerlerde core.sh'ın kendi 'date' çağrıları BOZULMASIN.

