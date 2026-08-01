@@ -118,8 +118,8 @@
 #
 # DEPLOY KİLİDİ (görev talebi — deploy sürerken domain cron'u ÇALIŞMAMALI):
 #   lib/deploy.sh:_deploy_lock 'flock -n 9' ile ${SRVCTL_LOCK_DIR:-/run/srvctl}/
-#   deploy-<sname>.lock dosyasını kilitler. Bu modül AYNI kilit dosyasını
-#   KARŞI taraftan kullanır: ExecStart, FLOCK_PREFIX ile
+#   locks/<sname>/deploy-<sname>.lock dosyasını kilitler. Bu modül AYNI kilit
+#   dosyasını KARŞI taraftan kullanır: ExecStart, FLOCK_PREFIX ile
 #   'flock -n -E 75 '<kilit-dosyası>' /bin/sh -c '<komut>'' ŞEKLİNDE
 #   SARMALANIR — kilit deploy tarafından TUTULUYORSA flock komutu HİÇ
 #   ÇALIŞTIRMADAN 75 (sysexits.h EX_TEMPFAIL — "geçici, yeniden dene") ile
@@ -135,6 +135,19 @@
 #   graceful-degrade deseni). Sistem cron'ları ('--system') bir domain'e
 #   bağlı OLMADIĞINDAN bu sarmalamayı HİÇ ALMAZ (FLOCK_PREFIX her zaman
 #   boştur).
+#
+#   DAC/root ÇELİŞKİSİ DÜZELTMESİ (GERÇEK üretim sunucusunda ölçüldü —
+#   AppArmor'a hiç sıra gelmeden 'flock: cannot open lock file ...:
+#   Permission denied', çıkış 66): kilit dizini ESKİDEN düz
+#   '${SRVCTL_LOCK_DIR:-/run/srvctl}/deploy-<sname>.lock' ve 700 root:root
+#   idi — bu, root olarak çalışan _deploy_lock İÇİN doğruydu ama bu cron
+#   job'u User=web_<sname> olarak çalıştığından o dizine hiç GİREMİYORDU.
+#   Şimdi kilit domain BAŞINA ayrı bir alt dizinde
+#   ('${SRVCTL_LOCK_DIR:-/run/srvctl}/locks/<sname>/', 700, sahibi
+#   web_<sname>:web_<sname>) yaşıyor — bkz. _cron_lock_dir (bu dosyada) /
+#   _deploy_lock_dir (lib/deploy.sh) yorumu. Üst dizinler (711) yalnız
+#   GEÇİŞE izin verir, domain'in KENDİ alt dizini ise BAŞKA hiçbir domain
+#   kullanıcısına AÇIK DEĞİLDİR — domainler arası izolasyon KORUNUR.
 #
 # YAZMA İZNİ (ProtectSystem=strict + ReadWritePaths=): domain cron'u
 # WORKING_DIR (WEB_ROOT/<domain>/current) DEĞİL, DOMAIN_ROOT'un TAMAMINA
@@ -529,6 +542,39 @@ _cron_fail_svc_name() {
 }
 
 # ═══════════════════════════════════════════════
+#  DEPLOY KİLİDİ DİZİNİ — DAC/root ÇELİŞKİSİ DÜZELTMESİ (GERÇEK üretim
+#  sunucusunda ölçüldü: 'flock: cannot open lock file
+#  /run/srvctl/deploy-<sname>.lock: Permission denied', çıkış 66 — AppArmor
+#  denied kaydı YOKTU, MAC katmanına HİÇ sıra gelmiyordu). Kilit dizini
+#  ESKİDEN 700 root:root idi — bu YALNIZCA root olarak çalışan
+#  lib/deploy.sh:_deploy_lock İÇİN doğruydu; bu cron job'u ise domain'in
+#  KENDİ kullanıcısı (User=web_<sname>, aşağıdaki ExecStart sarmalaması)
+#  olarak AYNI kilidi KARŞI taraftan (flock(1) exec-form) açmaya çalışıyor
+#  — 700 root:root bir dizine web_<sname> hiç GİREMEZ.
+#
+#  ÇÖZÜM — domain BAŞINA AYRI, o domain'in kullanıcısına ait (700) bir alt
+#  dizin (üç katman — lib/deploy.sh:_deploy_lock_dir İLE BİREBİR AYNI
+#  formül, çapraz modül bağımlılığı KURULMADAN burada AYRICA tutulur —
+#  CLAUDE.md deseni, bu dosyadaki diğer "AYNI formül" notlarıyla tutarlı):
+#    1) ${lock_base}          711 root:root — yalnız GEÇİŞ (listeleme YOK).
+#    2) ${lock_base}/locks     711 root:root — FPM'in AYNI ${lock_base}
+#       altındaki pid dosyalarından (fpm-<sname>.pid) ad alanı ayrımı.
+#    3) ${lock_base}/locks/<sname>  700 web_<sname>:web_<sname> — YALNIZ o
+#       domain'in kullanıcısı (VE root) girebilir; BAŞKA domain kullanıcısı
+#       GİREMEZ (domainler arası izolasyon KORUNUR — görev şartı).
+#  İki formülün DRIFT ETMEMESİ tests/test_deploy_lock_isolation.sh
+#  tarafından uçtan uca doğrulanır.
+_cron_lock_dir() {
+    local sname="$1" web_user="$2"
+    local lock_base="${SRVCTL_LOCK_DIR:-/run/srvctl}"
+    secure_dir "$lock_base" 711
+    secure_dir "${lock_base}/locks" 711
+    local dom_dir="${lock_base}/locks/${sname}"
+    secure_dir "$dom_dir" 700 "${web_user}:${web_user}"
+    printf '%s' "$dom_dir"
+}
+
+# ═══════════════════════════════════════════════
 #  AppArmor ÖN-KONTROLÜ — flock EXEC + KİLİT DOSYASI izni (KOORDİNATÖR
 #  HOST BULGUSU — İKİ KATMAN, AYNI SINIF)
 # ═══════════════════════════════════════════════
@@ -572,7 +618,14 @@ _cron_apparmor_flock_ok() {
     local profile="${SRVCTL_APPARMOR_DIR:-/etc/apparmor.d}/srvctl-${sname}-cli"
     [[ -f "$profile" ]] || return 2
     grep -Eq '^[[:space:]]*/usr/bin/flock[[:space:]]+m?rix,[[:space:]]*$' "$profile" 2>/dev/null || return 1
-    local lock_re="^[[:space:]]*/run/srvctl/deploy-${sname}\\.lock[[:space:]]+rwk,[[:space:]]*$"
+    # NOT (DAC/root çelişkisi düzeltmesi — bkz. _cron_lock_dir yorumu): kilit
+    # dosyası artık domain'e özel bir alt dizinde yaşıyor
+    # ('/run/srvctl/locks/<sname>/deploy-<sname>.lock') — eskiden düz
+    # '/run/srvctl/deploy-<sname>.lock' idi. Bu regex İKİ dosyanın (bu
+    # fonksiyon + templates/apparmor/profile-cli.tpl) AYNI ANDA güncellenmiş
+    # olmasını GEREKTİRİR; sürüklenirse (biri güncellenip diğeri unutulursa)
+    # tests/test_cron_add.sh (7b/7c/7d) bunu YAKALAR.
+    local lock_re="^[[:space:]]*/run/srvctl/locks/${sname}/deploy-${sname}\\.lock[[:space:]]+rwk,[[:space:]]*$"
     grep -Eq "$lock_re" "$profile" 2>/dev/null || return 1
     return 0
 }
@@ -914,9 +967,15 @@ _cron_add() {
     # (syscron şablonuyla BİREBİR AYNI biçim).
     local flock_prefix=""
     if [[ "$is_system" != "true" ]]; then
-        local lock_dir="${SRVCTL_LOCK_DIR:-/run/srvctl}"
+        # NOT: 'web_user' burada ERKEN (şablon render bölümünden ÖNCE)
+        # tanımlanır — aşağıda AYNI formülle YENİDEN tanımlanan aynı-adlı
+        # yerel değişkenle çakışmaz ('local' aynı fonksiyon içinde tekrar
+        # çağrılabilir, sadece değeri sıfırlar) — _cron_lock_dir'in
+        # domain'e özel alt dizini DOĞRU sahibe (web_<sname>) atayabilmesi
+        # için bu noktada ZATEN gereklidir.
+        local web_user="web_${sname}"
         if command -v flock >/dev/null 2>&1; then
-            secure_dir "$lock_dir" 700
+            local lock_dir; lock_dir=$(_cron_lock_dir "$sname" "$web_user")
             local lock_path lock_escaped
             lock_path="${lock_dir}/deploy-${sname}.lock"
             lock_escaped=$(_cron_escape_percent "$(_cron_escape_unit_squote "$lock_path")")
@@ -938,7 +997,7 @@ _cron_add() {
             local aa_rc=0
             _cron_apparmor_flock_ok "$sname" || aa_rc=$?
             if [[ "$aa_rc" -eq 1 ]]; then
-                warn "AppArmor profili GÜNCEL DEĞİL: /etc/apparmor.d/srvctl-${sname}-cli 'flock' exec VE/YA DA deploy kilidi dosyası ('/run/srvctl/deploy-${sname}.lock') izinlerinden birini İÇERMİYOR — bu cron çalıştığında 'Permission denied' (ör. 126) ile BAŞARISIZ OLUR. Düzeltme: 'srvctl domain repair ${domain}' (profili yeniden render edip AppArmor'a yeniden yükler), sonra 'srvctl cron run ${domain} ${name}' ile doğrulayın."
+                warn "AppArmor profili GÜNCEL DEĞİL: /etc/apparmor.d/srvctl-${sname}-cli 'flock' exec VE/YA DA deploy kilidi dosyası ('${lock_path}') izinlerinden birini İÇERMİYOR — bu cron çalıştığında 'Permission denied' (ör. 126) ile BAŞARISIZ OLUR. Düzeltme: 'srvctl domain repair ${domain}' (profili yeniden render edip AppArmor'a yeniden yükler), sonra 'srvctl cron run ${domain} ${name}' ile doğrulayın."
             fi
         else
             warn "flock bulunamadı — bu cron deploy ile ÇAKIŞMAYA KARŞI KORUNMUYOR (lib/deploy.sh:_deploy_lock ile AYNI sınırlama)"

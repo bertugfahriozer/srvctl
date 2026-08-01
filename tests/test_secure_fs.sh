@@ -40,5 +40,58 @@ secure_dir "$d2" 750
 assert_eq "$(test -d "$d2" && echo VAR || echo YOK)" "VAR" "secure_dir iç içe oluşturdu"
 assert_eq "$(_stat_mode "$d2" | tail -c 4)" "750" "secure_dir özel mod 750"
 
+# ═══════════════════════════════════════════════════════════════
+# 3. parametre 'owner' (görev: /run/srvctl deploy-kilidi DAC/root
+# çelişkisi düzeltmesi — bkz. lib/deploy.sh:_deploy_lock_dir /
+# lib/cron.sh:_cron_lock_dir). chown GERÇEK Linux kullanıcı adlarına
+# İHTİYAÇ duyduğundan (bu macOS dev kutusunda 'web_ornek' yok) gerçek
+# sahiplik burada DOĞRULANAMAZ — bunun yerine 'chown' bir FONKSİYON ile
+# GÖLGELENİR (bkz. tests/test_cron_add.sh'taki 'systemctl' stub deseniyle
+# AYNI teknik) ve secure_file/secure_dir'in İSTEDİĞİ sahiplik dizgesini
+# DOĞRU ARGÜMANLARLA çağırdığı doğrulanır — mod bitleri (chmod GERÇEKTEN
+# çalışır, macOS'ta ayrıcalık gerektirmez) AYRICA gerçek stat ile kontrol
+# edilir.
+# ═══════════════════════════════════════════════════════════════
+chown_log="${WEB_ROOT}/.chown.log"
+: > "$chown_log"
+chown() { printf '%s %s\n' "$1" "$2" >> "$chown_log"; return 0; }
+
+# secure_dir: owner VERİLMEDEN — GERİYE DÖNÜK UYUMLULUK REGRESYONU: hiçbir
+# mevcut çağrı yeri (init.sh/backup.sh/webhook.sh/domain.sh/security.sh/
+# selfupdate.sh/plugin.sh — 9+ çağrı) 3. argüman VERMEZ; varsayılan HÂLÂ
+# 'root:root' OLMALI.
+: > "$chown_log"
+d3="${WEB_ROOT}/default-owner-dir"
+secure_dir "$d3" 700
+assert_eq "$(cat "$chown_log")" "root:root ${d3}" \
+    "secure_dir: owner verilmezse VARSAYILAN 'root:root' (geriye dönük uyum)"
+
+# secure_dir: owner AÇIKÇA VERİLİRSE o kullanıcıya chown edilmeye ÇALIŞILIR
+: > "$chown_log"
+d4="${WEB_ROOT}/domain-owned-dir"
+secure_dir "$d4" 700 "web_ornek:web_ornek"
+assert_eq "$(cat "$chown_log")" "web_ornek:web_ornek ${d4}" \
+    "secure_dir: 3. parametre ile İSTENEN sahibe chown ÇAĞRILIYOR"
+assert_eq "$(_stat_mode "$d4" | tail -c 4)" "700" \
+    "secure_dir: owner verilse BİLE mod bitleri (700) DOĞRU uygulanıyor"
+
+# secure_file: AYNI owner parametresi — deploy kilidi DOSYASININ KENDİSİ
+# İÇİN (bkz. lib/deploy.sh:_deploy_lock) gereklidir.
+: > "$chown_log"
+f5="${WEB_ROOT}/domain-owned-file"
+secure_file "$f5" 600 "web_ornek:web_ornek"
+assert_eq "$(cat "$chown_log")" "web_ornek:web_ornek ${f5}" \
+    "secure_file: 3. parametre ile İSTENEN sahibe chown ÇAĞRILIYOR"
+assert_eq "$(_stat_mode "$f5" | tail -c 4)" "600" \
+    "secure_file: owner verilse BİLE mod bitleri (600) DOĞRU uygulanıyor"
+
+: > "$chown_log"
+f6="${WEB_ROOT}/default-owner-file"
+secure_file "$f6" 600
+assert_eq "$(cat "$chown_log")" "root:root ${f6}" \
+    "secure_file: owner verilmezse VARSAYILAN 'root:root' (geriye dönük uyum)"
+
+unset -f chown
+
 rm -rf "$WEB_ROOT"
 test_summary

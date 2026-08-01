@@ -291,8 +291,21 @@ locked_svc="${SRVCTL_SYSTEMD_DIR}/srvctl-cron-${sname}-locked_job.service"
 locked_content=$(cat "$locked_svc" 2>/dev/null)
 assert_contains "$locked_content" "flock -n -E 75" \
     "7) flock VARKEN ExecStart deploy-kilidi sarmalamasını İÇERİYOR (-E 75 sentinel)"
-assert_contains "$locked_content" "deploy-${sname}.lock" \
-    "7) kilit dosyası deploy.sh:_deploy_lock İLE AYNI adlandırmayı kullanıyor"
+assert_contains "$locked_content" "locks/${sname}/deploy-${sname}.lock" \
+    "7) kilit dosyası deploy.sh:_deploy_lock İLE AYNI (domain'e özel alt dizinli) yolu kullanıyor"
+
+# DAC/root çelişkisi düzeltmesi (görev): kilit dizin AĞACI GERÇEKTEN
+# oluşturuldu mu ve mod bitleri BEKLENEN (711/711/700) mi? Domain'e özel
+# alt dizin cron'un çalıştığı web_<sname> kullanıcısına GİRİLEBİLİR
+# olmalı (700 + doğru sahiplik — sahiplik test_deploy_lock_isolation.sh'ta
+# chown-stub İLE ayrıca doğrulanır), üst dizinler İSE yalnız GEÇİŞE izin
+# vermeli (711).
+assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}" | tail -c 4)" "711" \
+    "7) kilit ANA dizini 711 (geçiş serbest, listeleme YOK)"
+assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}/locks" | tail -c 4)" "711" \
+    "7) kilit 'locks' ara dizini 711"
+assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}/locks/${sname}" | tail -c 4)" "700" \
+    "7) domain'e ÖZEL kilit alt dizini 700 (yalnız o domain + root)"
 assert_contains "$out7" "Deploy kilidi entegrasyonu aktif" \
     "7) flock VARKEN operatöre entegrasyon AÇIKÇA bildiriliyor"
 
@@ -300,9 +313,9 @@ assert_contains "$out7" "Deploy kilidi entegrasyonu aktif" \
 # 7b) AppArmor ÖN-KONTROLÜ (KOORDİNATÖR HOST BULGUSU — İKİ KATMAN: (1)
 #     GERÇEK Ubuntu 24.04 VM'de flock EXEC izni OLMADIĞI için 126 ile
 #     REDDEDİLİYORDU; (2) bu düzeltildikten SONRA ölçüldü — flock çalışıyor
-#     ama kilit DOSYASINI ('/run/srvctl/deploy-<sname>.lock') AppArmor
-#     yüzünden açamıyordu, DAC sorunsuzdu. 'cron add' artık canlı profili
-#     okuyup İKİ katmanı da TEK kontrolde tespit ediyor mu?
+#     ama kilit DOSYASINI ('/run/srvctl/locks/<sname>/deploy-<sname>.lock')
+#     AppArmor yüzünden açamıyordu, DAC sorunsuzdu. 'cron add' artık canlı
+#     profili okuyup İKİ katmanı da TEK kontrolde tespit ediyor mu?
 # ═══════════════════════════════════════════════════════════════
 export SRVCTL_APPARMOR_DIR="$(mktemp -d)"
 
@@ -338,8 +351,12 @@ assert_contains "$out7bb" "AppArmor profili GÜNCEL DEĞİL" \
     "7b-ikinci-katman) flock EXEC VAR ama kilit dosyası kuralı YOKSA UYARI YİNE basılıyor (2. HOST bulgusu kapsanıyor)"
 _cron_remove "$d" half_fixed_job >/dev/null 2>&1
 
-# (ii) TAM GÜNCEL profil (flock rix, HEM deploy kilidi rwk, satırı — 'srvctl
-# domain repair' sonrası beklenen NİHAİ durum) — UYARI basılMAMALI.
+# (i-c) ESKİ (göç ÖNCESİ, DAC/root çelişkisi düzeltmesinden ÖNCEKİ) düz
+# yol kuralı — 'flock rix' VE bir kilit satırı VAR ama YOL FORMATI eski
+# ('/run/srvctl/deploy-<sname>.lock', 'locks/<sname>/' alt dizini YOK).
+# Göç sonrası bu ARTIK GÜNCEL DEĞİL sayılmalı (sessizce 'tam' kabul
+# edilirse operatör 'srvctl domain repair' çalıştırmaz ve cron GERÇEK
+# üretimde AYNI DAC hatasıyla düşmeye devam eder).
 cat > "${SRVCTL_APPARMOR_DIR}/srvctl-${sname}-cli" <<EOF
 profile srvctl-${sname}-cli flags=(attach_disconnected) {
   /usr/bin/php8.4 mrix,
@@ -349,9 +366,26 @@ profile srvctl-${sname}-cli flags=(attach_disconnected) {
   /run/srvctl/deploy-${sname}.lock rwk,
 }
 EOF
+out7bc=$(_cron_add "$d" --name=premigration_job --schedule="her saat" --command="echo x" 2>&1)
+assert_contains "$out7bc" "AppArmor profili GÜNCEL DEĞİL" \
+    "7b-üçüncü-katman) göç ÖNCESİ düz yol kuralı ARTIK GÜNCEL DEĞİL sayılıyor (yeni 'locks/<sname>/' yolu bekleniyor)"
+_cron_remove "$d" premigration_job >/dev/null 2>&1
+
+# (ii) TAM GÜNCEL profil (flock rix, HEM YENİ domain'e özel alt dizinli
+# deploy kilidi rwk, satırı — 'srvctl domain repair' sonrası beklenen
+# NİHAİ durum) — UYARI basılMAMALI.
+cat > "${SRVCTL_APPARMOR_DIR}/srvctl-${sname}-cli" <<EOF
+profile srvctl-${sname}-cli flags=(attach_disconnected) {
+  /usr/bin/php8.4 mrix,
+  /bin/sh rix,
+  /usr/bin/dash rix,
+  /usr/bin/flock rix,
+  /run/srvctl/locks/${sname}/deploy-${sname}.lock rwk,
+}
+EOF
 out7c=$(_cron_add "$d" --name=fresh_aa_job --schedule="her saat" --command="echo x" 2>&1)
 assert_not_contains "$out7c" "AppArmor profili GÜNCEL DEĞİL" \
-    "7c) TAM GÜNCEL (flock + kilit dosyası İKİSİ DE VAR) profilde UYARI basılMIYOR (yanlış pozitif yok)"
+    "7c) TAM GÜNCEL (flock + YENİ yollu kilit dosyası İKİSİ DE VAR) profilde UYARI basılMIYOR (yanlış pozitif yok)"
 _cron_remove "$d" fresh_aa_job >/dev/null 2>&1
 
 # (iii) Profil hiç YOKSA (ör. domain henüz hardened değil) — SESSİZCE

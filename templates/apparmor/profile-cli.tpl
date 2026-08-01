@@ -165,7 +165,27 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # bir domainin BAŞKA domainlerin deploy kilit dosyalarını açabilmesi
   # (varlığını/durumunu sezebilmesi) anlamına gelirdi ve bu profilin TEK
   # var oluş nedeni olan domainler-arası izolasyon sınırını delerdi.
-  /run/srvctl/deploy-{{SAFE_NAME}}.lock rwk,
+  #
+  # GÜNCELLEME — HOST BULGUSU 3 (DAC/root ÇELİŞKİSİ, bu İKİ AppArmor
+  # katmanından SONRA ölçüldü): yukarıdaki İKİ düzeltme TAM UYGULANDIKTAN
+  # SONRA BİLE cron job'ları AYNI hatayla ('Permission denied', çıkış 66)
+  # düşmeye devam etti — bu SEFER audit.log'da HİÇBİR 'apparmor="DENIED"'
+  # kaydı YOKTU (MAC katmanına hiç sıra gelmiyordu). Kök neden: kilit
+  # dizini ('/run/srvctl', bkz. lib/deploy.sh:_deploy_lock) 700 root:root
+  # idi — bu SADECE root olarak çalışan '_deploy_lock' İÇİN doğruydu;
+  # domain cron job'u ise User=web_{{SAFE_NAME}} olarak çalıştığından o
+  # dizine AppArmor'dan ÖNCE, saf DAC seviyesinde hiç GİREMİYORDU. Kilit
+  # artık domain BAŞINA ayrı bir alt dizinde yaşıyor
+  # ('/run/srvctl/locks/{{SAFE_NAME}}/', 700, sahibi
+  # {{WEB_USER}}:{{WEB_USER}} — bkz. lib/deploy.sh:_deploy_lock_dir /
+  # lib/cron.sh:_cron_lock_dir) — bu satır BİR ALT DİZİN daha ekleyerek
+  # güncellendi; "TEK domain'in TEK dosyası, glob YOK" prensibi AYNEN
+  # KORUNDU. Üst dizinlerin (üst dizin + 'locks/') KENDİSİ için AppArmor
+  # kuralı GEREKMEZ — AppArmor path mediation'ı DOSYANIN TAM YOLUNA göre
+  # çalışır, POSIX dizin 'x' (traverse) izni gibi ARA dizin kuralı İSTEMEZ
+  # (o ayrım saf DAC'ın konusu, üst dizinlerin 711 olması buradan bağımsız
+  # ayrıca sağlanır).
+  /run/srvctl/locks/{{SAFE_NAME}}/deploy-{{SAFE_NAME}}.lock rwk,
 
   # ─── Domain ağacı — FPM profiliyle AYNI okuma/yazma yolları ───
   # (framework yazma yolu eklerken profile.tpl'deki eşdeğer bloğu da

@@ -521,22 +521,31 @@ _require_owned_or_warn() {
 
 # ─── Güvenli FS oluşturma (umask 077 altında) ───
 # chown macOS dev kutusunda başarısız olabilir → guard'lı; mod/varlık test edilir.
+#
+# 3. parametre 'owner' (İSTEĞE BAĞLI, varsayılan 'root:root' — TÜM mevcut
+# çağrı yerleri GERİYE DÖNÜK UYUMLU kalır, hiçbiri 3. argüman VERMEZ): bazı
+# kaynaklar (ör. lib/deploy.sh:_deploy_lock_dir / lib/cron.sh:_cron_lock_dir
+# — domain başına deploy kilidi dizini) kasıtlı olarak root DIŞINDA bir
+# sahibe (domain'in web_<sname> kullanıcısı) ait olmalı; bu tür kaynaklar
+# İÇİN chown hedefi PARAMETRELENDİRİLDİ. Genel amaç (root-owned sır/durum
+# dosyaları) DEĞİŞMEDİ — yalnızca ihtiyaç duyan ÇAĞIRAN taraf farklı bir
+# sahip isteyebilir.
 secure_file() {
-    local path="$1" mode="${2:-600}"
+    local path="$1" mode="${2:-600}" owner="${3:-root:root}"
     # Dosyayı oluştur (yoksa) — MEVCUT içeriği KORU. 'touch' truncate ETMEZ;
     # (eski ': >' mevcut dosyayı boşaltıyordu → yazımdan sonra çağrılınca içerik
     #  kaybı: /root/.my.cnf, yedek artefaktları, migrate credentials).
     ( umask 077; touch "$path" 2>/dev/null || true )
     [[ -e "$path" ]] || { umask 077; touch "$path"; }
     chmod "$mode" "$path"
-    chown root:root "$path" 2>/dev/null || true
+    chown "$owner" "$path" 2>/dev/null || true
 }
 
 secure_dir() {
-    local path="$1" mode="${2:-700}"
+    local path="$1" mode="${2:-700}" owner="${3:-root:root}"
     ( umask 077; mkdir -p "$path" )
     chmod "$mode" "$path"
-    chown root:root "$path" 2>/dev/null || true
+    chown "$owner" "$path" 2>/dev/null || true
 }
 
 # ─── Güvenli arşiv çıkarma (tar/zip-slip + symlink/hardlink reddi) ───

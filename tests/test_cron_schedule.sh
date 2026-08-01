@@ -348,11 +348,19 @@ assert_eq "$sys_glob_hit" "hayir" \
 #     BULGUSU — İKİ KATMAN: (1) GERÇEK Ubuntu 24.04 VM'de flock EXEC
 #     AppArmor tarafından reddediliyordu (status=126) — düzeltme:
 #     '/usr/bin/flock rix,'. (2) BUNDAN SONRA ölçüldü — flock çalışıyor ama
-#     KİLİT DOSYASINI ('/run/srvctl/deploy-<sname>.lock') açamıyordu
-#     (denied_mask="rc", DAC sorunsuzdu) — düzeltme: aynı dosyaya
-#     '/run/srvctl/deploy-{{SAFE_NAME}}.lock rwk,'. İKİSİ DE ŞABLONU
-#     günceller, ÖNCEDEN render edilmiş canlı profiller OTOMATİK
-#     GÜNCELLENMEZ. Bu fonksiyon TEK kontrolde İKİSİNİ BİRDEN doğrular.)
+#     KİLİT DOSYASINI ('/run/srvctl/locks/<sname>/deploy-<sname>.lock')
+#     açamıyordu (denied_mask="rc", DAC sorunsuzdu) — düzeltme: aynı
+#     dosyaya '/run/srvctl/locks/{{SAFE_NAME}}/deploy-{{SAFE_NAME}}.lock
+#     rwk,'. İKİSİ DE ŞABLONU günceller, ÖNCEDEN render edilmiş canlı
+#     profiller OTOMATİK GÜNCELLENMEZ. Bu fonksiyon TEK kontrolde İKİSİNİ
+#     BİRDEN doğrular. (3. HOST BULGUSU — DAC/root çelişkisi, bu İKİ
+#     AppArmor katmanından SONRA ölçüldü: kilit dizini 700 root:root idi,
+#     User=web_<sname> olarak çalışan cron job'u AppArmor'a hiç sıra
+#     gelmeden dizine GİREMİYORDU — düzeltme lib/deploy.sh:_deploy_lock_dir
+#     / lib/cron.sh:_cron_lock_dir'de: kilit artık domain BAŞINA ayrı,
+#     domain'in kullanıcısına ait bir alt dizinde; bu yüzden yol BİR ALT
+#     DİZİN daha kazandı — 'deploy-<sname>.lock' düz yol ARTIK GÜNCEL
+#     DEĞİL sayılır, aşağıdaki 'goc_oncesi' örneği bunu doğrular.)
 # ═══════════════════════════════════════════════
 AA_DIR="$(mktemp -d)"
 export SRVCTL_APPARMOR_DIR="$AA_DIR"
@@ -381,17 +389,29 @@ EOF
 assert_fail _cron_apparmor_flock_ok "yarimprofil" \
     "AppArmor: SADECE flock EXEC izni eklenmiş (2. HOST bulgusu — kilit DOSYASI kuralı hâlâ eksik) — hâlâ 1 döner, UYARI KESİLMEMELİ"
 
+cat > "${AA_DIR}/srvctl-goc_oncesi-cli" <<'EOF'
+profile srvctl-goc_oncesi-cli flags=(attach_disconnected) {
+  /usr/bin/php8.3 mrix,
+  /bin/sh rix,
+  /usr/bin/dash rix,
+  /usr/bin/flock rix,
+  /run/srvctl/deploy-goc_oncesi.lock rwk,
+}
+EOF
+assert_fail _cron_apparmor_flock_ok "goc_oncesi" \
+    "AppArmor: GÖÇ ÖNCESİ (DAC/root çelişkisi düzeltmesinden ÖNCEKİ) düz yol ARTIK GÜNCEL DEĞİL sayılıyor — 'locks/<sname>/' alt dizini YOK"
+
 cat > "${AA_DIR}/srvctl-guncelprofil-cli" <<'EOF'
 profile srvctl-guncelprofil-cli flags=(attach_disconnected) {
   /usr/bin/php8.3 mrix,
   /bin/sh rix,
   /usr/bin/dash rix,
   /usr/bin/flock rix,
-  /run/srvctl/deploy-guncelprofil.lock rwk,
+  /run/srvctl/locks/guncelprofil/deploy-guncelprofil.lock rwk,
 }
 EOF
 assert_ok _cron_apparmor_flock_ok "guncelprofil" \
-    "AppArmor: profil TAM GÜNCEL — hem 'flock rix,' HEM 'deploy-<sname>.lock rwk,' VAR (0 döner)"
+    "AppArmor: profil TAM GÜNCEL — hem 'flock rix,' HEM YENİ 'locks/<sname>/deploy-<sname>.lock rwk,' VAR (0 döner)"
 
 # Kilit dosyası kuralı BAŞKA bir domain'e aitse (yanlış sname) EŞLEŞMEMELİ —
 # görev talebi: "DAR olması önemli", bu izolasyonun testte de doğrulanması.
@@ -401,7 +421,7 @@ profile srvctl-yanlisdomain-cli flags=(attach_disconnected) {
   /bin/sh rix,
   /usr/bin/dash rix,
   /usr/bin/flock rix,
-  /run/srvctl/deploy-baskadomain.lock rwk,
+  /run/srvctl/locks/baskadomain/deploy-baskadomain.lock rwk,
 }
 EOF
 assert_fail _cron_apparmor_flock_ok "yanlisdomain" \

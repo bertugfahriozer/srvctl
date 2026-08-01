@@ -689,16 +689,69 @@ _deploy_no_rollback_recover() {
     return 0
 }
 
+# ───────────────────────────────────────────────────────────────
+# DAC/root ÇELİŞKİSİ DÜZELTMESİ (GERÇEK üretim sunucusunda ölçüldü —
+# 'flock: cannot open lock file ...: Permission denied', çıkış kodu 66):
+# kilit dizini ESKİDEN 700 root:root idi — bu, root olarak çalışan
+# '_deploy_lock' (bu fonksiyon) İÇİN doğruydu, ama 'srvctl cron' job'ları
+# domain'in KENDİ kullanıcısı (User=web_<sname>, systemd unit) olarak AYNI
+# kilidi KARŞI taraftan (flock(1) exec-form ile, bkz. lib/cron.sh dosya başı
+# "DEPLOY KİLİDİ" yorumu) açmaya çalışıyor — 700 root:root bir dizine
+# web_<sname> hiç GİREMEZ (AppArmor'a sıra bile gelmeden DAC reddeder).
+# Dizin gevşetilip (ör. 711/755) İÇİNDEKİ dosya adı domain adından tahmin
+# edilebilir hale getirilirse bu SEFER domainler arası izolasyon (görev
+# şartı) zedelenir. ÇÖZÜM — bkz. _deploy_lock_dir yorumu: domain BAŞINA
+# AYRI, o domain'in kullanıcısına ait (700) bir alt dizin.
+# ───────────────────────────────────────────────────────────────
+
+# Kilit dizin ağacını hazırlar ve domain'e ÖZEL alt dizinin YOLUNU stdout'a
+# yazar. Üç katman:
+#   1) ${lock_base}          711 root:root — yalnız GEÇİŞ (listeleme YOK;
+#      root DIŞINDA kimse burada dosya/dizin OLUŞTURAMAZ/SİLEMEZ).
+#   2) ${lock_base}/locks     711 root:root — FPM'in AYNI ${lock_base}
+#      altında tuttuğu pid dosyalarından (fpm-<sname>.pid, bkz.
+#      templates/php-fpm/fpm-global.conf.tpl) ad alanı olarak ayrıştırmak
+#      İÇİN (kavramsal netlik; DAC izolasyonu için ZORUNLU değil, asıl
+#      izolasyon 3. katmanda sağlanıyor).
+#   3) ${lock_base}/locks/<sname>  700 web_<sname>:web_<sname> — YALNIZ o
+#      domain'in Linux kullanıcısı (VE root — root DAC'ı BAYPAS eder)
+#      girebilir; farklı bir UID'ye sahip BAŞKA hiçbir domain kullanıcısı
+#      buraya GİREMEZ (domainler arası izolasyon KORUNUR — görev şartı).
+# lib/cron.sh AYNI formülü KENDİ İÇİNDE (_cron_lock_dir) tutar — çapraz
+# modül bağımlılığı KURULMADAN (CLAUDE.md deseni; bu dosyadaki diğer "AYNI
+# formül" notlarıyla tutarlı, ör. _deploy_read_meta/_cron_add'ın working_dir
+# hesaplaması). İki formülün DRIFT ETMEMESİ tests/test_deploy_lock_isolation.sh
+# tarafından uçtan uca (gerçek FLOCK_PREFIX render'ı ile) doğrulanır.
+_deploy_lock_dir() {
+    local sname="$1" web_user="$2"
+    local lock_base="${SRVCTL_LOCK_DIR:-/run/srvctl}"
+    secure_dir "$lock_base" 711
+    secure_dir "${lock_base}/locks" 711
+    local dom_dir="${lock_base}/locks/${sname}"
+    secure_dir "$dom_dir" 700 "${web_user}:${web_user}"
+    printf '%s' "$dom_dir"
+}
+
 # Per-domain deploy kilidi (flock). Aynı domain'e eş zamanlı iki deploy
 # aynı release_dir adını üretebilir, birbirinin symlink'ini ezebilir ve
 # birinin prune'u diğerinin doldurmakta olduğu dizini silebilir.
 # fd 9'u tutar; kilit süreç bitince otomatik serbest kalır.
 _deploy_lock() {
     local domain="$1" sname; sname=$(safe_name "$domain")
-    local lock_dir="${SRVCTL_LOCK_DIR:-/run/srvctl}"
+    local web_user="web_${sname}"
     command -v flock &>/dev/null || { warn "flock yok — eşzamanlılık koruması devre dışı"; return 0; }
-    secure_dir "$lock_dir" 700
-    exec 9>"${lock_dir}/deploy-${sname}.lock" || return 0
+    local lock_dir; lock_dir=$(_deploy_lock_dir "$sname" "$web_user")
+    local lock_path="${lock_dir}/deploy-${sname}.lock"
+    # Kilit dosyasının KENDİSİ de domain kullanıcısına ait/600 olmalı —
+    # aksi halde root'un 'exec 9>' ile İLK yarattığı dosya varsayılan
+    # umask'la (tipik 644, root:root) kalırdı ve cron'un flock(1) çağrısı
+    # (web_<sname> olarak) dosyayı AÇAMAZDI (dizin doğru olsa BİLE — bu
+    # TAM DA bu görevin düzelttiği sınıftan bir DAC hatası olurdu).
+    # secure_file MEVCUT içeriği KORUR (truncate etmez) — kilit dosyasının
+    # içeriği zaten önemsiz (flock yalnız fd'yi kullanır) ama prensip
+    # olarak core.sh'ın genel sözleşmesiyle tutarlı.
+    secure_file "$lock_path" 600 "${web_user}:${web_user}"
+    exec 9>"$lock_path" || return 0
     flock -n 9 \
         || error "Bu domain için bir deploy zaten çalışıyor: ${domain}"
 }
