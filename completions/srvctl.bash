@@ -10,7 +10,7 @@ _srvctl_completions() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     # Ana komutlar
-    commands="init domain deploy backup ssl security status monitor notify cloudflare ip trusted user plugin webhook changelog version help"
+    commands="init domain cron deploy backup ssl security status monitor notify cloudflare ip trusted user plugin webhook changelog version help"
 
     # 1. seviye
     if [[ ${COMP_CWORD} -eq 1 ]]; then
@@ -33,6 +33,19 @@ _srvctl_completions() {
             elif [[ ${COMP_CWORD} -eq 4 && "${COMP_WORDS[2]}" == "framework" ]]; then
                 # 'domain framework <domain> <deger>' — beyan değeri tamamlama
                 COMPREPLY=($(compgen -W "ci4 laravel symfony none" -- "$cur"))
+            fi
+            ;;
+        cron)
+            local cron_cmds="add list show run enable disable remove logs"
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$cron_cmds" -- "$cur"))
+            elif [[ ${COMP_CWORD} -eq 3 ]]; then
+                # <domain>|--system tamamlama
+                COMPREPLY=($(compgen -W "--system" -- "$cur"))
+                _srvctl_complete_domains
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "add" ]]; then
+                # 'cron add' bayrak tamamlama
+                COMPREPLY=($(compgen -W "--name= --schedule= --command= --description= --timeout= --catch-up-on-boot" -- "$cur"))
             fi
             ;;
         deploy)

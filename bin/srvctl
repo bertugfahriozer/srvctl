@@ -44,6 +44,7 @@ _load_and_run() {
 case "${1:-help}" in
     init)       _load_and_run init cmd_init "${@:2}" ;;
     domain)     _load_and_run domain cmd_domain "${@:2}" ;;
+    cron)       _load_and_run cron cmd_cron "${@:2}" ;;
     deploy)     _load_and_run deploy cmd_deploy "${@:2}" ;;
     rollback)   _load_and_run deploy cmd_rollback "${@:2}" ;;
     backup)     _load_and_run backup cmd_backup "${@:2}" ;;
@@ -89,6 +90,16 @@ case "${1:-help}" in
         echo -e "    ${CYAN}domain resources${NC} <domain> [opts]  Kaynak limitleri (cgroups)"
         echo -e "    ${CYAN}domain worker${NC} <domain> <eylem>    Kuyruk worker'ı yönet (start/stop/status/enable/disable)"
         echo -e "    ${CYAN}domain scheduler${NC} <domain> <eylem> Zamanlanmış görev yönet (start/stop/status/enable/disable)"
+        echo ""
+        echo -e "  ${BOLD}Cron${NC} (kullanıcı dostu — arka planda systemd timer)"
+        echo -e "    ${CYAN}cron add${NC} <domain>|--system --name=<ad> --schedule=<zaman> --command=<komut>"
+        echo -e "                                     Yeni cron görevi ekle ('srvctl cron' ile tüm seçenekler)"
+        echo -e "    ${CYAN}cron list${NC} [<domain>|--system]     Cron görevlerini listele"
+        echo -e "    ${CYAN}cron show${NC} <domain>|--system <ad>  Cron detay bilgisi"
+        echo -e "    ${CYAN}cron run${NC} <domain>|--system <ad>   Şimdi bir kez çalıştır (test)"
+        echo -e "    ${CYAN}cron enable|disable${NC} <domain>|--system <ad>  Etkinleştir/devre dışı bırak"
+        echo -e "    ${CYAN}cron remove${NC} <domain>|--system <ad>  Cron görevini kaldır"
+        echo -e "    ${CYAN}cron logs${NC} <domain>|--system <ad> [-n N]     Cron loglarını göster"
         echo ""
         echo -e "  ${BOLD}Deploy${NC}"
         echo -e "    ${CYAN}deploy${NC} <domain> [branch]          Zero-downtime deploy"

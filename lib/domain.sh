@@ -2917,6 +2917,38 @@ _domain_purge_resources() {
     systemctl stop "srvctl-scheduler-${sname}.service" >/dev/null 2>&1 || true
     rm -f -- "${sysd_dir}/srvctl-scheduler-${sname}.timer" "${sysd_dir}/srvctl-scheduler-${sname}.service"
 
+    # 2.5. Domain cron görevleri (srvctl cron add <domain> ...) — worker/
+    #      scheduler İLE AYNI gerekçe (H2): 'domain remove' sonrası bu
+    #      unit'ler öksüz kalmasın (kullanıcısı silinmiş bir 'User=' ile her
+    #      tetiklemede journal spam'i üretmesinler). Sistem geneli cron'lar
+    #      ('srvctl-syscron-*') bu domain'e ÖZGÜ DEĞİLDİR — buraya ASLA
+    #      dokunulmaz. lib/cron.sh'ı SOURCE ETMİYORUZ (CLAUDE.md deseni:
+    #      çapraz modül çağrısı yalnızca fonksiyon GERÇEKTEN gerektiğinde
+    #      guard'lı source edilir) — worker/scheduler'ın KENDİSİ de aynı
+    #      şekilde başka bir modülü çağırmadan doğrudan systemctl/rm
+    #      kullanıyor, cron temizliği de AYNI stile uyar. Ad uzayı ayrımı
+    #      ('srvctl-cron-<sname>-*' vs 'srvctl-cronfail-<sname>-*') KASITLI
+    #      farklı önek kullanır (bkz. lib/cron.sh:_cron_fail_svc_name) — bu
+    #      glob'lar birbirini YAKALAMAZ.
+    local cf
+    for cf in "${sysd_dir}/srvctl-cron-${sname}-"*".timer"; do
+        [[ -e "$cf" ]] || continue
+        systemctl disable --now "$(basename "$cf")" >/dev/null 2>&1 || true
+    done
+    for cf in "${sysd_dir}/srvctl-cron-${sname}-"*".service"; do
+        [[ -e "$cf" ]] || continue
+        systemctl stop "$(basename "$cf")" >/dev/null 2>&1 || true
+    done
+    for cf in "${sysd_dir}/srvctl-cronfail-${sname}-"*".service"; do
+        [[ -e "$cf" ]] || continue
+        systemctl disable --now "$(basename "$cf")" >/dev/null 2>&1 || true
+    done
+    rm -rf -- "${sysd_dir}/srvctl-cron-${sname}-"*".service.d"
+    rm -f -- "${sysd_dir}/srvctl-cron-${sname}-"*".timer" \
+             "${sysd_dir}/srvctl-cron-${sname}-"*".service" \
+             "${sysd_dir}/srvctl-cronfail-${sname}-"*".service"
+    rm -rf -- "${SRVCTL_STATE_DIR:-/nonexistent}/_cron/${sname}" 2>/dev/null || true
+
     # 3. Per-domain FPM unit (T7a/harden-fpm) + config (H2: eskiden yalnız rollback biliyordu).
     systemctl disable --now "srvctl-fpm-${sname}.service" >/dev/null 2>&1 || true
     rm -f -- "${sysd_dir}/srvctl-fpm-${sname}.service" "${fpm_dir}/${sname}.conf"

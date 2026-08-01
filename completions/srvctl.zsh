@@ -9,6 +9,7 @@ _srvctl() {
     commands=(
         'init:Sunucu ilk kurulumu'
         'domain:Domain yönetimi'
+        'cron:Kullanıcı dostu cron (systemd timer)'
         'deploy:Zero-downtime deploy'
         'backup:Yedekleme ve geri yükleme'
         'ssl:SSL sertifika yönetimi'
@@ -80,6 +81,34 @@ _srvctl() {
                         _describe 'framework değeri' framework_values
                     else
                         _describe 'domain işlemi' domain_cmds
+                    fi
+                    ;;
+                cron)
+                    local -a cron_cmds
+                    cron_cmds=(
+                        'add:Yeni cron görevi ekle'
+                        'list:Cron görevlerini listele'
+                        'show:Cron detay bilgisi'
+                        'run:Şimdi bir kez çalıştır (test)'
+                        'enable:Etkinleştir'
+                        'disable:Devre dışı bırak'
+                        'remove:Cron görevini kaldır'
+                        'logs:Cron loglarını göster'
+                    )
+                    if [[ "${words[2]:-}" == "add" && ${#words} -ge 4 ]]; then
+                        local -a cron_add_flags
+                        cron_add_flags=(
+                            '--name=:Cron adı (harf/rakam/alt çizgi)'
+                            '--schedule=:Zamanlama (Türkçe kısayol|cron sözdizimi|ham systemd)'
+                            '--command=:Çalıştırılacak komut'
+                            '--description=:Açıklama'
+                            '--timeout=:Azami çalışma süresi (sn)'
+                            '--catch-up-on-boot:Kaçan çalışmayı açılışta telafi et'
+                        )
+                        _describe 'cron add seçeneği' cron_add_flags
+                    else
+                        _describe 'cron işlemi' cron_cmds
+                        _srvctl_domains
                     fi
                     ;;
                 deploy)
