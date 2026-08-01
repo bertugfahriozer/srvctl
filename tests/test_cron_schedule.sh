@@ -430,5 +430,70 @@ assert_fail _cron_apparmor_flock_ok "yanlisdomain" \
 rm -rf "$AA_DIR"
 unset SRVCTL_APPARMOR_DIR
 
+# ═══════════════════════════════════════════════
+#  9) SANDBOX (systemd mount namespace) ÖN-KONTROLÜ — _cron_sandbox_probe_ok
+#     (DÖRDÜNCÜ HOST BULGUSU — koordinatör, 2. tur: flock DAC/AppArmor'dan
+#     geçtiği HÂLDE 'ProtectSystem=strict' + eksik 'ReadWritePaths=' YÜZÜNDEN
+#     'Permission denied' (73) ile düşüyordu; bu fonksiyon koordinatörün
+#     KENDİ 'systemd-run' A/B testini 'cron add' anına taşır). Dönüş kodları
+#     (0/1/2) VE fail-soft/gerekli argüman kontrolleri burada İZOLE test
+#     edilir — GERÇEK bir 'systemd-run'/sandbox davranışı BU MAKİNEDE
+#     doğrulanamaz (bkz. fonksiyonun KENDİ DÜRÜSTLÜK NOTU), yalnız KONTROL
+#     AKIŞI (argüman eksikliği/komut yokluğu/dönüş kodu eşlemesi) test
+#     edilebilir.
+# ═══════════════════════════════════════════════
+SANDBOX_FAKEBIN="$(mktemp -d)"
+
+# (i) 'systemd-run' PATH'te YOKSA (bu makinenin doğal durumu) — 2 döner
+# (BİLİNMİYOR, "hatalı" DEĞİL — core.sh'taki AYNI missing-vs-tamper ayrımı).
+if ! command -v systemd-run >/dev/null 2>&1; then
+    assert_fail _cron_sandbox_probe_ok "/var/www/example.com" "/run/srvctl/locks/example_com" "root" \
+        "9i) 'systemd-run' YOKSA probe ÇALIŞTIRILAMAZ (2 döner, predikat FAIL — sessizce geçilecek durum)"
+else
+    echo "  UYARI: bu host'ta GERÇEK 'systemd-run' VAR — (i) testi bu ortamda ANLAMSIZ, ATLANDI"
+fi
+
+# Aşağıdaki testler İÇİN sahte bir 'systemd-run' PATH'e eklenir (yalnız
+# KONTROL AKIŞINI izole etmek için — argümanlarını GERÇEKTEN kullanmaz,
+# yalnız önceden belirlenmiş bir kodla çıkar).
+cat > "${SANDBOX_FAKEBIN}/systemd-run" <<'EOF'
+#!/bin/bash
+exit "${FAKE_SYSTEMD_RUN_EXIT:-0}"
+EOF
+chmod +x "${SANDBOX_FAKEBIN}/systemd-run"
+export PATH="${SANDBOX_FAKEBIN}:${PATH}"
+
+# (ii) Eksik argüman (boş domain_root/lock_dir/web_user) — 'systemd-run'
+# VARKEN BİLE 2 döner (probe ANLAMLI bir girdi olmadan HİÇ ÇALIŞTIRILMAZ).
+assert_fail _cron_sandbox_probe_ok "" "/run/srvctl/locks/example_com" "root" \
+    "9ii) domain_root BOŞSA probe ÇALIŞTIRILMAZ (2 döner)"
+assert_fail _cron_sandbox_probe_ok "/var/www/example.com" "" "root" \
+    "9ii) lock_dir BOŞSA probe ÇALIŞTIRILMAZ (2 döner)"
+assert_fail _cron_sandbox_probe_ok "/var/www/example.com" "/run/srvctl/locks/example_com" "" \
+    "9ii) web_user BOŞSA probe ÇALIŞTIRILMAZ (2 döner)"
+
+# (iii) web kullanıcısı YOKSA (gerçek bir Linux kullanıcı adı OLMAYAN bir
+# dize) — 'systemd-run' VARKEN BİLE 2 döner ('id' başarısız).
+assert_fail _cron_sandbox_probe_ok "/var/www/example.com" "/run/srvctl/locks/example_com" "srvctl_test_nonexistent_user_xyz" \
+    "9iii) web kullanıcısı YOKSA probe ÇALIŞTIRILMAZ (2 döner — 'id' başarısız)"
+
+# (iv) 'systemd-run' VAR + kullanıcı VAR ('root' — her POSIX sistemde
+# GERÇEKTEN var olan tek kimlik, 'id root' HER YERDE başarılıdır) + sahte
+# 'systemd-run' 0 ile çıkıyor → probe BAŞARILI (0 döner).
+export FAKE_SYSTEMD_RUN_EXIT=0
+assert_ok _cron_sandbox_probe_ok "/var/www/example.com" "/run/srvctl/locks/example_com" "root" \
+    "9iv) systemd-run BAŞARILI çıkarsa probe BAŞARILI sayılır (0 döner)"
+
+# (v) AYNI koşullar ama sahte 'systemd-run' 1 ile çıkıyor → probe ÇALIŞTI
+# ama BAŞARISIZ (1 döner — GERÇEK bir tespit, 'cron add' bunu UYARIYA
+# çevirir, ASLA engellemez).
+export FAKE_SYSTEMD_RUN_EXIT=1
+assert_fail _cron_sandbox_probe_ok "/var/www/example.com" "/run/srvctl/locks/example_com" "root" \
+    "9v) systemd-run BAŞARISIZ çıkarsa probe BAŞARISIZ sayılır (1 döner — GERÇEK tespit)"
+unset FAKE_SYSTEMD_RUN_EXIT
+
+rm -f "${SANDBOX_FAKEBIN}/systemd-run"
+rm -rf "$SANDBOX_FAKEBIN"
+
 rm -rf "$WEB_ROOT"
 test_summary

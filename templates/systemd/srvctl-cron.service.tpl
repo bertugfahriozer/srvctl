@@ -1,5 +1,5 @@
 # TOKENS: SAFE_NAME DOMAIN WEB_USER WORKING_DIR CRON_NAME CRON_DESCRIPTION
-#         CRON_COMMAND RUNTIME_MAX DOMAIN_ROOT FLOCK_PREFIX
+#         CRON_COMMAND RUNTIME_MAX DOMAIN_ROOT LOCK_DIR FLOCK_PREFIX
 # Besleyen: lib/cron.sh (ayrı bir görevde yazılıyor) — bu şablonun TOKEN
 # listesi görev tanımının SÖZLEŞMESİDİR, tek taraflı GENİŞLETİLMEMELİDİR.
 # FLOCK_PREFIX (GERÇEK üretim sunucusunda ölçülen bir kaçış hatasından
@@ -14,6 +14,11 @@
 # KARDEŞ dizinlere yazan HER TİPİK cron işini (cache temizliği, log
 # rotasyonu) EROFS ile KIRIYORDU — bir TAKİP maddesi değil, İŞLEVSEL bir
 # regresyondu; bu yüzden token kontratı GENİŞLETİLDİ.
+# LOCK_DIR (DÖRDÜNCÜ HOST BULGUSU — bkz. aşağıdaki ReadWritePaths= yorumu):
+# lib/cron.sh:_cron_lock_dir'in (lib/deploy.sh:_deploy_lock_dir İLE AYNI
+# formül) ürettiği domain'e özel deploy-kilidi dizini
+# ('/run/srvctl/locks/<sname>/'). FLOCK_PREFIX mevcut OLMASA BİLE (flock
+# yoksa/sistem cron'u) HER ZAMAN beslenir — token kontratı KOŞULSUZDUR.
 #
 # ADLANDIRMA SÖZLEŞMESİ (lib/cron.sh bu adı üretir/kullanır):
 #   srvctl-cron-{{SAFE_NAME}}-{{CRON_NAME}}.service (+ eşlenik .timer)
@@ -169,7 +174,37 @@ ProtectHome=yes
 # 'DOMAIN_ROOT=${WEB_ROOT}/${domain}' olarak beslenmelidir; render SONRASI
 # leftover-token guard'ı (_domain_assert_no_leftover_tokens) bunu ayrıca
 # doğrular.
-ReadWritePaths=-{{DOMAIN_ROOT}}
+#
+# DÖRDÜNCÜ HOST BULGUSU (koordinatör, AYNI Ubuntu 24.04 domain, ÖNCEKİ ÜÇ
+# katman — flock exec izni, AppArmor dosya kuralı, DAC dizin modu —
+# TEK TEK düzeltildikten SONRA ölçüldü): flock artık deploy-kilidi
+# dosyasına DAC VE AppArmor açısından erişebiliyordu (AppArmor
+# 'aa-complain' moduna alınıp TEKRAR denendiğinde BİLE AYNI hata —
+# AppArmor'u KESİN olarak eledi) ama YİNE DE 'Permission denied' (çıkış
+# 73) ile düşmeye devam etti. Kök neden: 'ProtectSystem=strict' TÜM dosya
+# sistemi hiyerarşisini salt-okunur mount eder; bu satır (ReadWritePaths=)
+# YALNIZCA burada AÇIKÇA listelenen yolları geri açar — kilit dizini
+# ('/run/srvctl/locks/<sname>/', bkz. lib/cron.sh:_cron_lock_dir /
+# lib/deploy.sh:_deploy_lock_dir) DOMAIN_ROOT'un DIŞINDA (WEB_ROOT/<domain>
+# ağacı DEĞİL, srvctl'in kendi runtime dizini) olduğundan bu listede
+# YOKTU — flock DAC/AppArmor'dan GEÇSE BİLE salt-okunur bind-mount'a
+# ÇARPIYORDU. Koordinatör bunu 'systemd-run' ile AYNI sandbox koşullarını
+# kurup A/B testiyle KANITLADI: ReadWritePaths'te kilit dizini YOKKEN
+# 'touch' başarısız, VARKEN başarılıydı. LOCK_DIR token'ı (yukarıdaki
+# TOKENS envanterine SONRADAN eklendi) bu ikinci yolu açar — '-' öneki
+# AYNI DOMAIN_ROOT'takiyle AYNI gerekçeyle: kilit dizini yalnız domain'in
+# İLK 'cron add'i (ya da İLK deploy'u) ÇALIŞTIRILDIĞINDA oluşturulur, bu
+# satır render EDİLDİĞİ anda HENÜZ var olmayabilir; '-' öneki olmadan
+# systemd yol YOKSA unit'i BAŞLATMAYI REDDEDER (bu görev tanımının AÇIKÇA
+# uyardığı tuzak). LOCK_DIR, lib/cron.sh:_cron_add tarafından FLOCK_PREFIX
+# mevcut olsun ya da olmasın HER ZAMAN beslenir (koşulsuz token kontratı)
+# — render'dan HEMEN SONRA _cron_assert_readwrite_covers_lock (lib/cron.sh)
+# bu satırın GERÇEKTEN LOCK_DIR'i İÇERDİĞİNİ statik olarak doğrular;
+# _cron_sandbox_probe_ok İSE (varsa) GERÇEK bir 'systemd-run' probe'uyla
+# bunu 'cron add' ANINDA DİNAMİK olarak sınar (bkz. o fonksiyonların
+# yorumları — koordinatörün KENDİ teşhis tekniğinin add-zamanına taşınmış
+# hâli).
+ReadWritePaths=-{{DOMAIN_ROOT}} -{{LOCK_DIR}}
 # PrivateTmp: worker.service.tpl'deki AYNI caveat geçerlidir (SİSTEM
 # /tmp'ini izole eder, uygulamanın kendi WEB_ROOT/<domain>/tmp'ini DEĞİL) —
 # ayrıca cron script'lerinde TARİHSEL bir açık sınıfına (öngörülebilir

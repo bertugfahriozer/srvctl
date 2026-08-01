@@ -631,6 +631,83 @@ _cron_apparmor_flock_ok() {
 }
 
 # ═══════════════════════════════════════════════
+#  SANDBOX (systemd mount namespace) ÖN-KONTROLÜ — DÖRDÜNCÜ HOST BULGUSU
+# ═══════════════════════════════════════════════
+# Koordinatör, AYNI Ubuntu 24.04 domain, ÖNCEKİ ÜÇ katman (exec izni,
+# AppArmor dosya kuralı, DAC dizin modu) düzeltildikten SONRA ölçtü: flock
+# artık dizine hem DAC hem AppArmor açısından girebiliyordu (AppArmor
+# 'aa-complain' moduna alınıp TEKRAR denendiğinde BİLE AYNI hata — bu
+# AppArmor'u KESİN olarak eledi) ama YİNE DE 'Permission denied' (çıkış
+# 73) ile düşmeye devam etti. Kalan tek aday systemd'nin KENDİ mount
+# sandbox'ıydı: cron unit'i 'ProtectSystem=strict' kullanır — bu TÜM dosya
+# sistemi hiyerarşisini salt-okunur mount eder ('/dev','/proc','/sys'
+# hariç); 'ReadWritePaths=' yalnız AÇIKÇA listelenen yolları geri açar.
+# Kilit dizini bu listede YOKTU (yalnız DOMAIN_ROOT vardı) — flock DAC/
+# AppArmor'dan GEÇSE BİLE salt-okunur bind-mount'a ÇARPIYORDU. Koordinatör
+# bunu 'systemd-run' ile AYNI sandbox koşullarını kurup A/B testiyle
+# KANITLADI: ReadWritePaths'te kilit dizini YOKKEN 'touch' başarısız,
+# VARKEN başarılıydı.
+#
+# Düzeltme İKİ KATMANLI: (1) templates/systemd/srvctl-cron.service.tpl'in
+# 'ReadWritePaths=' satırına YENİ bir LOCK_DIR token'ı eklendi (bkz. o
+# şablonun TOKENS envanteri, _cron_add'in render_template çağrısı). (2)
+# BU FONKSİYON — koordinatörün KENDİ teşhis tekniğinin (systemd-run A/B
+# testi) 'cron add' ANINA taşınmış hâli: cron unit'inin KULLANACAĞI TAM
+# AYNI sandbox özellikleriyle (User/Group, ProtectSystem=strict,
+# ProtectHome=yes, PrivateTmp=yes, ReadWritePaths=-domain_root -lock_dir)
+# geçici bir 'touch' unit'i çalıştırıp GERÇEKTEN yazılabilir mi diye
+# DİNAMİK olarak sınar — statik metin eşleşmesinin (bkz.
+# _cron_assert_readwrite_covers_lock, render sonrası) YAKALAYAMAYACAĞI
+# "syntax doğru ama KERNEL/systemd sürümü BEKLENMEDİK davranıyor" sınıfı
+# sorunları da kapsar.
+#
+# FAIL-SOFT (İSTEĞE BAĞLI): çağıran taraf (_cron_add) bu fonksiyonun
+# sonucunu ASLA 'cron add'i ENGELLEMEK için kullanmaz, yalnız UYARIR —
+# bkz. dönüş kodu 2 (probe hiç çalıştırılamadı) İLE 1 (probe çalıştı ve
+# BAŞARISIZ) arasındaki ayrım. systemd-analyze (schedule sözdizimi)
+# KASITLI OLARAK fail-closed'dır çünkü SAF/deterministik bir sözdizim
+# kontrolüdür; bu probe İSE canlı sistem durumuna (kullanıcı henüz var mı,
+# systemd sürümü, cgroup delegasyonu, o anki sistem yükü) BAĞIMLI bir
+# DIŞ YAN ETKİLİ komut çalıştırır — GEÇİCİ/ilgisiz bir nedenle başarısız
+# olması TÜM 'cron add' akışını KIRMAMALIDIR (istenmeyen bir fail-closed
+# riski, tespit değeri kadar önemli).
+#
+# DÜRÜSTLÜK NOTU (görev talebi — "ölç, tahmin etme"): bu macOS geliştirme
+# makinesinde systemd YOK — bu fonksiyonun 'systemd-run' ÇAĞRISI BURADAN
+# HİÇ ÇALIŞTIRILAMADI/doğrulanamadı (yalnız 'command -v systemd-run'
+# YOKKEN erken dönen (2) dalı VE argüman/mantık akışı test edilebildi,
+# bkz. tests/test_cron_schedule.sh). GERÇEK üretim sunucusunda
+# 'srvctl cron add' ile doğrulanmalı — sözdiziminde bir sorun çıkarsa
+# YUKARIDAKİ fail-soft tasarımı sayesinde en kötü ihtimalle YANLIŞ bir
+# uyarı basar/basmaz, ama 'cron add' akışını KIRMAZ.
+#
+# Dönüş: 0=probe BAŞARILI (sandbox altında kilit dizini yazılabilir —
+# KANITLANDI), 1=probe ÇALIŞTI ama BAŞARISIZ (sandbox kilit dizinini
+# KAPSAMIYOR — GERÇEK bir tespit), 2=probe HİÇ ÇALIŞTIRILAMADI
+# (systemd-run yok / web kullanıcısı henüz yok / eksik argüman — BİLİNMİYOR,
+# "eksik" "hatalı" ile AYNI ŞEY DEĞİL, sessizce geçilir — core.sh'taki AYNI
+# missing-vs-tamper ayrım ilkesi, bkz. _cron_apparmor_flock_ok yorumu).
+_cron_sandbox_probe_ok() {
+    local domain_root="$1" lock_dir="$2" web_user="$3"
+    command -v systemd-run >/dev/null 2>&1 || return 2
+    [[ -n "$domain_root" && -n "$lock_dir" && -n "$web_user" ]] || return 2
+    id "$web_user" >/dev/null 2>&1 || return 2
+
+    local probe_file="${lock_dir}/.srvctl-cron-add-sandbox-probe.$$"
+    systemd-run --quiet --wait --pipe --collect \
+        --uid="$web_user" --gid="$web_user" \
+        --property="ProtectSystem=strict" \
+        --property="ProtectHome=yes" \
+        --property="PrivateTmp=yes" \
+        --property="ReadWritePaths=-${domain_root} -${lock_dir}" \
+        -- /usr/bin/touch "$probe_file" >/dev/null 2>&1
+    local rc=$?
+    rm -f -- "$probe_file" 2>/dev/null || true
+    [[ "$rc" -eq 0 ]] && return 0
+    return 1
+}
+
+# ═══════════════════════════════════════════════
 #  KAÇIŞ YARDIMCILARI (bkz. dosya başındaki UZUN sözleşme yorumu)
 # ═══════════════════════════════════════════════
 
@@ -680,6 +757,31 @@ _cron_assert_no_leftover_tokens() {
         leftover=$(grep -oE '\{\{[A-Z_]+\}\}' "$file" 2>/dev/null | sort -u | tr '\n' ' ')
         rm -f -- "$file"
         error "Şablon render hatası: ${file} içinde beslenmeyen token kaldı (${leftover:-'{{...}}'}) — dosya silindi, işlem durduruldu."
+    fi
+}
+
+# DÖRDÜNCÜ HOST BULGUSU'nun STATİK yarısı (bkz. _cron_sandbox_probe_ok'un
+# UZUN yorumu — DİNAMİK yarısı). Bu bir OPERATÖR/host koşulu DEĞİL, saf
+# bir srvctl İÇ TUTARLILIK denetimidir: render EDİLMİŞ dosyanın KENDİSİNDE
+# LOCK_DIR'in GERÇEKTEN 'ReadWritePaths='e ULAŞTIĞINI doğrular — ileride
+# biri _cron_add'in render_template çağrısından 'LOCK_DIR=...' token'ını
+# YANLIŞLIKLA çıkarırsa (ya da şablondan satırı silerse) bu, render'ın
+# KENDİSİNİ ('{{LOCK_DIR}}' leftover) KIRMAZ (render_template salt
+# string-replace'tir, eksik token'ı SESSİZCE boş bırakabilir) — bu yüzden
+# '_cron_assert_no_leftover_tokens' TEK BAŞINA bu sınıf regresyonu
+# YAKALAYAMAZ, AYRI bir SEMANTİK kontrol gerekir. '_cron_assert_no_leftover_
+# tokens' İLE AYNI ciddiyette FAIL-CLOSED: dosyayı SİLER, hata verir —
+# bir kod hatası operatöre "cron eklendi" YANILSAMASI VERİP GERÇEK
+# üretimde sessizce (66/73 ile) düşmesine asla İZİN VERİLMEZ.
+_cron_assert_readwrite_covers_lock() {
+    local svc_file="$1" lock_dir="$2"
+    [[ -f "$svc_file" ]] || return 0
+    [[ -n "$lock_dir" ]] || return 0
+    local rwline
+    rwline=$(grep -m1 '^ReadWritePaths=' "$svc_file" 2>/dev/null) || rwline=""
+    if [[ "$rwline" != *"$lock_dir"* ]]; then
+        rm -f -- "$svc_file"
+        error "İç tutarlılık hatası: ${svc_file} içindeki 'ReadWritePaths=' satırı kilit dizinini ('${lock_dir}') İÇERMİYOR — bu bir srvctl KOD HATASIDIR (LOCK_DIR token'ı şablona ya da render çağrısına eksik besleniyor olabilir), bir yapılandırma sorunu DEĞİL. Dosya silindi, işlem durduruldu — lütfen bir hata bildirin."
     fi
 }
 
@@ -965,17 +1067,30 @@ _cron_add() {
     # BAŞINA, '/bin/sh'den ÖNCE eklenir) boş kalabilir (sistem cron'u ya da
     # flock yoksa) — bu durumda ExecStart doğrudan '/bin/sh' ile başlar
     # (syscron şablonuyla BİREBİR AYNI biçim).
-    local flock_prefix=""
+    #
+    # NOT: web_user/domain_root/working_dir/lock_dir burada, render_template
+    # çağrısından ÖNCE, ERKEN hesaplanır (aşağıdaki render bölümünde AYRICA
+    # tanımlanan aynı-adlı değişkenlerle çakışmaz — bkz. o bölümdeki NOT) —
+    # 'lock_dir' HEM FLOCK_PREFIX'in kilit yolu HEM DE render'a beslenen
+    # LOCK_DIR token'ı (ReadWritePaths= — bkz. DÖRDÜNCÜ HOST BULGUSU
+    # aşağıda) İÇİN gereklidir; bu yüzden flock MEVCUT OLMASA BİLE
+    # hesaplanır (LOCK_DIR token'ı HER ZAMAN beslenmek ZORUNDADIR, aksi
+    # halde render_template leftover-token guard'ı patlar).
+    local flock_prefix="" lock_dir="" domain_root="" working_dir="" web_user=""
     if [[ "$is_system" != "true" ]]; then
-        # NOT: 'web_user' burada ERKEN (şablon render bölümünden ÖNCE)
-        # tanımlanır — aşağıda AYNI formülle YENİDEN tanımlanan aynı-adlı
-        # yerel değişkenle çakışmaz ('local' aynı fonksiyon içinde tekrar
-        # çağrılabilir, sadece değeri sıfırlar) — _cron_lock_dir'in
-        # domain'e özel alt dizini DOĞRU sahibe (web_<sname>) atayabilmesi
-        # için bu noktada ZATEN gereklidir.
-        local web_user="web_${sname}"
+        web_user="web_${sname}"
+        # WEB_ROOT/<domain>/current — _domain_working_dir (lib/domain.sh) İLE
+        # BİREBİR AYNI sözleşme; çapraz modül bağımlılığı KURULMADAN (tek
+        # satırlık formül) burada yeniden üretilir.
+        working_dir="${WEB_ROOT}/${domain}/current"
+        # DOMAIN_ROOT: ReadWritePaths= için domain'in TÜM ağacı gerekir
+        # (yalnız WORKING_DIR/'current' DEĞİL — worker/scheduler İLE AYNI
+        # gerekçe, bkz. srvctl-cron.service.tpl başlık yorumu: 'writable/',
+        # 'storage/', üst düzey 'logs/' gibi KARDEŞ dizinler de dahil).
+        domain_root="${WEB_ROOT}/${domain}"
+        lock_dir=$(_cron_lock_dir "$sname" "$web_user")
+
         if command -v flock >/dev/null 2>&1; then
-            local lock_dir; lock_dir=$(_cron_lock_dir "$sname" "$web_user")
             local lock_path lock_escaped
             lock_path="${lock_dir}/deploy-${sname}.lock"
             lock_escaped=$(_cron_escape_percent "$(_cron_escape_unit_squote "$lock_path")")
@@ -998,6 +1113,31 @@ _cron_add() {
             _cron_apparmor_flock_ok "$sname" || aa_rc=$?
             if [[ "$aa_rc" -eq 1 ]]; then
                 warn "AppArmor profili GÜNCEL DEĞİL: /etc/apparmor.d/srvctl-${sname}-cli 'flock' exec VE/YA DA deploy kilidi dosyası ('${lock_path}') izinlerinden birini İÇERMİYOR — bu cron çalıştığında 'Permission denied' (ör. 126) ile BAŞARISIZ OLUR. Düzeltme: 'srvctl domain repair ${domain}' (profili yeniden render edip AppArmor'a yeniden yükler), sonra 'srvctl cron run ${domain} ${name}' ile doğrulayın."
+            fi
+
+            # ── DÖRDÜNCÜ HOST BULGUSU (koordinatör, AYNI Ubuntu 24.04
+            # domain, ÖNCEKİ ÜÇ katman — exec izni, AppArmor dosya kuralı,
+            # DAC dizin modu — düzeltildikten SONRA ölçüldü): flock DAC VE
+            # AppArmor'dan (complain modda BİLE) geçtiği HÂLDE 'Permission
+            # denied' (çıkış 73) İLE düşmeye DEVAM ETTİ. Kök neden: cron
+            # unit'i 'ProtectSystem=strict' kullanıyor — bu, TÜM dosya
+            # sistemini salt-okunur mount eder; 'ReadWritePaths=' yalnız
+            # AÇIKÇA listelenen yolları geri açar VE kilit dizini bu listede
+            # YOKTU (yalnız DOMAIN_ROOT vardı). Düzeltme: şablona YENİ bir
+            # LOCK_DIR token'ı eklendi (bkz. srvctl-cron.service.tpl TOKENS
+            # envanteri) — STATİK doğrulama _cron_assert_readwrite_covers_lock
+            # ile (render'dan hemen sonra, aşağıda), DİNAMİK (varsa GERÇEK
+            # bir systemd-run probe'uyla) doğrulama ise burada, EKLEME
+            # ANINDA, _cron_sandbox_probe_ok ile yapılır — koordinatörün
+            # KENDİ teşhis tekniğinin (systemd-run A/B testi) 'cron add'e
+            # taşınmış hâli. FAIL-SOFT: yalnız UYARIR, asla 'cron add'i
+            # ENGELLEMEZ (bkz. o fonksiyonun DÜRÜSTLÜK NOTU — bu macOS
+            # geliştirme makinesinde GERÇEK bir systemd-run çağrısı hiç
+            # ÇALIŞTIRILAMADI/doğrulanamadı).
+            local sandbox_rc=0
+            _cron_sandbox_probe_ok "$domain_root" "$lock_dir" "$web_user" || sandbox_rc=$?
+            if [[ "$sandbox_rc" -eq 1 ]]; then
+                warn "systemd SANDBOX ön-kontrolü BAŞARISIZ: '${lock_dir}' bu unit'in 'ProtectSystem=strict' + 'ReadWritePaths=' sınırları İÇİNDE YAZILABİLİR DEĞİL (GERÇEK bir 'systemd-run' probe'uyla ölçüldü) — bu cron GERÇEK bir deploy kilidi çakışmasında 'Permission denied' (ör. 73) ile BAŞARISIZ OLABİLİR. Bu normalde bir srvctl KOD HATASINI gösterir (LOCK_DIR token'ı ReadWritePaths='e eksik besleniyor olabilir) — lütfen srvctl'i GÜNCEL sürüme yükseltin ya da bir hata bildirin."
             fi
         else
             warn "flock bulunamadı — bu cron deploy ile ÇAKIŞMAYA KARŞI KORUNMUYOR (lib/deploy.sh:_deploy_lock ile AYNI sınırlama)"
@@ -1025,25 +1165,28 @@ _cron_add() {
             > "$timer_file"
         _cron_assert_no_leftover_tokens "$timer_file"
     else
-        local web_user="web_${sname}"
-        # WEB_ROOT/<domain>/current — _domain_working_dir (lib/domain.sh) İLE
-        # BİREBİR AYNI sözleşme; çapraz modül bağımlılığı KURULMADAN (tek
-        # satırlık formül) burada yeniden üretilir.
-        local working_dir="${WEB_ROOT}/${domain}/current"
-        # DOMAIN_ROOT: ReadWritePaths= için domain'in TÜM ağacı gerekir
-        # (yalnız WORKING_DIR/'current' DEĞİL — worker/scheduler İLE AYNI
-        # gerekçe, bkz. srvctl-cron.service.tpl başlık yorumu: 'writable/',
-        # 'storage/', üst düzey 'logs/' gibi KARDEŞ dizinler de dahil).
-        local domain_root="${WEB_ROOT}/${domain}"
-
+        # web_user/working_dir/domain_root/lock_dir YUKARIDA (FLOCK_PREFIX
+        # bloğunda) ZATEN hesaplandı — burada TEKRAR hesaplanmaz (drift
+        # riski: iki ayrı hesaplama noktası kolayca birbirinden SAPAR;
+        # bkz. o bloktaki NOT).
         render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.service.tpl" \
             "SAFE_NAME=${sname}" "DOMAIN=${domain}" "WEB_USER=${web_user}" \
             "WORKING_DIR=${working_dir}" "CRON_NAME=${name}" \
             "CRON_DESCRIPTION=${description_final}" "CRON_COMMAND=${cron_command_final}" \
             "RUNTIME_MAX=${timeout}" "DOMAIN_ROOT=${domain_root}" \
-            "FLOCK_PREFIX=${flock_prefix}" \
+            "LOCK_DIR=${lock_dir}" "FLOCK_PREFIX=${flock_prefix}" \
             > "$svc_file"
         _cron_assert_no_leftover_tokens "$svc_file"
+        # DÖRDÜNCÜ HOST BULGUSU'nun STATİK yarısı (bkz. FLOCK_PREFIX
+        # bloğundaki DİNAMİK 'systemd-run' probe'unun yorumu): render'dan
+        # HEMEN SONRA, RENDER EDİLMİŞ dosyanın KENDİSİNDE LOCK_DIR'in
+        # GERÇEKTEN 'ReadWritePaths='e ULAŞTIĞINI doğrular — bu bir
+        # OPERATÖR/host koşulu DEĞİL, saf bir srvctl İÇ TUTARLILIK
+        # denetimidir (token besleme/şablon DRIFT'i), bu yüzden
+        # '_cron_assert_no_leftover_tokens' İLE AYNI ciddiyette FAIL-CLOSED
+        # (dosyayı SİLER, hata verir) — bir sonraki koddaki bir hata bunu
+        # SESSİZCE geçemez.
+        _cron_assert_readwrite_covers_lock "$svc_file" "$lock_dir"
 
         render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.timer.tpl" \
             "SAFE_NAME=${sname}" "DOMAIN=${domain}" "CRON_NAME=${name}" \

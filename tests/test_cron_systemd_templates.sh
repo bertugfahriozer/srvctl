@@ -84,7 +84,8 @@ a_out=$(render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.service.tpl" \
     SAFE_NAME=example_com DOMAIN=example.com WEB_USER=web_example_com \
     WORKING_DIR=/var/www/example.com/current CRON_NAME=cache-clear \
     CRON_DESCRIPTION="Cache temizligi" CRON_COMMAND="php artisan cache:clear" \
-    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com FLOCK_PREFIX=)
+    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com \
+    LOCK_DIR=/run/srvctl/locks/example_com FLOCK_PREFIX=)
 
 assert_not_contains    "$a_out" "{{"                                     "A: leftover token yok"
 assert_contains        "$a_out" "Type=oneshot"                            "A: Type=oneshot (çakışma engeli — job coalescing)"
@@ -101,6 +102,13 @@ assert_contains        "$a_out" "NoNewPrivileges=true"                    "A: No
 assert_contains        "$a_out" "ProtectSystem=strict"                    "A: ProtectSystem=strict"
 assert_contains        "$a_out" "ReadWritePaths=-/var/www/example.com"    "A: ReadWritePaths DOMAIN_ROOT (worker/scheduler paritesi — writable/storage/shared/logs KAPSANIR)"
 assert_not_contains    "$a_out" "ReadWritePaths=-/var/www/example.com/current" "A: ReadWritePaths ARTIK yalnız WORKING_DIR'e daraltılmış DEĞİL (regresyon: koordinatör bulgusu)"
+# DÖRDÜNCÜ HOST BULGUSU (koordinatör, 2. tur): flock DAC+AppArmor'dan
+# GEÇSE BİLE 'ProtectSystem=strict' altında ReadWritePaths'te YOKSA kilit
+# dosyasını açamıyordu ('Permission denied', çıkış 73 — AppArmor
+# 'aa-complain' modunda BİLE AYNI hata, koordinatör bunu 'systemd-run'
+# A/B testiyle KANITLADI). ReadWritePaths artık kilit dizinini de İÇERMELİ.
+assert_contains        "$a_out" "ReadWritePaths=-/var/www/example.com -/run/srvctl/locks/example_com" \
+    "A: ReadWritePaths kilit dizinini (LOCK_DIR) de KAPSIYOR (DÖRDÜNCÜ HOST BULGUSU — systemd sandbox düzeltmesi)"
 assert_contains        "$a_out" "StandardOutput=journal"                  "A: çıktı journal'a"
 assert_contains        "$a_out" "StandardError=journal"                   "A: hata journal'a"
 assert_contains        "$a_out" "After=network.target srvctl-fpm-example_com.service" "A: FPM'den sonra sıralama"
@@ -116,10 +124,11 @@ a_out_flock=$(render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.service.t
     WORKING_DIR=/var/www/example.com/current CRON_NAME=cache-clear \
     CRON_DESCRIPTION="Cache temizligi" CRON_COMMAND="php artisan cache:clear" \
     RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com \
-    "FLOCK_PREFIX=/usr/bin/flock -n -E 75 '/run/srvctl/deploy-example_com.lock' ")
+    LOCK_DIR=/run/srvctl/locks/example_com \
+    "FLOCK_PREFIX=/usr/bin/flock -n -E 75 '/run/srvctl/locks/example_com/deploy-example_com.lock' ")
 assert_not_contains "$a_out_flock" "{{" "A2: leftover token yok (FLOCK_PREFIX doluyken)"
 assert_contains "$a_out_flock" \
-    "ExecStart=/usr/bin/flock -n -E 75 '/run/srvctl/deploy-example_com.lock' /bin/sh -c 'php artisan cache:clear'" \
+    "ExecStart=/usr/bin/flock -n -E 75 '/run/srvctl/locks/example_com/deploy-example_com.lock' /bin/sh -c 'php artisan cache:clear'" \
     "A2: FLOCK_PREFIX doluyken ExecStart TEK satırda flock+sh -c'yi doğru sırayla İÇERİYOR"
 assert_not_contains "$a_out_flock" "-c '/usr/bin/flock" \
     "A2: flock KENDİ '-c' bayrağıyla ÇAĞRILMIYOR (exec-form — iç kabuk katmanı YOK)"
@@ -133,9 +142,26 @@ a_out_missing_flock=$(render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.s
     SAFE_NAME=example_com DOMAIN=example.com WEB_USER=web_example_com \
     WORKING_DIR=/var/www/example.com/current CRON_NAME=cache-clear \
     CRON_DESCRIPTION="Cache temizligi" CRON_COMMAND="php artisan cache:clear" \
-    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com)
+    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com LOCK_DIR=/run/srvctl/locks/example_com)
 assert_contains "$a_out_missing_flock" "{{FLOCK_PREFIX}}" \
     "ENTEGRASYON: lib/cron.sh FLOCK_PREFIX beslemeyi UNUTURSA render_template bunu literal bırakır (leftover-token guard'ının yakalayacağı sinyal)"
+
+# ── ENTEGRASYON RİSKİ — AYNI olgu LOCK_DIR İÇİN (DÖRDÜNCÜ HOST BULGUSU —
+#    LOCK_DIR TOKENS envanterine SONRADAN eklendi): lib/cron.sh render'a
+#    LOCK_DIR beslemeyi UNUTURSA sonuç SESSİZ bir 'ReadWritePaths eksik'
+#    DEĞİL, literal '{{LOCK_DIR}}' render çıktısında KALIR —
+#    _cron_assert_no_leftover_tokens BUNU YAKALAR (fail-closed). Ayrıca bu,
+#    _cron_assert_readwrite_covers_lock'un (SEMANTİK kontrol — token BOŞ
+#    beslenirse leftover-token guard'ı bunu YAKALAYAMAZ, ör. 'LOCK_DIR='
+#    şeklinde boş dize geçilirse) NEDEN AYRI bir kontrole ihtiyaç
+#    duyulduğunu da gösterir.
+a_out_missing_lockdir=$(render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-cron.service.tpl" \
+    SAFE_NAME=example_com DOMAIN=example.com WEB_USER=web_example_com \
+    WORKING_DIR=/var/www/example.com/current CRON_NAME=cache-clear \
+    CRON_DESCRIPTION="Cache temizligi" CRON_COMMAND="php artisan cache:clear" \
+    RUNTIME_MAX=120 DOMAIN_ROOT=/var/www/example.com FLOCK_PREFIX=)
+assert_contains "$a_out_missing_lockdir" "{{LOCK_DIR}}" \
+    "ENTEGRASYON: lib/cron.sh LOCK_DIR beslemeyi UNUTURSA render_template bunu literal bırakır (leftover-token guard'ının yakalayacağı sinyal)"
 
 # ═══════════════════════════════════════════════════════════════
 # B) srvctl-cron.timer.tpl — A'yı tetikler
@@ -269,6 +295,33 @@ assert_contains "$c_mut_scf_line" "mount" \
 a_mut_narrow="${a_out/ReadWritePaths=-\/var\/www\/example.com/ReadWritePaths=-/var/www/example.com/current}"
 assert_contains "$a_mut_narrow" "ReadWritePaths=-/var/www/example.com/current" \
     "MUTASYON A: ReadWritePaths YENİDEN WORKING_DIR'e daraltılırsa mutant BUNU DOĞRULUYOR (regresyon algılanabilir)"
+
+# (6b) LOCK_DIR REGRESYONU (DÖRDÜNCÜ HOST BULGUSU — koordinatör, 2. tur):
+#      ReadWritePaths'ten YALNIZCA kilit dizini (LOCK_DIR) segmenti
+#      SİLİNİRSE (ör. biri "-{{LOCK_DIR}}" ekini şablondan KALDIRIRSA,
+#      DOMAIN_ROOT segmentine DOKUNMADAN) — bu, statik metin karşılaştırması
+#      (yukarıdaki "A: ReadWritePaths kilit dizinini de KAPSIYOR" testi)
+#      için AYIRT EDİCİ bir mutanttır: DOMAIN_ROOT hâlâ VAR ama LOCK_DIR
+#      YOK — 'flock' yine 'Permission denied' (73) ile düşer, ama SESSİZCE
+#      (leftover-token guard'ı bunu YAKALAMAZ; token BOŞ değil, satırdan
+#      SADECE bir SEGMENT eksik).
+#      PERFORMANS NOTU: mutasyon KASITLI OLARAK tüm 'a_out' (~15KB) yerine
+#      YALNIZCA önce grep İLE ÇIKARILMIŞ tek satır ('rwline') üzerinde
+#      uygulanır — macOS'un öntanımlı kabuğu (bash 3.2.57, Apple'ın GPLv3
+#      nedeniyle 2007'den beri dondurduğu sürüm) '${var/pattern/...}' desen
+#      eşleştirmesinde büyük çok satırlı dizgelerde ÖLÇÜLEBİLİR ÖLÇÜDE YAVAŞ
+#      (bu HOST'ta ampirik ölçüldü: AYNI desen 15KB'lık 'a_out' üzerinde
+#      ~19 SANİYE, 67 karakterlik tek satırda ~2 MİLİSANİYE sürdü) — modern
+#      bash (5.x, Ubuntu hedef sunucularda) bu patolojiyi GÖSTERMEZ, ama bu
+#      test macOS geliştirme makinesinde ('bash tests/run.sh') ÇALIŞTIĞINDAN
+#      testin KENDİSİ gereksiz yere ~20 saniye YAVAŞLATILMASIN diye küçük
+#      girdi tercih edilir (doğrulama gücü AYNI — yalnız verimlilik farkı).
+rwline_full=$(printf '%s\n' "$a_out" | grep -m1 '^ReadWritePaths=')
+rwline_no_lockdir="${rwline_full/ -\/run\/srvctl\/locks\/example_com/}"
+assert_not_contains "$rwline_no_lockdir" "/run/srvctl/locks/example_com" \
+    "MUTASYON A: ReadWritePaths'ten LOCK_DIR segmenti SİLİNİNCE mutant BUNU DOĞRULUYOR (segment gerçekten gitti)"
+assert_contains "$rwline_full" "/run/srvctl/locks/example_com" \
+    "MUTASYON A (kontrol): mutasyon ÖNCESİ satır GERÇEKTEN LOCK_DIR'i İÇERİYORDU (mutantın vakumda PASS vermediğinin kanıtı)"
 
 # (7) ENTEGRASYON RİSKİ — lib/cron.sh render_template'e DOMAIN_ROOT
 #     BESLEMEYİ UNUTURSA (yeni token, sibling görev güncellemeli): sonuç
