@@ -641,6 +641,51 @@ confirm() {
 
 # Template dosyasını işle — değişkenleri yerine koy
 # Kullanım: render_template template.tpl VAR1=value1 VAR2=value2
+#
+# GERÇEK ÜRETİM SUNUCUSUNDA İZOLE EDİLEN KUSUR: 'srvctl cron add ...
+# --command="echo bir && echo iki"' 'beslenmeyen token kaldı ({{CRON_
+# COMMAND}})' hatasıyla EXIT=1 veriyordu; '&' içermeyen komutlar sorunsuzdu.
+# DOĞRULAMA: bu fonksiyon repo tarihi boyunca (repo init'ten beri) 'sed'
+# HİÇ KULLANMADI — her zaman saf bash parametre genişletmesi
+# ('${content//pattern/replacement}') kullandı, bu yüzden sed'in DEĞİŞTİRME
+# tarafındaki '&' (= "eşleşen metnin tamamı") tuzağı BU FONKSİYONDA HİÇ
+# MEVCUT OLMADI (ampirik doğrulandı: gerçek şablon + gerçek escape
+# fonksiyonlarıyla '&&' içeren değer sorunsuz render edildi) — üretimdeki
+# kurulum muhtemelen bu repodan senkronize DEĞİLDİ (bkz. CLAUDE.md 'Repo ≠
+# kurulum'; 'sudo bash install.sh' çalıştırılmamış bir /usr/local/srvctl,
+# eski/farklı bir render_template taşıyor olabilir).
+#
+# YİNE DE İKİ GERÇEK SORUN BURADA GİDERİLDİ:
+#   1) SAĞLAMLIK: '${content//pattern/replacement}' bash'in KENDİ glob
+#      motoruna bel bağlar — REPLACEMENT tarafı bugün zararsız olsa da
+#      "değeri bir yerine-koyma motoruna teslim etme" deseni sed ile AYNI
+#      RİSK SINIFIDIR (bkz. bash sürüm/'extglob' farklılıkları). Artık DEĞER
+#      hiçbir yorumlayıcıya (ne sed ne bash glob) teslim EDİLMİYOR — aşağıdaki
+#      awk yardımcısı SAF 'index()'/'substr()' ile bayt-bayt arama/birleştirme
+#      yapar (regex/backreference/glob YOK); '&', '\', '|', '$', backtick,
+#      tek/çift tırnak DAHİL HİÇBİR karakter özel yorumlanmaz.
+#   2) PERFORMANS (100 domain hedefi): ÖLÇÜLDÜ — macOS bash 3.2'de (test
+#      ortamı) eski '${content//pattern/replacement}' döngüsü 16KB'lık TEK
+#      bir systemd şablonunda (11 token) TEK ÇAĞRI başına ~1.7 saniyeye kadar
+#      çıkıyordu; 100 domain'lik bir 'security audit'/'domain repair --all'
+#      taramasında bu tolere edilemez (100 tekrarlı bir benzetim 2 dakikada
+#      BİLE bitmedi). AWK'nin string motoru AYNI şablon için render_template
+#      ÇAĞRISI başına ~10ms mertebesindedir (bkz. tests/test_render_perf.sh)
+#      — token sayısından BAĞIMSIZ TEK bir alt-süreç (fork) maliyeti.
+#
+# GÜVENLİ VERİ AKTARIMI (bash → awk): değerler awk'ye '-v ad=değer' İLE
+# DEĞİL, ortam değişkenleri (ENVIRON) ile aktarılır — POSIX awk '-v'
+# atamasında değer İÇİN kaçış dizisi ('\n','\t','\\', ...) çözümlemesi
+# YAPAR (ör. değerde LİTERAL iki karakterlik '\n' varsa '-v' bunu GERÇEK bir
+# satırsonuna çevirirdi — CRLF-reddi korumasını BYPASS eden yeni bir
+# enjeksiyon sınıfı). 'ENVIRON["..."]' ise işletim sisteminin environ'ından
+# DOĞRUDAN, HİÇBİR kaçış çözümlemesi OLMADAN okunur (POSIX/gawk/mawk/bwk-awk
+# hepsinde aynı) — değerler 'env "AD=değer" awk ...' ÖN-EKİYLE (mevcut
+# desen, bkz. lib/deploy.sh) yalnızca O TEK awk alt-sürecinin ortamına
+# yazılır; kalıcı shell ortamı KİRLENMEZ, 'export'/'unset' çifti GEREKMEZ.
+# Boş '$@' durumunda 'env_pairs' dizisinin genişlemesi CLAUDE.md'nin bilinen
+# bash 3.2 tuzağına ("${arr[@]}" boş dizide 'set -u' altında ÖLÜR) düşmemesi
+# için 'lib/deploy.sh' İLE AYNI '${arr[@]+"${arr[@]}"}' deseniyle yapılır.
 render_template() {
     local template="$1"
     shift
@@ -649,20 +694,66 @@ render_template() {
         error "Template bulunamadı: ${template}"
     fi
 
-    local content
-    content=$(cat "$template")
-
+    local pair key value
+    local -a env_pairs=()
     for pair in "$@"; do
-        local key="${pair%%=*}"
-        local value="${pair#*=}"
+        key="${pair%%=*}"
+        value="${pair#*=}"
         # CRLF/config-enjeksiyon koruması: değer satırsonu/CR içeremez.
         # (render-time değişmezi — bu error EXIT eder; charset doğrulaması
         #  çağıran tarafta assert_regex_safe ile yapılır.)
         if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
             error "render_template: '${key}' değeri satırsonu/CR içeriyor — reddedildi"
         fi
-        content="${content//\{\{${key}\}\}/${value}}"
+        # Savunma derinliği: token adı geçerli bir tanımlayıcı OLMALI —
+        # aşağıda '_RT_VAL_<key>' biçiminde bir ortam değişkeni adına
+        # gömülür; ad sağlamsa (yalnız harf/rakam/alt çizgi, rakamla
+        # BAŞLAMAZ) isim çakışması/enjeksiyonu YAPISAL olarak imkansızdır.
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            error "render_template: geçersiz token adı: '${key}'"
+        fi
+        env_pairs+=("_RT_VAL_${key}=${value}")
     done
+
+    local content
+    content=$(env ${env_pairs[@]+"${env_pairs[@]}"} awk '
+        BEGIN {
+            prefix = "_RT_VAL_"
+            plen = length(prefix)
+            n = 0
+            for (name in ENVIRON) {
+                if (substr(name, 1, plen) == prefix) {
+                    n++
+                    key = substr(name, plen + 1)
+                    pat[n] = "{{" key "}}"
+                    patlen[n] = length(pat[n])
+                    val[n] = ENVIRON[name]
+                }
+            }
+        }
+        {
+            line = $0
+            for (i = 1; i <= n; i++) {
+                if (index(line, pat[i]) > 0) {
+                    line = replace_literal(line, pat[i], patlen[i], val[i])
+                }
+            }
+            print line
+        }
+        # SAF bayt-bayt literal degistirme -- gsub/sub KASITLI OLARAK
+        # KULLANILMAZ (POSIX ERE + "&"/"\\N" geri-referans yorumlamasi
+        # tasirlar; tam da sed ile AYNI risk sinifi). index()/substr()
+        # yalniz duz alt-dizge arar/birlestirir, HICBIR karakteri
+        # yorumlamaz.
+        function replace_literal(s, pat, plen, rep,    result, idx) {
+            result = ""
+            while ((idx = index(s, pat)) > 0) {
+                result = result substr(s, 1, idx - 1) rep
+                s = substr(s, idx + plen)
+            }
+            return result s
+        }
+    ' "$template") || error "render_template: awk render başarısız: ${template}"
 
     echo "$content"
 }
