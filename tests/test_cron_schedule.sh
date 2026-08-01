@@ -291,5 +291,44 @@ esac
 assert_eq "$sys_glob_hit" "hayir" \
     "ad uzayı: 'srvctl-syscron-*.service' glob'u sistem fail-service ile ÇAKIŞMIYOR"
 
+# ═══════════════════════════════════════════════
+#  8) AppArmor ÖN-KONTROLÜ — _cron_apparmor_flock_ok (KOORDİNATÖR HOST
+#     BULGUSU: GERÇEK Ubuntu 24.04 VM'de flock AppArmor tarafından
+#     reddediliyordu, status=126 — kök neden templates/apparmor/
+#     profile-cli.tpl'e '/usr/bin/flock rix,' eklenerek düzeltildi, AMA
+#     ÖNCEDEN render edilmiş canlı profiller OTOMATİK GÜNCELLENMEZ. Bu
+#     fonksiyon canlı profili okuyup bu durumu 'cron add' anında tespit
+#     eder.)
+# ═══════════════════════════════════════════════
+AA_DIR="$(mktemp -d)"
+export SRVCTL_APPARMOR_DIR="$AA_DIR"
+
+assert_fail _cron_apparmor_flock_ok "hicprofil_yok" \
+    "AppArmor: profil dosyası HİÇ YOKSA (2 döner, predikat FAIL) — SESSİZCE geçilecek durum"
+
+cat > "${AA_DIR}/srvctl-eskiprofil-cli" <<'EOF'
+profile srvctl-eskiprofil-cli flags=(attach_disconnected) {
+  /usr/bin/php8.3 mrix,
+  /bin/sh rix,
+  /usr/bin/dash rix,
+}
+EOF
+assert_fail _cron_apparmor_flock_ok "eskiprofil" \
+    "AppArmor: profil VAR ama 'flock' YOK (1 döner — repair GEREKİR, bu durum UYARILMALI)"
+
+cat > "${AA_DIR}/srvctl-guncelprofil-cli" <<'EOF'
+profile srvctl-guncelprofil-cli flags=(attach_disconnected) {
+  /usr/bin/php8.3 mrix,
+  /bin/sh rix,
+  /usr/bin/dash rix,
+  /usr/bin/flock rix,
+}
+EOF
+assert_ok _cron_apparmor_flock_ok "guncelprofil" \
+    "AppArmor: profil GÜNCEL, 'flock rix,' satırı VAR (0 döner)"
+
+rm -rf "$AA_DIR"
+unset SRVCTL_APPARMOR_DIR
+
 rm -rf "$WEB_ROOT"
 test_summary

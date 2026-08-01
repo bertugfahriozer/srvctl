@@ -32,9 +32,17 @@
 #
 #   2) EXEC WHITELIST KİLİDİ: 'x' izni verilen (allow) yolların TAM
 #      KÜMESİNİN, FPM profilinde yalnızca php-fpm binary'si, CLI
-#      profilinde yalnızca php/sh/dash olduğunu doğrular. İleride biri
-#      buraya geniş bir 'x' allow'u (ör. '/usr/bin/** rix,') eklerse bu
-#      test KIRILIR — MADDE B'nin "guardrail" amacının ta kendisi.
+#      profilinde yalnızca php/sh/dash/flock olduğunu doğrular. İleride
+#      biri buraya geniş bir 'x' allow'u (ör. '/usr/bin/** rix,') eklerse
+#      bu test KIRILIR — MADDE B'nin "guardrail" amacının ta kendisi.
+#      'flock' (koordinatör bulgusu, GERÇEK Ubuntu 24.04 VM — status=126
+#      "Permission denied", TÜM domain cron'ları çalışamıyordu) BİLİNÇLİ
+#      OLARAK eklendi: lib/cron.sh'ın deploy-kilidi sarmalayıcısı
+#      ('flock -n -E 75 <kilit> -c "<komut>"') bu profil altında (worker/
+#      scheduler İLE PAYLAŞILAN srvctl-<sname>-cli) çalışır — bkz.
+#      templates/apparmor/profile-cli.tpl'deki UZUN gerekçe (üç seçenek
+#      değerlendirildi, whitelist'e ekleme SEÇİLDİ: kök nedeni bu modülün
+#      sınırları içinde çözer, lib/deploy.sh'a dokunmayı gerektirmez).
 #
 #   3) DÜZ (audit'siz) EXEC-DENY İNVARİANT'I — HOST ÖLÇÜMÜYLE EKLENDİ:
 #      srvctl-jammy VM'de (AppArmor 3.0.4) gerçek bir ölçüm, önceki
@@ -522,10 +530,10 @@ fpm_set="$(_aa_exec_allow_set "$fpm_text")"
 assert_eq "$fpm_set" "/usr/sbin/php-fpm{{PHP_VERSION}}" \
     "profile.tpl: x-izinli TAM yol kümesi yalnızca php-fpm{{PHP_VERSION}}'dan ibaret"
 
-cli_expected="$(printf '%s\n' "/bin/sh" "/usr/bin/dash" "/usr/bin/php{{PHP_VERSION}}" | sort | tr '\n' ' ' | sed 's/ *$//')"
+cli_expected="$(printf '%s\n' "/bin/sh" "/usr/bin/dash" "/usr/bin/flock" "/usr/bin/php{{PHP_VERSION}}" | sort | tr '\n' ' ' | sed 's/ *$//')"
 cli_set="$(_aa_exec_allow_set "$cli_text")"
 assert_eq "$cli_set" "$cli_expected" \
-    "profile-cli.tpl: x-izinli TAM yol kümesi yalnızca php{{PHP_VERSION}}/sh/dash'ten ibaret"
+    "profile-cli.tpl: x-izinli TAM yol kümesi yalnızca php{{PHP_VERSION}}/sh/dash/flock'tan ibaret (flock: lib/cron.sh deploy-kilidi — koordinatör HOST bulgusu)"
 
 # --- Dedektör 3: düz (audit'siz) exec-only deny invariant'ı ---
 fpm_plain="$(_aa_plain_execonly_deny_findings "profile.tpl" "$fpm_text")"

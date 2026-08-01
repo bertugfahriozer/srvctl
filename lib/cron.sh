@@ -483,6 +483,37 @@ _cron_fail_svc_name() {
 }
 
 # ═══════════════════════════════════════════════
+#  AppArmor ÖN-KONTROLÜ — flock exec izni (KOORDİNATÖR HOST BULGUSU)
+# ═══════════════════════════════════════════════
+# GERÇEK Ubuntu 24.04 VM'de ölçüldü: domain cron'unun deploy-kilidi
+# sarmalayıcısı ('flock -n -E 75 ...') 'srvctl-<sname>-cli' AppArmor
+# profilinin exec beyaz listesinde 'flock' OLMADIĞI için '/bin/sh: 1: flock:
+# Permission denied' (status=126) ile ÇÖKÜYORDU — TÜM domain cron'ları
+# sessizce çalışamıyordu. Kök neden templates/apparmor/profile-cli.tpl'e
+# '/usr/bin/flock rix,' eklenerek düzeltildi (bkz. o dosyadaki UZUN
+# gerekçe) — AMA bu yalnızca ŞABLONU günceller; ÖNCEDEN render edilmiş
+# ('srvctl domain add'/'repair' ile zaten oluşturulmuş) canlı profil
+# dosyaları ('/etc/apparmor.d/srvctl-<sname>-cli') OTOMATİK GÜNCELLENMEZ —
+# 'srvctl domain repair <domain>' ÇALIŞTIRILMADAN düzeltme o domainde ETKİN
+# OLMAZ. Bu fonksiyon, 'cron add' anında CANLI profili GERÇEKTEN okuyup bu
+# durumu proaktif olarak tespit eder — operatör bunu ancak BAŞARISIZ bir
+# çalıştırmadan (exit 126) SONRA fark etmek yerine EKLEME ANINDA görür.
+#
+# Dönüş: 0=izin VAR (whitelist güncel), 1=profil VAR ama flock YOK (repair
+# gerekir), 2=profil hiç yok/okunamıyor (bilinmiyor — domain henüz hardened
+# olmayabilir ya da AppArmor kapalı olabilir; bu durumda SESSİZCE geçilir,
+# UYARI ÜRETİLMEZ — "hiç profil yok" ile "profil var ama eksik" AYNI
+# ŞEY DEĞİLDİR, ilkini "eksik/bozuk" gibi göstermek yanlış alarmdır, bkz.
+# core.sh:_require_owned_or_warn'daki AYNI missing-vs-tamper ayrım ilkesi).
+_cron_apparmor_flock_ok() {
+    local sname="$1"
+    local profile="${SRVCTL_APPARMOR_DIR:-/etc/apparmor.d}/srvctl-${sname}-cli"
+    [[ -f "$profile" ]] || return 2
+    grep -Eq '^[[:space:]]*/usr/bin/flock[[:space:]]+m?rix,[[:space:]]*$' "$profile" 2>/dev/null && return 0
+    return 1
+}
+
+# ═══════════════════════════════════════════════
 #  KAÇIŞ YARDIMCILARI (bkz. dosya başındaki UZUN sözleşme yorumu)
 # ═══════════════════════════════════════════════
 
@@ -802,6 +833,15 @@ _cron_add() {
             lockfile_q=$(_cron_escape_singlequote "${lock_dir}/deploy-${sname}.lock")
             shell_body="flock -n -E 75 '${lockfile_q}' -c '${inner}'"
             info "Deploy kilidi entegrasyonu aktif: 'srvctl deploy ${domain}' sürerken bu cron ÇALIŞMAZ (çıkış kodu 75 ile sessizce atlanır, bildirim GÖNDERİLMEZ)."
+
+            # AppArmor ön-kontrolü (koordinatör HOST bulgusu — bkz. yukarıdaki
+            # _cron_apparmor_flock_ok yorumu): "hiç profil yok" (2) SESSİZCE
+            # geçilir, yalnız "profil var ama flock eksik" (1) UYARILIR.
+            local aa_rc=0
+            _cron_apparmor_flock_ok "$sname" || aa_rc=$?
+            if [[ "$aa_rc" -eq 1 ]]; then
+                warn "AppArmor profili GÜNCEL DEĞİL: /etc/apparmor.d/srvctl-${sname}-cli 'flock' exec iznini İÇERMİYOR — bu cron çalıştığında 126 (Permission denied) ile BAŞARISIZ OLUR. Düzeltme: 'srvctl domain repair ${domain}' (profili yeniden render edip AppArmor'a yeniden yükler), sonra 'srvctl cron run ${domain} ${name}' ile doğrulayın."
+            fi
         else
             shell_body="$command"
             warn "flock bulunamadı — bu cron deploy ile ÇAKIŞMAYA KARŞI KORUNMUYOR (lib/deploy.sh:_deploy_lock ile AYNI sınırlama)"

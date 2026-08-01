@@ -211,6 +211,57 @@ assert_contains "$locked_content" "deploy-${sname}.lock" \
     "7) kilit dosyası deploy.sh:_deploy_lock İLE AYNI adlandırmayı kullanıyor"
 assert_contains "$out7" "Deploy kilidi entegrasyonu aktif" \
     "7) flock VARKEN operatöre entegrasyon AÇIKÇA bildiriliyor"
+
+# ═══════════════════════════════════════════════════════════════
+# 7b) AppArmor ÖN-KONTROLÜ (KOORDİNATÖR HOST BULGUSU — GERÇEK Ubuntu 24.04
+#     VM'de flock, ESKİ/render edilmiş bir '-cli' profilinde exec izni
+#     OLMADIĞI için 126 (Permission denied) ile REDDEDİLİYORDU; TÜM domain
+#     cron'ları sessizce çalışamıyordu). 'cron add' artık canlı profili
+#     okuyup bu durumu EKLEME ANINDA tespit ediyor mu?
+# ═══════════════════════════════════════════════════════════════
+export SRVCTL_APPARMOR_DIR="$(mktemp -d)"
+
+# (i) ESKİ (flock'suz) profil — tam olarak koordinatörün ölçtüğü kümeyle
+# (php/dash/sh) — UYARI basılmalı.
+cat > "${SRVCTL_APPARMOR_DIR}/srvctl-${sname}-cli" <<EOF
+profile srvctl-${sname}-cli flags=(attach_disconnected) {
+  /usr/bin/php8.4 mrix,
+  /bin/sh rix,
+  /usr/bin/dash rix,
+}
+EOF
+out7b=$(_cron_add "$d" --name=stale_aa_job --schedule="her saat" --command="echo x" 2>&1)
+assert_contains "$out7b" "AppArmor profili GÜNCEL DEĞİL" \
+    "7b) ESKİ (flock'suz) canlı AppArmor profili tespit edilip UYARILIYOR"
+assert_contains "$out7b" "srvctl domain repair ${d}" \
+    "7b) uyarı, düzeltme için somut komutu ('srvctl domain repair') İÇERİYOR"
+_cron_remove "$d" stale_aa_job >/dev/null 2>&1
+
+# (ii) GÜNCEL profil (flock rix, satırı eklenmiş — 'srvctl domain repair'
+# sonrası beklenen durum) — UYARI basılMAMALI.
+cat > "${SRVCTL_APPARMOR_DIR}/srvctl-${sname}-cli" <<EOF
+profile srvctl-${sname}-cli flags=(attach_disconnected) {
+  /usr/bin/php8.4 mrix,
+  /bin/sh rix,
+  /usr/bin/dash rix,
+  /usr/bin/flock rix,
+}
+EOF
+out7c=$(_cron_add "$d" --name=fresh_aa_job --schedule="her saat" --command="echo x" 2>&1)
+assert_not_contains "$out7c" "AppArmor profili GÜNCEL DEĞİL" \
+    "7c) GÜNCEL (flock İÇEREN) profilde UYARI basılMIYOR (yanlış pozitif yok)"
+_cron_remove "$d" fresh_aa_job >/dev/null 2>&1
+
+# (iii) Profil hiç YOKSA (ör. domain henüz hardened değil) — SESSİZCE
+# geçilmeli, UYARI basılMAMALI (missing ≠ tamper/eksik — core.sh'taki AYNI
+# ayrım ilkesi, bkz. _cron_apparmor_flock_ok yorumu).
+rm -f "${SRVCTL_APPARMOR_DIR}/srvctl-${sname}-cli"
+out7d=$(_cron_add "$d" --name=nohardening_job --schedule="her saat" --command="echo x" 2>&1)
+assert_not_contains "$out7d" "AppArmor profili GÜNCEL DEĞİL" \
+    "7d) profil HİÇ YOKSA sessizce geçilir, UYARI basılMIYOR (yanlış alarm yok)"
+_cron_remove "$d" nohardening_job >/dev/null 2>&1
+
+unset SRVCTL_APPARMOR_DIR
 rm -f "${FAKEBIN}/flock"
 
 # ═══════════════════════════════════════════════════════════════

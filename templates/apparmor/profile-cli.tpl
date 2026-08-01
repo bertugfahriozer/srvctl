@@ -70,6 +70,58 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   /bin/sh rix,
   /usr/bin/dash rix,
 
+  # ─── /usr/bin/flock — cron deploy-kilidi sarmalayıcısı (lib/cron.sh) ───
+  # HOST BULGUSU (koordinatör, Ubuntu 24.04, gerçek sertleştirilmiş domain):
+  # 'srvctl cron add <domain> ...' domain kapsamlı cron'ları, deploy sürerken
+  # çakışmayı önlemek için 'flock -n -E 75 <kilit> -c "<komut>"' ile sarmalar
+  # (bkz. lib/cron.sh dosya başı "DEPLOY KİLİDİ" yorumu) — bu unit de bu
+  # profille (srvctl-cron.service.tpl: AppArmorProfile=srvctl-{{SAFE_NAME}}-cli)
+  # çalışır. 'flock' whitelist'te YOKTU ('mrix'/'rix' izinli hiçbir satırda
+  # geçmiyordu) — sonuç GERÇEK VM'de ölçüldü: 'ExecStart' '/bin/sh: 1: flock:
+  # Permission denied' ile status=126 veriyordu, TÜM domain cron'ları (bu
+  # sarmalamayı alan HER iş) sessizce çalışamıyordu ('srvctl cron list' bunu
+  # dürüstçe 'Son çıkış kodu: 126' ile raporluyordu — dedektör DOĞRU
+  # çalışıyordu, kök neden AppArmor'daydı).
+  #
+  # KARAR (üç seçenek değerlendirildi — coordinator notu): (a) flock'u
+  # whitelist'e ekle [SEÇİLDİ], (b) flock'suz kilit kontrolü [flock(1)
+  # olmadan bir '/bin/sh' alt-sürecinin tuttuğu POSIX dosya kilidini
+  # doğrudan sorgulamanın pratik bir yolu YOK — terk edildi], (c) deploy
+  # tarafında bir 'çalışıyor' işaretçi dosyası + 'ExecCondition=' [lib/
+  # deploy.sh'a dokunmayı GEREKTİRİR — bu profilin/kütüphanenin sahibi
+  # DEĞİL, ayrı bir görev/onay gerektirir]. (a) TEK BAŞINA bu MODÜLÜN
+  # (lib/cron.sh + bu profil) sınırları İÇİNDE çözülebilen, kök nedeni
+  # (whitelist eksikliği) DOĞRUDAN gideren seçenektir.
+  #
+  # RİSK DEĞERLENDİRMESİ (bu profil worker/scheduler İLE DE PAYLAŞILDIĞINDAN
+  # — dosya başı "NEDEN AYRI PROFİL?" notuna bkz. — flock'a erişim onlara da
+  # AÇILIR): flock(1) TEK işlevi POSIX 'flock()' syscall'ını sarmalamak ve
+  # (isteğe bağlı) bir alt komut exec etmektir — YENİ bir dosya/ağ/kimlik
+  # yeteneği EKLEMEZ (kilit tuttuğu dosyaya zaten '-c' argümanındaki komutun
+  # KENDİSİ erişebilir durumda olmalı; flock'un kendisi bu erişimi
+  # GENİŞLETMEZ). Ele geçirilmiş bir worker/scheduler için marjinal risk:
+  # saldırgan flock'u ARAÇ olarak kullanabilir (ör. kendi kalıcılık
+  # mekanizmasını serileştirmek için) ama bu, zaten whitelist'te olan
+  # php{{PHP_VERSION}}/sh/dash ile ULAŞABİLECEĞİ yetenekleri AŞMAZ — net
+  # risk artışı DÜŞÜK, root neden (100% ölü cron özelliği HER sertleştirilmiş
+  # domainde) İLE KIYASLANAMAYACAK kadar küçüktür.
+  #
+  # 'rix' (php{{PHP_VERSION}}/sh/dash İLE AYNI izin — mmap 'm' GEREKMEZ,
+  # flock paylaşımlı kütüphane olarak yüklenmiyor, yalnız exec ediliyor):
+  # merged-usr'de '/bin/flock' aynı dosyaya işaret eder (kernel d_path
+  # çözümü '/usr/bin/flock'u verir — coordinator'ın GERÇEK VM ölçümüyle
+  # BİREBİR eşleşir: "flock ise /usr/bin/flock'ta"); '/bin/sh'+'/usr/bin/
+  # dash' çiftindeki gibi İKİ AYRI ada ihtiyaç YOK (flock'un 'sh' gibi bir
+  # alternatif adı/sembolik link zinciri yok) — TEK satır yeterli.
+  #
+  # ÖNEMLİ — MEVCUT SERTLEŞTİRİLMİŞ DOMAINLER OTOMATİK GÜNCELLENMEZ: bu
+  # profil yalnızca ŞABLONDUR; disk üzerindeki '/etc/apparmor.d/srvctl-
+  # <sname>-cli' zaten render EDİLMİŞ domainlerde bu satırı İÇERMEZ.
+  # 'srvctl domain repair <domain>' (profili yeniden render edip
+  # 'apparmor_parser -r' ile yeniden yükler) ÇALIŞTIRILMADAN bu düzeltme
+  # o domainlerde ETKİN OLMAZ — bu bir HOST doğrulama/rollout maddesidir.
+  /usr/bin/flock rix,
+
   # ─── Domain ağacı — FPM profiliyle AYNI okuma/yazma yolları ───
   # (framework yazma yolu eklerken profile.tpl'deki eşdeğer bloğu da
   # güncelleyin — bkz. dosya başı NOT)
