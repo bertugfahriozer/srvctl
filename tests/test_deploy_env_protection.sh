@@ -193,7 +193,7 @@ d="$(mktemp -d)"
 cat > "${d}/clean.env" <<'EOF'
 APP_ENV=prod
 APP_DEBUG=0
-APP_SECRET=efa9e73311468dfef9afde68654b3b2b
+APP_SECRET=SAHTE_TEST_DEGERI_gercek_sir_DEGIL
 DATABASE_URL="mysql://user:pass@127.0.0.1:3306/db"
 EOF
 assert_eq "$(_deploy_env_duplicate_keys "${d}/clean.env")" "" \
@@ -203,7 +203,7 @@ assert_eq "$(_deploy_env_duplicate_keys "${d}/clean.env")" "" \
 cat > "${d}/corrupted.env" <<'EOF'
 APP_ENV=prod
 APP_DEBUG=0
-APP_SECRET=efa9e73311468dfef9afde68654b3b2b
+APP_SECRET=SAHTE_TEST_DEGERI_gercek_sir_DEGIL
 DB_PASSWORD=super_gizli_parola
 
 ###> symfony/framework-bundle ###
@@ -234,7 +234,7 @@ out_dup=$(_deploy_env_check_duplicates "${d}/corrupted.env" 2>&1)
 assert_contains "$out_dup" "GÜVENLİK-KRİTİK" "MÜKERRER güvenlik-kritik anahtarlar [GÜVENLİK-KRİTİK] etiketiyle ESKALE ediliyor"
 assert_contains "$out_dup" "APP_ENV=dev" \
     "APP_ENV mükerrerliğinde GEÇERLİ (son/kazanan) değer AÇIKÇA gösteriliyor (secret değil, teşhis için gerekli)"
-assert_not_contains "$out_dup" "efa9e73311468dfef9afde68654b3b2b" \
+assert_not_contains "$out_dup" "SAHTE_TEST_DEGERI_gercek_sir_DEGIL" \
     "APP_SECRET'ın (SIR) hiçbir değeri (ne eski ne yeni) log çıktısına YAZILMIYOR"
 assert_contains "$out_dup" "gizli değer" "APP_SECRET için değer yerine 'gizli değer' maskesi gösteriliyor"
 assert_contains "$out_dup" "OTOMATİK SİLME YAPMAZ" "operatöre otomatik silme YAPILMADIĞI AÇIKÇA söyleniyor"
