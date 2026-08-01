@@ -122,6 +122,51 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # o domainlerde ETKİN OLMAZ — bu bir HOST doğrulama/rollout maddesidir.
   /usr/bin/flock rix,
 
+  # ─── Deploy kilidi DOSYASI — AYNI HOST BULGUSUNUN İKİNCİ KATMANI ───
+  # HOST BULGUSU 2 (koordinatör, aynı Ubuntu 24.04 domain, 'flock' exec
+  # düzeltmesinden SONRA ölçüldü): exec artık geçiyor ama flock kendisi
+  # 'cannot open lock file /run/srvctl/deploy-{{SAFE_NAME}}.lock: Permission
+  # denied' ile başarısız oluyordu. DAC (dosya izinleri — root:root 644)
+  # sorunsuzdu; koordinatör audit.log'da kanıtı buldu:
+  #   apparmor="DENIED" operation="open"
+  #   name="/run/srvctl/deploy-{{SAFE_NAME}}.lock" denied_mask="rc"
+  # yani profilde '/run/srvctl' için HİÇBİR KURAL YOKTU (default-deny bu
+  # sistem yoluna hiç dokunmuyordu — domain ağacı DIŞINDA, srvctl'in kendi
+  # runtime dizini).
+  #
+  # SEÇİLEN İZİN — 'rwk,' (bu profildeki HER flock() gerektiren yol İLE
+  # BİREBİR AYNI desen, bkz. aşağıdaki "Dosya kilidi ('k')" bloğu): 'k'
+  # (flock() syscall'ı) 'rw'DEN AYRI bir izindir — yalnız 'r' vermek LOCK_EX
+  # için YETMEZDİ (bu oturumda PHP tarafında "Exclusive locks are not
+  # supported for this stream" olarak TAM BU sınıf hata zaten görülmüştü).
+  # 'w' + 'r' GNU flock(1)'ün kendi belgelenmiş açma davranışından gelir:
+  # bir dosya YOLU (fd numarası DEĞİL) argüman olarak verildiğinde flock(1)
+  # dosyayı 'O_RDWR|O_CREAT' ile açar (kilit dosyası YOKSA kendisi
+  # oluşturabilsin diye — bu domainin durumunda dosya zaten root tarafından
+  # ÖNCEDEN var edilmiş olsa da açma çağrısı YİNE DE bu bayraklarla yapılır;
+  # AppArmor mediation kararını dosyanın GERÇEKTEN var olup olmadığından
+  # BAĞIMSIZ, açma isteğinin KENDİSİNE göre verir — ölçülen 'denied_mask=
+  # "rc"' bunun R/O_CREAT tarafını yansıtıyor olabilir).
+  #
+  # DÜRÜSTLÜK NOTU (görev talebi — "ölç, tahmin etme"): bu macOS geliştirme
+  # makinesinde GERÇEK bir AppArmor çekirdeği YOK, bu yüzden 'rwk,'nın TAM
+  # OLARAK yeterli/gerekli en dar küme olduğu BURADAN doğrulanamadı — seçim
+  # (1) bu profildeki HER flock()-gerektiren yolun ZATEN kullandığı, HOST'ta
+  # daha önce doğrulanmış 'rwk,' desenine UYMASI ve (2) GNU flock(1)'ün
+  # belgelenmiş 'O_RDWR|O_CREAT' açma davranışına DAYANIYOR — ampirik bir
+  # HOST ölçümü DEĞİL. 'srvctl domain repair <domain>' sonrası GERÇEK
+  # denemede 'rwk,' YETERSİZ ya da FAZLA geniş çıkarsa (ör. yalnız 'r'+'k'
+  # yeterliyse), lütfen tam 'denied_mask' çıktısını paylaşın — bu satır
+  # buna göre daraltılır.
+  #
+  # KAPSAM — TEK domain'in TEK dosyası (görev talebi: "DAR olması önemli"):
+  # '{{SAFE_NAME}}' token'ı ile domain'in KENDİ kilit dosyasına SABİTLENİR;
+  # '/run/srvctl/*' gibi bir glob KASITLI OLARAK YAZILMAZ — böyle bir kural
+  # bir domainin BAŞKA domainlerin deploy kilit dosyalarını açabilmesi
+  # (varlığını/durumunu sezebilmesi) anlamına gelirdi ve bu profilin TEK
+  # var oluş nedeni olan domainler-arası izolasyon sınırını delerdi.
+  /run/srvctl/deploy-{{SAFE_NAME}}.lock rwk,
+
   # ─── Domain ağacı — FPM profiliyle AYNI okuma/yazma yolları ───
   # (framework yazma yolu eklerken profile.tpl'deki eşdeğer bloğu da
   # güncelleyin — bkz. dosya başı NOT)

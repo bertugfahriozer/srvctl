@@ -293,12 +293,14 @@ assert_eq "$sys_glob_hit" "hayir" \
 
 # ═══════════════════════════════════════════════
 #  8) AppArmor ÖN-KONTROLÜ — _cron_apparmor_flock_ok (KOORDİNATÖR HOST
-#     BULGUSU: GERÇEK Ubuntu 24.04 VM'de flock AppArmor tarafından
-#     reddediliyordu, status=126 — kök neden templates/apparmor/
-#     profile-cli.tpl'e '/usr/bin/flock rix,' eklenerek düzeltildi, AMA
-#     ÖNCEDEN render edilmiş canlı profiller OTOMATİK GÜNCELLENMEZ. Bu
-#     fonksiyon canlı profili okuyup bu durumu 'cron add' anında tespit
-#     eder.)
+#     BULGUSU — İKİ KATMAN: (1) GERÇEK Ubuntu 24.04 VM'de flock EXEC
+#     AppArmor tarafından reddediliyordu (status=126) — düzeltme:
+#     '/usr/bin/flock rix,'. (2) BUNDAN SONRA ölçüldü — flock çalışıyor ama
+#     KİLİT DOSYASINI ('/run/srvctl/deploy-<sname>.lock') açamıyordu
+#     (denied_mask="rc", DAC sorunsuzdu) — düzeltme: aynı dosyaya
+#     '/run/srvctl/deploy-{{SAFE_NAME}}.lock rwk,'. İKİSİ DE ŞABLONU
+#     günceller, ÖNCEDEN render edilmiş canlı profiller OTOMATİK
+#     GÜNCELLENMEZ. Bu fonksiyon TEK kontrolde İKİSİNİ BİRDEN doğrular.)
 # ═══════════════════════════════════════════════
 AA_DIR="$(mktemp -d)"
 export SRVCTL_APPARMOR_DIR="$AA_DIR"
@@ -314,7 +316,18 @@ profile srvctl-eskiprofil-cli flags=(attach_disconnected) {
 }
 EOF
 assert_fail _cron_apparmor_flock_ok "eskiprofil" \
-    "AppArmor: profil VAR ama 'flock' YOK (1 döner — repair GEREKİR, bu durum UYARILMALI)"
+    "AppArmor: profil VAR ama 'flock' EXEC İZNİ DE, kilit dosyası izni de YOK (1 döner — repair GEREKİR)"
+
+cat > "${AA_DIR}/srvctl-yarimprofil-cli" <<'EOF'
+profile srvctl-yarimprofil-cli flags=(attach_disconnected) {
+  /usr/bin/php8.3 mrix,
+  /bin/sh rix,
+  /usr/bin/dash rix,
+  /usr/bin/flock rix,
+}
+EOF
+assert_fail _cron_apparmor_flock_ok "yarimprofil" \
+    "AppArmor: SADECE flock EXEC izni eklenmiş (2. HOST bulgusu — kilit DOSYASI kuralı hâlâ eksik) — hâlâ 1 döner, UYARI KESİLMEMELİ"
 
 cat > "${AA_DIR}/srvctl-guncelprofil-cli" <<'EOF'
 profile srvctl-guncelprofil-cli flags=(attach_disconnected) {
@@ -322,10 +335,25 @@ profile srvctl-guncelprofil-cli flags=(attach_disconnected) {
   /bin/sh rix,
   /usr/bin/dash rix,
   /usr/bin/flock rix,
+  /run/srvctl/deploy-guncelprofil.lock rwk,
 }
 EOF
 assert_ok _cron_apparmor_flock_ok "guncelprofil" \
-    "AppArmor: profil GÜNCEL, 'flock rix,' satırı VAR (0 döner)"
+    "AppArmor: profil TAM GÜNCEL — hem 'flock rix,' HEM 'deploy-<sname>.lock rwk,' VAR (0 döner)"
+
+# Kilit dosyası kuralı BAŞKA bir domain'e aitse (yanlış sname) EŞLEŞMEMELİ —
+# görev talebi: "DAR olması önemli", bu izolasyonun testte de doğrulanması.
+cat > "${AA_DIR}/srvctl-yanlisdomain-cli" <<'EOF'
+profile srvctl-yanlisdomain-cli flags=(attach_disconnected) {
+  /usr/bin/php8.3 mrix,
+  /bin/sh rix,
+  /usr/bin/dash rix,
+  /usr/bin/flock rix,
+  /run/srvctl/deploy-baskadomain.lock rwk,
+}
+EOF
+assert_fail _cron_apparmor_flock_ok "yanlisdomain" \
+    "AppArmor: kilit dosyası kuralı BAŞKA bir domain'e aitse (sname uyuşmuyor) TANINMAZ (izolasyon — dar kapsam kilidi)"
 
 rm -rf "$AA_DIR"
 unset SRVCTL_APPARMOR_DIR
