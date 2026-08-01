@@ -100,6 +100,28 @@ sudo srvctl security harden-fpm <domain> --apply --all  # Uygula | tüm domain'l
 > çözüm per-domain FPM unit'i devreye almak: `srvctl security harden-fpm <domain> --apply`.
 > ModSecurity /admin XSS koruması yalnız 941160 (zengin-metin yanlış-pozitifi) hariç aktiftir.
 
+> **🔴 KRİTİK GÜVENLİK DÜZELTMESİ — deploy kilit dizini (symlink ile ROOT'a yükselme):**
+> Önceki sürümlerde `/run/srvctl/locks/<sname>` dizini `700 web_<sname>:web_<sname>`
+> idi. Sahibi domain kullanıcısı olduğundan o kullanıcı kilit dosyasını **silip
+> yerine keyfi bir hedefe sembolik bağ koyabiliyordu**; root olarak çalışan
+> `srvctl deploy` bu bağı dereference edip hedefi `chown`/`chmod`/**truncate**
+> ediyordu (`/etc/ld.so.preload` → tam root). Canlı bir Ubuntu 24.04 üretim
+> sunucusunda sömürülebilirliği kanıtlandı.
+> **Düzeltme:** dizin `710 root:web_<sname>` (domain kullanıcısında yazma yok,
+> yalnız geçiş), kilit dosyası `660 root:web_<sname>` ve root tarafından
+> ön-oluşturuluyor; `secure_file`/`secure_dir` sembolik bağda **fail-closed**
+> (+ `chown -h`); `_deploy_lock` artık `exec 9>>` (truncate yok).
+> **Mevcut kurulumlar:** bir sonraki `srvctl deploy` / `srvctl cron add`
+> kilit ağacını yeniden uyguladığı için kendiliğinden onarılır; beklemeden
+> kapatmak için `sudo srvctl domain repair --all` çalıştırın. `security audit`
+> onarılmamış her domaini (ve yerleştirilmiş bir sembolik bağı) **FAIL** olarak
+> raporlar.
+>
+> **Davranış değişikliği (`secure_file`/`secure_dir`):** hedef yolun kendisi bir
+> sembolik bağsa artık hiçbir mod/sahiplik uygulanmaz — `warn` basılıp `1` dönülür.
+> Bilinen tek gri alan: `BACKUP_DIR` bir mount noktasına **symlink** yapılmışsa
+> `srvctl backup`/`init` uyarıp durur; `conf/srvctl.conf`'ta gerçek yolu yazın.
+
 > **Per-domain FPM unit (Faz 2/T7a):** Her domain kendi `srvctl-fpm-<sname>.service`'inde
 > çalışır; AppArmor profili (`AppArmorProfile=`) ve cgroups slice (`Slice=`) systemd üzerinden
 > gerçekten uygulanır. Mevcut kurulumları taşımak:

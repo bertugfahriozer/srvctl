@@ -69,9 +69,17 @@ mkdir -p "${WEB_ROOT}/${domA}" "${WEB_ROOT}/${domB}"
 # ═══════════════════════════════════════════════════════════════
 # chown STUB — bkz. dosya başı DÜRÜSTLÜK NOTU (1).
 # ═══════════════════════════════════════════════════════════════
+# NOT: secure_file/secure_dir ARTIK 'chown -h' çağırır (symlink dereference
+# karşıtı — bkz. core.sh:_reject_symlink). Stub bayrağı ATAR ki mevcut
+# "hangi sahip isteniyor" iddiaları AYNEN çalışsın; '-h'nin varlığı
+# tests/test_secure_fs.sh'ta AYRICA doğrulanır.
 chown_log="${WEB_ROOT}/.chown.log"
 : > "$chown_log"
-chown() { printf '%s %s\n' "$1" "$2" >> "$chown_log"; return 0; }
+chown() {
+    [[ "${1:-}" == "-h" ]] && shift
+    printf '%s %s\n' "${1:-}" "${2:-}" >> "$chown_log"
+    return 0
+}
 
 # ═══════════════════════════════════════════════════════════════
 # flock KULLANILABİLİRLİĞİNİ GARANTİYE AL — bkz. dosya başı DÜRÜSTLÜK
@@ -126,56 +134,107 @@ assert_eq "$dirA_deploy" "${SRVCTL_LOCK_DIR}/locks/${snameA}" \
 # ═══════════════════════════════════════════════════════════════
 # 2) (a) DOMAIN CRON'UNUN KİLİT YOLU DOMAİNİN ERİŞEBİLECEĞİ BİR YERDE:
 #    üst dizinler yalnız GEÇİŞE izin verir (711 — listeleme YOK), domain'e
-#    özel alt dizin ise 700 VE domain'in KENDİ kullanıcısına chown
-#    edilmeye ÇALIŞILDI mı?
+#    özel alt dizin ise 710 root:web_<sname>.
+#
+#    ⚠ 700 web_x:web_x → 710 root:web_x (KRİTİK GÜVENLİK DÜZELTMESİ):
+#    dizinin SAHİBİ domain kullanıcısı olduğunda o kullanıcı dizin İÇİNDE
+#    unlink+create yapabiliyordu; kilit dosyasını silip yerine KEYFİ bir
+#    hedefe sembolik bağ koyuyor, root olarak çalışan '_deploy_lock' bunu
+#    dereference edip hedefi chown/chmod/TRUNCATE ediyordu (canlı Ubuntu
+#    24.04 üretim sunucusunda SÖMÜRÜLEBİLİRLİĞİ KANITLANDI). '710 root:web_x'
+#    ile domain kullanıcısında 'w' YOK — dosyayı SİLEMEZ, yerine BAŞKA BİR
+#    ŞEY KOYAMAZ; 'x' ile dizinden GEÇEBİLİR (open() için yeterli), 'r'
+#    olmadığından LİSTELEYEMEZ. BAŞKA domainler 'diğer: ---' ile TAMAMEN
+#    dışarıdadır (izolasyon KORUNUR — görev şartı).
 # ═══════════════════════════════════════════════════════════════
 assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}" | tail -c 4)" "711" \
     "2a) kilit ANA dizini 711 (web_<sname> GEÇEBİLİR, listeleyemez)"
 assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}/locks" | tail -c 4)" "711" \
     "2a) 'locks' ara dizini 711"
-assert_eq "$(_stat_mode "$dirA_deploy" | tail -c 4)" "700" \
-    "2a) domain A'nın kilit alt dizini 700 (yalnız o domain + root)"
-assert_contains "$(cat "$chown_log")" "${webA}:${webA} ${dirA_deploy}" \
-    "2a) domain A'nın alt dizini KENDİ web kullanıcısına (web_${snameA}) chown edilmeye ÇALIŞILDI"
+assert_eq "$(_stat_mode "$dirA_deploy" | tail -c 4)" "710" \
+    "2a) domain A'nın kilit alt dizini 710 (grup=web_<sname> yalnız GEÇEBİLİR — YAZAMAZ)"
+assert_contains "$(cat "$chown_log")" "root:${webA} ${dirA_deploy}" \
+    "2a) domain A'nın alt dizini ROOT'a (grup web_${snameA}) chown edilmeye ÇALIŞILDI"
+assert_not_contains "$(cat "$chown_log")" "${webA}:${webA} ${dirA_deploy}" \
+    "2a) [REGRESYON KAPISI] alt dizin ARTIK 'web_x:web_x' sahipliğine chown EDİLMİYOR (symlink primitifinin KAYNAĞI buydu)"
 
-# _deploy_lock'un GERÇEK akışı: kilit DOSYASININ KENDİSİ de domain
-# kullanıcısına ait/600 olmalı (aksi halde root'un ilk oluşturduğu dosya
-# varsayılan umask'la (root:root 644) kalır ve cron'un flock(1) çağrısı —
-# web_<sname> olarak — dosyayı AÇAMAZ; TAM DA bu görevin düzelttiği DAC
-# hata sınıfı yeniden doğardı).
+# Kilit DOSYASI artık '_deploy_lock'a GEREK KALMADAN '_deploy_lock_dir'in
+# KENDİSİ tarafından ROOT olarak ÖN-OLUŞTURULUR. GEREKÇE (ölçüm): util-linux
+# 'sys-utils/flock.c' open_file() dosyayı 'O_RDONLY|O_NOCTTY|O_CREAT' (0666)
+# ile açar — v2.37.2 (Ubuntu 22.04) ve v2.39.3 (Ubuntu 24.04) etiketlerinde
+# BİREBİR aynı kod. Dizinde 'w' biti kalmadığından O_CREAT ARTIK dosyayı
+# yaratamaz (EACCES); bu yüzden ön-oluşturma ZORUNLUDUR.
+lock_fileA="${dirA_deploy}/deploy-${snameA}.lock"
+assert_eq "$(test -f "$lock_fileA" && echo VAR || echo YOK)" "VAR" \
+    "2a) kilit DOSYASI _deploy_lock_dir tarafından ÖN-OLUŞTURULDU (flock(1) artık kendisi YARATAMAZ)"
+assert_eq "$(_stat_mode "$lock_fileA" | tail -c 4)" "660" \
+    "2a) kilit dosyası mod 660 (grup=web_<sname> AÇABİLİR — flock(1) O_RDONLY ile açar)"
+assert_contains "$(cat "$chown_log")" "root:${webA} ${lock_fileA}" \
+    "2a) kilit DOSYASI ROOT'a (grup web_${snameA}) chown edilmeye ÇALIŞILDI"
+assert_not_contains "$(cat "$chown_log")" "${webA}:${webA} ${lock_fileA}" \
+    "2a) [REGRESYON KAPISI] kilit dosyası ARTIK domain kullanıcısının MÜLKİYETİNDE DEĞİL"
+
 if command -v flock >/dev/null 2>&1; then
-    : > "$chown_log"
-    ( _deploy_lock "$domA" ) # flock varsa dosyayı OLUŞTURUR ve chown dener
-    lock_file="${dirA_deploy}/deploy-${snameA}.lock"
-    assert_eq "$(test -f "$lock_file" && echo VAR || echo YOK)" "VAR" \
-        "2a) _deploy_lock kilit DOSYASINI gerçekten oluşturdu"
-    assert_eq "$(_stat_mode "$lock_file" | tail -c 4)" "600" \
-        "2a) kilit dosyası mod 600"
-    assert_contains "$(cat "$chown_log")" "${webA}:${webA} ${lock_file}" \
-        "2a) kilit DOSYASININ KENDİSİ de domain kullanıcısına chown edilmeye ÇALIŞILDI (cron'un flock(1) açabilmesi için ZORUNLU)"
+    ( _deploy_lock "$domA" )
+    assert_eq "$(_stat_mode "$lock_fileA" | tail -c 4)" "660" \
+        "2a) _deploy_lock çalıştıktan SONRA da kilit dosyası 660 KALIYOR"
 fi
 
 # ═══════════════════════════════════════════════════════════════
 # 3) (b) BİR DOMAIN BAŞKA DOMAİNİN KİLİDİNE ERİŞEMİYOR — domain B'nin
-#    dizini FARKLI bir yolda, FARKLI bir sahibe (chown hedefi) chown
-#    edilmeye çalışılıyor mu (izolasyonun DAC MEKANİZMASI: mod 700 +
-#    domain'e özel sahiplik farkı)?
+#    dizini FARKLI bir yolda, FARKLI bir GRUBA (chown hedefi) chown
+#    edilmeye çalışılıyor mu (izolasyonun DAC MEKANİZMASI: mod 710 —
+#    'diğer' bitleri TAMAMEN kapalı — + domain'e özel GRUP farkı)?
 # ═══════════════════════════════════════════════════════════════
 : > "$chown_log"
 dirB=$(_deploy_lock_dir "$snameB" "$webB")
-assert_eq "$(_stat_mode "$dirB" | tail -c 4)" "700" \
-    "3b) domain B'nin kilit alt dizini de 700"
-assert_contains "$(cat "$chown_log")" "${webB}:${webB} ${dirB}" \
-    "3b) domain B'nin alt dizini KENDİ (A'dan FARKLI) web kullanıcısına chown edilmeye ÇALIŞILDI"
+assert_eq "$(_stat_mode "$dirB" | tail -c 4)" "710" \
+    "3b) domain B'nin kilit alt dizini de 710"
+assert_contains "$(cat "$chown_log")" "root:${webB} ${dirB}" \
+    "3b) domain B'nin alt dizini ROOT'a + KENDİ (A'dan FARKLI) web GRUBUNA chown edilmeye ÇALIŞILDI"
 assert_not_contains "${dirA_deploy}" "${snameB}" \
     "3b) domain A'nın kilit yolu domain B'nin adını İÇERMİYOR (yollar birbirinden BAĞIMSIZ)"
 if [[ "$webA" == "$webB" ]]; then
     echo "  $(printf '\033[0;31mFAIL\033[0m') 3b) domain A/B FARKLI web kullanıcısı üretmeli"
     TESTS_FAIL=$((TESTS_FAIL + 1))
 else
-    echo "  $(printf '\033[0;32mPASS\033[0m') 3b) domain A/B FARKLI (web_${snameA} != web_${snameB}) kullanıcı — 700 mod ile BİRLİKTE gerçek DAC izolasyonunun temelini oluşturur"
+    echo "  $(printf '\033[0;32mPASS\033[0m') 3b) domain A/B FARKLI (web_${snameA} != web_${snameB}) grup — 710 mod ('diğer' = ---) ile BİRLİKTE gerçek DAC izolasyonunun temelini oluşturur"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
+
+# ═══════════════════════════════════════════════════════════════
+# 3c) DRIFT KAPISI — '_deploy_lock_dir' ve '_cron_lock_dir' YALNIZ AYNI
+#     YOLU değil, AYNI İZİN/SAHİPLİK FORMÜLÜNÜ de üretmeli. İkisi de artık
+#     core.sh'taki TEK fonksiyona (_srvctl_lock_ensure) indirgendiğinden
+#     drift YAPISAL olarak imkânsız; bu bölüm o indirgemeyi DAVRANIŞ
+#     düzeyinde (mod + chown hedefi + kilit dosyası varlığı) DOĞRULAR.
+# ═══════════════════════════════════════════════════════════════
+domC="lock-domain-c.test"
+snameC=$(safe_name "$domC")
+webC="web_${snameC}"
+
+: > "$chown_log"
+dirC_deploy=$(_deploy_lock_dir "$snameC" "$webC")
+mode_deploy=$(_stat_mode "$dirC_deploy")
+lockmode_deploy=$(_stat_mode "${dirC_deploy}/deploy-${snameC}.lock")
+chown_deploy=$(cat "$chown_log")
+
+# Aynı ağacı SIFIRDAN kur ki cron tarafı da GERÇEKTEN uygulasın.
+rm -rf "${SRVCTL_LOCK_DIR:?}/locks/${snameC}"
+: > "$chown_log"
+dirC_cron=$(_cron_lock_dir "$snameC" "$webC")
+mode_cron=$(_stat_mode "$dirC_cron")
+lockmode_cron=$(_stat_mode "${dirC_cron}/deploy-${snameC}.lock")
+chown_cron=$(cat "$chown_log")
+
+assert_eq "$mode_cron" "$mode_deploy" \
+    "3c) _cron_lock_dir ve _deploy_lock_dir AYNI dizin MODUNU uyguluyor (drift YOK)"
+assert_eq "$lockmode_cron" "$lockmode_deploy" \
+    "3c) _cron_lock_dir ve _deploy_lock_dir AYNI kilit DOSYASI modunu uyguluyor (drift YOK)"
+assert_eq "$chown_cron" "$chown_deploy" \
+    "3c) _cron_lock_dir ve _deploy_lock_dir BİREBİR AYNI chown hedeflerini istiyor (drift YOK)"
+assert_contains "$chown_deploy" "root:${webC} ${dirC_deploy}" \
+    "3c) her iki yol da dizini ROOT'a chown ediyor (web_<sname>'e DEĞİL)"
 
 # ═══════════════════════════════════════════════════════════════
 # 4) (c) EŞZAMANLI DEPLOY ENGELİ — _deploy_lock HÂLÂ çalışıyor mu

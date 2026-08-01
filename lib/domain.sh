@@ -224,6 +224,66 @@ _domain_repair_ghost_report() {
     warn "      - Hayalet bir kalıntıysa (ör. nginx varsayılan dizini): '${base}' içeriğini inceleyip gerekiyorsa elle kaldırın."
 }
 
+# ═══════════════════════════════════════════════════════════════
+#  DEPLOY KİLİT DİZİNİ SAHİPLİK ONARIMI (KRİTİK — kod düzeltmesi TEK
+#  BAŞINA YETMEZ)
+# ═══════════════════════════════════════════════════════════════
+# Kaynak kodu düzeltmek, HÂLİHAZIRDA KURULU sistemlerdeki zafiyeti
+# KAPATMAZ: '/run/srvctl/locks/<sname>' dizini o sunucularda ŞU AN
+# '700 web_<sname>:web_<sname>' durumundadır ve domain kullanıcısı orada
+# hâlâ unlink+create yapabilir — yani sömürü silahlı kalır. ('/run' bir
+# tmpfs'tir; yeniden başlatma dizini SİLER ama srvctl bir sonraki
+# deploy/cron-add'de onu YENİ formülle tekrar yaratır. Yeniden başlatmadan
+# ÖNCEKİ pencere ise tamamen açıktır.)
+#
+# Bu fonksiyon 'srvctl domain repair <domain>' akışına bağlanır ve:
+#   1) Kilit dosyası bir SEMBOLİK BAĞ ise — bu bir AKTİF SALDIRI göstergesidir
+#      — bağı SİLER ve operatörü AÇIKÇA uyarır (hedefe DOKUNMAZ; 'rm' bağın
+#      kendisini kaldırır, işaret ettiği dosyayı DEĞİL).
+#   2) Ağacı core.sh'taki TEK KAYNAK formülüyle (710 root:web_<sname> +
+#      660 root:web_<sname> ön-oluşturulmuş kilit dosyası) YENİDEN kurar.
+#   3) Bulduğu YANLIŞ durumu (sahip/mod) raporlar — sessiz düzeltme YOK.
+# Dönüş: 0=sorun yok ya da onarıldı, 1=onarılamadı (çağıran repair_failed'i
+# işaretler).
+_domain_repair_lock_dir() {
+    local domain="$1" sname="$2" web_user="$3"
+    local dom_dir lock_file
+    dom_dir=$(_srvctl_lock_dir_path "$sname")
+    lock_file=$(_srvctl_lock_file_path "$sname")
+
+    # ─── 1) Aktif saldırı göstergesi: kilit dosyası sembolik bağ mı? ───
+    if [[ -L "$lock_file" ]]; then
+        local target=""
+        target=$(readlink "$lock_file" 2>/dev/null) || target="?"
+        warn "GÜVENLİK UYARISI (${domain}): deploy kilit dosyası bir SEMBOLİK BAĞ — hedef: '${target}'"
+        warn "    Bu, domain kullanıcısının ('${web_user}') root'a KEYFİ bir dosyayı chown/truncate ettirme girişimidir."
+        warn "    Bağ KALDIRILIYOR (hedef dosyaya DOKUNULMAZ). Sunucuyu ihlal açısından inceleyin: '${target}' dosyasının sahipliğini/içeriğini DOĞRULAYIN."
+        rm -f -- "$lock_file" || {
+            warn "    Sembolik bağ KALDIRILAMADI: ${lock_file}"
+            return 1
+        }
+    fi
+
+    # ─── 2) Mevcut (onarım ÖNCESİ) durumu tespit et — sessiz düzeltme YOK ───
+    if [[ -d "$dom_dir" && ! -L "$dom_dir" ]]; then
+        local cur_owner="" cur_mode=""
+        cur_owner=$(_stat_owner "$dom_dir" 2>/dev/null) || cur_owner=""
+        cur_mode=$(_stat_mode "$dom_dir" 2>/dev/null) || cur_mode=""
+        if [[ -n "$cur_owner" && "$cur_owner" != "root" ]]; then
+            warn "GÜVENLİK ONARIMI (${domain}): kilit dizini '${dom_dir}' root'a DEĞİL '${cur_owner}' kullanıcısına aitti (mod ${cur_mode:-?}) — bu, o kullanıcının kilit dosyasını silip yerine sembolik bağ koymasına izin veriyordu. Sahiplik root'a ALINIYOR (710 root:${web_user})."
+        elif [[ -n "$cur_mode" && "$cur_mode" != "710" ]]; then
+            info "Kilit dizini modu ${cur_mode} → 710 olarak güncelleniyor: ${dom_dir}"
+        fi
+    fi
+
+    # ─── 3) TEK KAYNAK formülüyle yeniden kur ───
+    _srvctl_lock_ensure "$sname" "$web_user" >/dev/null || {
+        warn "Kilit dizini onarılamadı: ${dom_dir} (yukarıdaki uyarıya bakın)"
+        return 1
+    }
+    return 0
+}
+
 # ─── public_html / current onarımı (GÜVENLİK DENETİMİ EKİ — KARAR REVİZYONU) ───
 # İLK KARAR (bu fonksiyonun önceki sürümü) yalnız TEŞHİS koyuyordu:
 # "kök neden deploy tarafında, releases/ boşken yönlendirilecek geçerli
@@ -668,6 +728,16 @@ _domain_repair() {
     # FPM config-test/aktivasyon adımından (2/4) ÖNCE çağrılır ki 'chdir'
     # invariant'ı düzeltilmiş olarak o adıma girilsin.
     _domain_repair_fix_docroot "$target" "$base" "$web_user"
+
+    # ─── Deploy kilit dizini sahiplik onarımı (KRİTİK güvenlik) ───
+    # MEVCUT kurulumlarda dizin '700 web_<sname>:web_<sname>' olarak duruyor
+    # olabilir; kaynak kodu düzeltmek bunu tek başına kapatmaz. Bkz.
+    # _domain_repair_lock_dir başlık yorumu. 'set -e' altında çıplak çağrı
+    # 1 dönünce TÜM repair'i düşürürdü — 'if !' ile guard'lanır ve gerçek
+    # sonuç 'repair_failed' üzerinden dürüstçe raporlanır.
+    if ! _domain_repair_lock_dir "$target" "$sname" "$web_user"; then
+        repair_failed=true
+    fi
 
     step "1/4" "Chroot kütüphaneleri güncelleniyor (PHP ${php_ver})..."
     _apply_chroot_php_deps "${base}" "${php_ver}"

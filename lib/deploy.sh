@@ -700,36 +700,39 @@ _deploy_no_rollback_recover() {
 # web_<sname> hiç GİREMEZ (AppArmor'a sıra bile gelmeden DAC reddeder).
 # Dizin gevşetilip (ör. 711/755) İÇİNDEKİ dosya adı domain adından tahmin
 # edilebilir hale getirilirse bu SEFER domainler arası izolasyon (görev
-# şartı) zedelenir. ÇÖZÜM — bkz. _deploy_lock_dir yorumu: domain BAŞINA
-# AYRI, o domain'in kullanıcısına ait (700) bir alt dizin.
+# şartı) zedelenir. ÇÖZÜM: domain BAŞINA AYRI bir alt dizin.
+#
+# ⚠ SONRAKİ DÜZELTME (KRİTİK): o alt dizin ilk sürümde '700
+# web_<sname>:web_<sname>' idi — yani SAHİBİ domain kullanıcısıydı ve bu,
+# root'a keyfi dosya chown/truncate ettiren bir SEMBOLİK BAĞ primitifi
+# doğurdu (canlı üretimde kanıtlandı). Dizin artık '710 root:web_<sname>':
+# geçiş hakkı KORUNUR, yazma hakkı KALKAR. Bkz. core.sh:_srvctl_lock_ensure.
 # ───────────────────────────────────────────────────────────────
 
 # Kilit dizin ağacını hazırlar ve domain'e ÖZEL alt dizinin YOLUNU stdout'a
-# yazar. Üç katman:
-#   1) ${lock_base}          711 root:root — yalnız GEÇİŞ (listeleme YOK;
-#      root DIŞINDA kimse burada dosya/dizin OLUŞTURAMAZ/SİLEMEZ).
-#   2) ${lock_base}/locks     711 root:root — FPM'in AYNI ${lock_base}
-#      altında tuttuğu pid dosyalarından (fpm-<sname>.pid, bkz.
-#      templates/php-fpm/fpm-global.conf.tpl) ad alanı olarak ayrıştırmak
-#      İÇİN (kavramsal netlik; DAC izolasyonu için ZORUNLU değil, asıl
-#      izolasyon 3. katmanda sağlanıyor).
-#   3) ${lock_base}/locks/<sname>  700 web_<sname>:web_<sname> — YALNIZ o
-#      domain'in Linux kullanıcısı (VE root — root DAC'ı BAYPAS eder)
-#      girebilir; farklı bir UID'ye sahip BAŞKA hiçbir domain kullanıcısı
-#      buraya GİREMEZ (domainler arası izolasyon KORUNUR — görev şartı).
-# lib/cron.sh AYNI formülü KENDİ İÇİNDE (_cron_lock_dir) tutar — çapraz
-# modül bağımlılığı KURULMADAN (CLAUDE.md deseni; bu dosyadaki diğer "AYNI
-# formül" notlarıyla tutarlı, ör. _deploy_read_meta/_cron_add'ın working_dir
-# hesaplaması). İki formülün DRIFT ETMEMESİ tests/test_deploy_lock_isolation.sh
-# tarafından uçtan uca (gerçek FLOCK_PREFIX render'ı ile) doğrulanır.
+# yazar.
+#
+# ⚠ KRİTİK GÜVENLİK DÜZELTMESİ — bu fonksiyonun GÖVDESİ core.sh'a TAŞINDI
+# (_srvctl_lock_ensure). Gerekçe İKİ KATLI:
+#   (1) Eski 3. katman '700 web_<sname>:web_<sname>' idi. Dizinin SAHİBİ
+#       domain kullanıcısı olduğundan o kullanıcı dizinde UNLINK + CREATE
+#       yapabiliyordu: kilit dosyasını silip yerine KEYFİ bir hedefe (ör.
+#       '/etc/ld.so.preload') sembolik bağ koyuyor, sonra root olarak
+#       çalışan aşağıdaki '_deploy_lock' bu bağı dereference edip HEDEFİ
+#       chown/chmod ediyor ve 'exec 9>' ile TRUNCATE ediyordu → TAM ROOT.
+#       Canlı bir Ubuntu 24.04 üretim sunucusunda SÖMÜRÜLEBİLİRLİĞİ
+#       KANITLANDI. Yeni model: dizin '710 root:web_<sname>' — domain
+#       kullanıcısında 'w' YOK, yalnız 'x' (geçiş) var.
+#   (2) AYNI formül lib/cron.sh:_cron_lock_dir'de KOPYA olarak duruyordu;
+#       ikisi de AYNI hatayı taşıyordu. Artık İKİSİ DE core.sh'taki TEK
+#       fonksiyonu çağırır — drift YAPISAL olarak imkânsız. core.sh her
+#       modülden ÖNCE koşulsuz source edildiğinden çapraz modül 'source'
+#       sorunu (exit 127) DOĞMAZ.
+# İzin modelinin TAM gerekçesi + flock(1)'ün ölçülmüş açma kipi için bkz.
+# lib/core.sh:_srvctl_lock_ensure başlık yorumu. Drift'i ayrıca
+# tests/test_deploy_lock_isolation.sh uçtan uca doğrular.
 _deploy_lock_dir() {
-    local sname="$1" web_user="$2"
-    local lock_base="${SRVCTL_LOCK_DIR:-/run/srvctl}"
-    secure_dir "$lock_base" 711
-    secure_dir "${lock_base}/locks" 711
-    local dom_dir="${lock_base}/locks/${sname}"
-    secure_dir "$dom_dir" 700 "${web_user}:${web_user}"
-    printf '%s' "$dom_dir"
+    _srvctl_lock_ensure "$1" "$2"
 }
 
 # Per-domain deploy kilidi (flock). Aynı domain'e eş zamanlı iki deploy
@@ -740,18 +743,59 @@ _deploy_lock() {
     local domain="$1" sname; sname=$(safe_name "$domain")
     local web_user="web_${sname}"
     command -v flock &>/dev/null || { warn "flock yok — eşzamanlılık koruması devre dışı"; return 0; }
-    local lock_dir; lock_dir=$(_deploy_lock_dir "$sname" "$web_user")
+    # Kilit ağacı + kilit DOSYASININ KENDİSİ burada (root olarak, 710/660
+    # root-sahipli) hazırlanır — bkz. core.sh:_srvctl_lock_ensure. Dosyanın
+    # ÖN-OLUŞTURULMASI ARTIK ZORUNLUDUR: dizin domain kullanıcısına yazılabilir
+    # olmadığından cron'un flock(1) çağrısı (O_CREAT verse bile) dosyayı
+    # kendisi YARATAMAZ.
+    # FAIL-CLOSED: ağaç güvenli biçimde kurulamıyorsa (ör. bir bileşen
+    # sembolik bağ) deploy DEVAM ETMEZ — eskiden dönüş değeri hiç
+    # kontrol edilmiyordu.
+    local lock_dir=""
+    lock_dir=$(_deploy_lock_dir "$sname" "$web_user") \
+        || error "Kilit dizini güvenli biçimde hazırlanamadı (yukarıdaki uyarıya bakın) — 'srvctl domain repair ${domain}' çalıştırın"
+    [[ -n "$lock_dir" ]] \
+        || error "Kilit dizini yolu hesaplanamadı: ${domain}"
     local lock_path="${lock_dir}/deploy-${sname}.lock"
-    # Kilit dosyasının KENDİSİ de domain kullanıcısına ait/600 olmalı —
-    # aksi halde root'un 'exec 9>' ile İLK yarattığı dosya varsayılan
-    # umask'la (tipik 644, root:root) kalırdı ve cron'un flock(1) çağrısı
-    # (web_<sname> olarak) dosyayı AÇAMAZDI (dizin doğru olsa BİLE — bu
-    # TAM DA bu görevin düzelttiği sınıftan bir DAC hatası olurdu).
-    # secure_file MEVCUT içeriği KORUR (truncate etmez) — kilit dosyasının
-    # içeriği zaten önemsiz (flock yalnız fd'yi kullanır) ama prensip
-    # olarak core.sh'ın genel sözleşmesiyle tutarlı.
-    secure_file "$lock_path" 600 "${web_user}:${web_user}"
-    exec 9>"$lock_path" || return 0
+
+    # ─── SYMLINK KAPISI (fail-closed) ───
+    # Yapısal savunma (dizinde 'w' yok) tek başına yeterlidir; bu kontrol
+    # İKİNCİ KATMANDIR — root ayrıcalığıyla açılacak yolun bir sembolik bağ
+    # OLMADIĞI, açmadan ÖNCE doğrulanır.
+    if [[ -L "$lock_path" ]]; then
+        error "Güvenlik: kilit dosyası bir SEMBOLİK BAĞ (${lock_path}) — deploy REDDEDİLDİ. Bu, domain kullanıcısının root'a keyfi dosya chown/truncate ettirme girişimidir; 'srvctl domain repair ${domain}' ile temizleyin."
+    fi
+
+    # '9>' DEĞİL '9>>': '>' hedefi TRUNCATE eder ve tam da bu, sömürünün
+    # "keyfi dosya sıfırlama" (ör. /etc/shadow) yarısıydı. Append kipi
+    # flock() için BİREBİR aynı işlevi görür (yalnız fd gerekir) ama
+    # HİÇBİR içeriği yok etmez — primitif kökten kaldırılır.
+    exec 9>>"$lock_path" || return 0
+
+    # ─── AÇIŞ SONRASI DOĞRULAMA (Linux) ───
+    # '-L' kontrolü ile 'exec 9>>' arasındaki teorik yarışı kapatır: fd 9
+    # GERÇEKTEN beklenen yola mı bağlandı? '/proc' yoksa (macOS geliştirme
+    # kutusu) sessizce atlanır — orada zaten root/AppArmor tehdit modeli yok.
+    #
+    # YANLIŞ POZİTİF KORUMASI: '/proc/self/fd/N' FİZİKSEL (symlink'leri
+    # çözülmüş) yolu verir. Ubuntu'da '/run' gerçek bir dizindir, ama
+    # SRVCTL_LOCK_DIR bir test tohumu olarak symlink içeren bir yola
+    # ayarlanmış olabilir — bu yüzden beklenen yolun FİZİKSEL karşılığı da
+    # kabul edilir. Bu, kontrolün güvenlik değerini AZALTMAZ: saldırganın
+    # yerleştirebileceği bir bağ BAŞKA bir dosyaya işaret ederdi ve İKİ
+    # biçimden hiçbiriyle eşleşmezdi.
+    if [[ -e /proc/self/fd/9 ]]; then
+        local _fd_target="" _phys_dir="" _expected_phys=""
+        _fd_target=$(readlink /proc/self/fd/9 2>/dev/null) || _fd_target=""
+        _phys_dir=$(cd -P -- "$lock_dir" 2>/dev/null && pwd -P) || _phys_dir=""
+        [[ -n "$_phys_dir" ]] && _expected_phys="${_phys_dir}/deploy-${sname}.lock"
+        if [[ -n "$_fd_target" && "$_fd_target" != "$lock_path" \
+              && ( -z "$_expected_phys" || "$_fd_target" != "$_expected_phys" ) ]]; then
+            exec 9>&-
+            error "Güvenlik: kilit fd'si beklenen yola bağlanmadı (beklenen '${lock_path}', gerçek '${_fd_target}') — deploy REDDEDİLDİ."
+        fi
+    fi
+
     flock -n 9 \
         || error "Bu domain için bir deploy zaten çalışıyor: ${domain}"
 }

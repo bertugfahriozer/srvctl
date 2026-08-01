@@ -161,15 +161,28 @@ assert_fail _cron_calendar_charset_ok "%i" \
     "ham mod: '%' (systemd specifier) REDDEDİLİR"
 
 # ═══════════════════════════════════════════════
-#  4) DAĞITICI — _cron_resolve_schedule (üç biçim + UTC/ham dilim kararı)
+#  4) DAĞITICI — _cron_resolve_schedule (üç biçim + yerel/UTC dilim kararı)
+#
+#  KARAR DEĞİŞTİ (GERÇEK üretim sunucusunda ölçüldü — Europe/Istanbul/+03):
+#  'her gün 04:00' ESKİDEN 'OnCalendar=*-*-* 04:00:00 UTC' yazıyordu ve iş
+#  sabah 07:00'de çalışıyordu. Varsayılan artık SUNUCU YEREL SAATİ (sonek
+#  YOK); UTC AÇIK bir '--utc' bayrağına (tz_mode='utc') taşındı.
 # ═══════════════════════════════════════════════
 
-assert_eq "$(_cron_resolve_schedule 'her gün 03:00')" "turkish *-*-* 03:00:00 UTC" \
-    "resolve: Türkçe yol seçilir VE 'UTC' EKLENİR (tasarım kararı)"
-assert_eq "$(_cron_resolve_schedule '0 3 * * *')" "cron5 *-*-* 03:00:00 UTC" \
-    "resolve: cron5 yolu seçilir VE 'UTC' EKLENİR"
+assert_eq "$(_cron_resolve_schedule 'her gün 03:00')" "turkish *-*-* 03:00:00" \
+    "resolve: VARSAYILAN Türkçe yolda ' UTC' soneki EKLENMEZ (yerel saat — yazdığın saat çalışan saattir)"
+assert_eq "$(_cron_resolve_schedule '0 3 * * *')" "cron5 *-*-* 03:00:00" \
+    "resolve: VARSAYILAN cron5 yolunda da ' UTC' soneki EKLENMEZ"
+assert_eq "$(_cron_resolve_schedule 'her gün 03:00' local)" "turkish *-*-* 03:00:00" \
+    "resolve: tz_mode='local' AÇIKÇA verilse de sonek EKLENMEZ (varsayılanla AYNI)"
+assert_eq "$(_cron_resolve_schedule 'her gün 03:00' utc)" "turkish *-*-* 03:00:00 UTC" \
+    "resolve: tz_mode='utc' ('--utc') ESKİ davranışı BİREBİR geri getirir"
+assert_eq "$(_cron_resolve_schedule '0 3 * * *' utc)" "cron5 *-*-* 03:00:00 UTC" \
+    "resolve: cron5 + '--utc' → ' UTC' soneki yazılır"
 assert_eq "$(_cron_resolve_schedule '*-*-01 02:00:00')" "raw *-*-01 02:00:00" \
     "resolve: ham yol seçilir, HİÇBİR ŞEY EKLENMEZ/DEĞİŞTİRİLMEZ (operatör sorumluluğu)"
+assert_eq "$(_cron_resolve_schedule '*-*-01 02:00:00' utc)" "raw *-*-01 02:00:00" \
+    "resolve: ham yolda '--utc' YOK SAYILIR — operatörün ifadesine ASLA sonek eklenmez"
 assert_fail _cron_resolve_schedule "0 3 1 * 1" \
     "resolve: cron5 ŞEKLİNDE (5 alan) ama semantik olarak GEÇERSİZ girdi HAM MODA DÜŞMEZ — net hata (yanlış yorumlamaktansa)"
 assert_fail _cron_resolve_schedule "" \
@@ -179,7 +192,7 @@ assert_fail _cron_resolve_schedule $'her gün\n03:00' \
 
 # Aynı zamanlamanın Türkçe/cron5/eşdeğerleri BİREBİR AYNI OnCalendar GÖVDESİNİ
 # üretmeli (MOD alanı — 'turkish'/'cron5' — kasıtlı olarak farklıdır, yalnız
-# takvim gövdesi + 'UTC' soneki karşılaştırılır: 'read' ile İLK alan atılır).
+# takvim gövdesi karşılaştırılır: 'read' ile İLK alan atılır).
 turkish_out=$(_cron_resolve_schedule 'hafta içi 09:00')
 cron5_out=$(_cron_resolve_schedule '0 9 * * 1-5')
 turkish_cal="" cron5_cal=""

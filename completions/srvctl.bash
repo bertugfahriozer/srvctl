@@ -45,7 +45,7 @@ _srvctl_completions() {
                 _srvctl_complete_domains
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "add" ]]; then
                 # 'cron add' bayrak tamamlama
-                COMPREPLY=($(compgen -W "--name= --schedule= --command= --description= --timeout= --catch-up-on-boot" -- "$cur"))
+                COMPREPLY=($(compgen -W "--name= --schedule= --command= --description= --timeout= --catch-up-on-boot --utc" -- "$cur"))
             fi
             ;;
         deploy)

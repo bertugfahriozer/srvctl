@@ -530,22 +530,165 @@ _require_owned_or_warn() {
 # İÇİN chown hedefi PARAMETRELENDİRİLDİ. Genel amaç (root-owned sır/durum
 # dosyaları) DEĞİŞMEDİ — yalnızca ihtiyaç duyan ÇAĞIRAN taraf farklı bir
 # sahip isteyebilir.
+# ─── SYMLINK FAIL-CLOSED (KRİTİK — canlı üretimde SÖMÜRÜLEBİLİRLİĞİ
+#     KANITLANMIŞ ayrıcalık yükseltme sınıfı) ───
+#
+# ÖLÇÜLEN SALDIRI (Ubuntu 24.04, gerçek e-ticaret sunucusu, web_<sname>
+# kullanıcısı olarak): kilit dizini domain kullanıcısına ait (700
+# web_x:web_x) olduğundan o kullanıcı dizin İÇİNDE unlink+create yapabiliyor;
+# kilit dosyasını silip yerine '/etc/ld.so.preload' gibi KEYFİ bir hedefe
+# sembolik bağ koyabiliyordu. Ardından root olarak çalışan srvctl
+#   secure_file "$lock_path" 600 "web_x:web_x"
+# çağrısı sembolik bağı DEREFERENCE ederek:
+#   * 'touch'  → hedef YOKSA root olarak YARATIYOR,
+#   * 'chmod'  → HEDEFİN modunu değiştiriyor,
+#   * 'chown'  → HEDEFİ SALDIRGANA VERİYOR ('chown -h' değildi)
+# yani keyfi dosya sahipliği + (çağıranın 'exec 9>' açışıyla birlikte) keyfi
+# dosya truncate primitifi sunuyordu. '/etc/ld.so.preload' hedeflenirse TAM
+# ROOT; '/etc/shadow' hedeflenirse hesap kilidi.
+#
+# ⚠ DAVRANIŞ DEĞİŞİKLİĞİ (belgelenmiştir — mevcut çağrı yerleri taranmıştır):
+#   Hedef yolun KENDİSİ bir sembolik bağ ise secure_file/secure_dir ARTIK
+#   HİÇBİR ŞEY YAPMAZ: 'warn' basar ve 1 DÖNER (fail-closed). Bu, yapısal
+#   olarak SEMBOLİK BAĞ ÜZERİNDEN mod/sahiplik uygulanmasını İMKÂNSIZ kılar.
+#   Repodaki 34 çağrı yerinin TAMAMI (plugin/init/domain/backup/security/
+#   selfupdate/webhook/cron/deploy) GERÇEK dosya-dizin hedefler; hiçbiri
+#   kasıtlı olarak bir sembolik bağa yazmaz. Bilinen TEK gri alan: operatör
+#   'BACKUP_DIR'i (varsayılan '/backups') bir mount noktasına SEMBOLİK BAĞ
+#   yapmışsa 'srvctl backup'/'srvctl init' artık uyarıp durur — çözüm,
+#   conf/srvctl.conf'ta BACKUP_DIR'e GERÇEK yolu yazmaktır (belgelenen desen
+#   zaten budur, bkz. README).
+#
+# Ayrıca 'chown' → 'chown -h': sembolik bağ kontrolü ile açılış arasındaki
+# (teorik) yarış penceresinde bile chown ARTIK hedefi DEĞİL bağın KENDİSİNİ
+# değiştirir — dereference primitifi kökten yok edilir. ('chmod'un portable
+# bir '-h' karşılığı YOKTUR; bu yüzden kontrol chmod'dan hemen ÖNCE tekrar
+# yapılır ve asıl savunma, kilit ağacında dizinin artık domain kullanıcısına
+# YAZILABİLİR OLMAMASIDIR — bkz. _srvctl_lock_ensure.)
+_reject_symlink() {
+    local path="$1" kind="$2"
+    [[ -L "$path" ]] || return 0
+    warn "Güvenlik: '${path}' bir sembolik bağ — ${kind} mod/sahiplik uygulaması REDDEDİLDİ (symlink saldırısı olabilir)"
+    return 1
+}
+
 secure_file() {
     local path="$1" mode="${2:-600}" owner="${3:-root:root}"
+    # KAPI 1: 'touch'tan ÖNCE — sarkan (dangling) bir bağda 'touch' HEDEFİ
+    # YARATIRDI; kontrol bu yüzden HER ŞEYDEN önce gelir.
+    _reject_symlink "$path" "dosya" || return 1
     # Dosyayı oluştur (yoksa) — MEVCUT içeriği KORU. 'touch' truncate ETMEZ;
     # (eski ': >' mevcut dosyayı boşaltıyordu → yazımdan sonra çağrılınca içerik
     #  kaybı: /root/.my.cnf, yedek artefaktları, migrate credentials).
     ( umask 077; touch "$path" 2>/dev/null || true )
-    [[ -e "$path" ]] || { umask 077; touch "$path"; }
-    chmod "$mode" "$path"
-    chown "$owner" "$path" 2>/dev/null || true
+    [[ -e "$path" ]] || { umask 077; touch "$path" || return 1; }
+    # KAPI 2: chmod dereference ettiğinden, touch ile chmod ARASINDAKİ
+    # pencereye karşı tekrar bak (TOCTOU daraltma).
+    _reject_symlink "$path" "dosya" || return 1
+    chmod "$mode" "$path" || return 1
+    chown -h "$owner" "$path" 2>/dev/null || true
+    return 0
 }
 
 secure_dir() {
     local path="$1" mode="${2:-700}" owner="${3:-root:root}"
-    ( umask 077; mkdir -p "$path" )
-    chmod "$mode" "$path"
-    chown "$owner" "$path" 2>/dev/null || true
+    _reject_symlink "$path" "dizin" || return 1
+    ( umask 077; mkdir -p "$path" ) || return 1
+    _reject_symlink "$path" "dizin" || return 1
+    chmod "$mode" "$path" || return 1
+    chown -h "$owner" "$path" 2>/dev/null || true
+    return 0
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  DEPLOY/CRON KİLİT AĞACI — TEK KAYNAK (drift KÖKTEN engellenir)
+# ═══════════════════════════════════════════════════════════════════
+# ESKİDEN bu formül İKİ YERDE (lib/deploy.sh:_deploy_lock_dir ve
+# lib/cron.sh:_cron_lock_dir) AYRI AYRI yazılıydı ("çapraz modül bağımlılığı
+# kurmamak" gerekçesiyle). İkisi de AYNI güvenlik hatasını taşıyordu ve bir
+# düzeltmenin ikisine BİRDEN uygulanması operatöre/teste bırakılmıştı. Bu
+# fonksiyonlar core.sh'a taşındı: core.sh HER modülden ÖNCE ve KOŞULSUZ
+# source edilir (bin/srvctl:_load_and_run) — yani çapraz modül 'source'
+# sorunu (exit 127) HİÇ DOĞMAZ ve İKİ formülün sürüklenmesi YAPISAL olarak
+# imkânsızlaşır.
+#
+# İZİN MODELİ (KRİTİK GÜVENLİK DÜZELTMESİ — bkz. _reject_symlink başlığındaki
+# sömürü zinciri):
+#   1) <base>                    711 root:root   — yalnız GEÇİŞ (listeleme YOK)
+#   2) <base>/locks              711 root:root   — FPM'in pid dosyalarından
+#                                                  ad alanı ayrımı
+#   3) <base>/locks/<sname>      710 root:web_<sname>
+#        root: rwx | grup (web_<sname>): --x | diğer: ---
+#        ⚠ ESKİDEN '700 web_<sname>:web_<sname>' idi. Dizinin SAHİBİ domain
+#        kullanıcısı olduğu için o kullanıcı dizin içinde UNLINK + CREATE
+#        yapabiliyordu → kilit dosyasını silip yerine sembolik bağ koyma
+#        primitifi (canlı üretimde KANITLANDI). Artık dizinde 'w' biti YOK:
+#        domain kullanıcısı dosyayı SİLEMEZ, YERİNE BAŞKA BİR ŞEY KOYAMAZ;
+#        'x' (traverse) biti ile dizinden GEÇEBİLİR (open() bunun için
+#        yeterlidir), 'r' biti OLMADIĞI için LİSTELEYEMEZ. BAŞKA domainlerin
+#        kullanıcıları 'diğer: ---' ile TAMAMEN dışarıdadır — domainler arası
+#        izolasyon KORUNUR.
+#   4) <base>/locks/<sname>/deploy-<sname>.lock  660 root:web_<sname>
+#        ⚠ Dosya ROOT tarafından ÖN-OLUŞTURULUR ve root'a ait KALIR.
+#
+# ÖLÇÜLEN GERÇEK — flock(1) dosyayı HANGİ kiple açar?
+#   util-linux 'sys-utils/flock.c', open_file():
+#       int fl = *flags == 0 ? O_RDONLY : *flags;
+#       fl |= O_NOCTTY | O_CREAT;
+#       fd = open(filename, fl, 0666);
+#   Yani VARSAYILAN açış 'O_RDONLY | O_CREAT | O_NOCTTY' (0666) — 'O_RDWR'
+#   DEĞİL. (v2.37.2 = Ubuntu 22.04 ve v2.39.3 = Ubuntu 24.04 etiketlerinde
+#   BİREBİR AYNI kod — kaynaktan doğrulandı, tahmin DEĞİL. 'O_RDWR' yalnızca
+#   flock() EIO/EBADF döndüren NFS yolunda, 'access(file, R_OK|W_OK)'
+#   başarılıysa YENİDEN AÇMA olarak devreye girer.)
+#   SONUÇLARI:
+#     (a) Mevcut bir dosya için domain kullanıcısına 'r' YETER; 660 verilmesi
+#         yalnız yukarıdaki NFS geri çekilme yolunu ve AppArmor 'rwk'
+#         kuralıyla tutarlılığı korumak İÇİNDİR (fazladan bir yetenek
+#         AÇMAZ — dizinde 'w' olmadığından dosya SİLİNEMEZ/DEĞİŞTİRİLEMEZ,
+#         yalnız İÇERİĞİ yazılabilir; kilit dosyasının içeriği zaten
+#         anlamsızdır, flock yalnız fd'yi kullanır).
+#     (b) O_CREAT HER ZAMAN verilir. Dizin artık domain kullanıcısına
+#         YAZILABİLİR OLMADIĞINDAN, dosya YOKSA flock(1) onu ARTIK
+#         OLUŞTURAMAZ (EACCES). Bu yüzden kilit dosyasını ROOT'un ÖNCEDEN
+#         yaratması ZORUNLUDUR — bu fonksiyon tam olarak bunu garanti eder
+#         ve HEM _deploy_lock_dir HEM _cron_lock_dir bunu çağırır.
+#   ÜRETİMDE '644 web_x:web_x' GÖRÜLMESİNİN AÇIKLAMASI: secure_file 600
+#   istediği hâlde diskte 644 ölçüldü çünkü dosyayı orada secure_file DEĞİL,
+#   cron job'unun KENDİ flock(1) çağrısı yaratmıştı: O_CREAT mode 0666 &
+#   ~umask(022) = 0644, sahibi de süreci çalıştıran web_x. Yani deploy'lar
+#   arasında dosya SİLİNİP domain kullanıcısı tarafından YENİDEN
+#   yaratılabiliyordu — sömürünün 'rm -f' adımının doğrudan kanıtı. Yeni
+#   modelde bu mümkün DEĞİL.
+
+# Saf yol hesapları (YAN ETKİSİZ — mkdir/chmod YAPMAZ; test edilebilir).
+_srvctl_lock_dir_path() {
+    printf '%s/locks/%s' "${SRVCTL_LOCK_DIR:-/run/srvctl}" "$1"
+}
+_srvctl_lock_file_path() {
+    printf '%s/locks/%s/deploy-%s.lock' "${SRVCTL_LOCK_DIR:-/run/srvctl}" "$1" "$1"
+}
+
+# Kilit ağacını güvenli izinlerle KURAR/ONARIR ve domain alt dizininin
+# YOLUNU stdout'a yazar. Başarısızlıkta (ör. bir bileşen sembolik bağ ise)
+# 1 döner ve HİÇBİR ŞEY yazmaz — çağıran fail-closed davranmalıdır.
+_srvctl_lock_ensure() {
+    local sname="$1" web_user="$2"
+    local base="${SRVCTL_LOCK_DIR:-/run/srvctl}"
+    local dom_dir; dom_dir=$(_srvctl_lock_dir_path "$sname")
+    local lock_file; lock_file=$(_srvctl_lock_file_path "$sname")
+
+    secure_dir "$base" 711 || return 1
+    secure_dir "${base}/locks" 711 || return 1
+    # 710 root:web_<sname> — sahiplik ROOT'ta; domain kullanıcısına yalnız
+    # GEÇİŞ (--x) hakkı kalır (unlink/create YOK).
+    secure_dir "$dom_dir" 710 "root:${web_user}" || return 1
+    # Kilit dosyası ROOT tarafından ÖN-OLUŞTURULUR (flock(1) artık kendisi
+    # yaratamaz — yukarıdaki (b) maddesi).
+    secure_file "$lock_file" 660 "root:${web_user}" || return 1
+
+    printf '%s' "$dom_dir"
+    return 0
 }
 
 # ─── Güvenli arşiv çıkarma (tar/zip-slip + symlink/hardlink reddi) ───

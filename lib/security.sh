@@ -433,6 +433,139 @@ _check_fpm_isolation() {
 }
 
 # ───────────────────────────────────────────────────────────────
+#  DEPLOY KİLİT DİZİNİ SAHİPLİĞİ — SAF KARAR FONKSİYONU
+#  (KRİTİK: canlı üretimde SÖMÜRÜLEBİLİRLİĞİ KANITLANMIŞ ayrıcalık
+#  yükseltme sınıfı; bkz. lib/core.sh:_srvctl_lock_ensure başlık yorumu)
+# ───────────────────────────────────────────────────────────────
+#  Kod düzeltmesi TEK BAŞINA yetmez: '/run/srvctl/locks/<sname>' MEVCUT
+#  kurulumlarda hâlâ '700 web_<sname>:web_<sname>' olabilir ve o hâlde
+#  domain kullanıcısı kilit dosyasını silip yerine sembolik bağ koyarak
+#  root'a keyfi dosya chown/truncate ettirebilir. Bu kontrol o durumu
+#  DENETİMDE FAIL olarak raporlar; onarımı 'srvctl domain repair <domain>'
+#  yapar (_domain_repair_lock_dir).
+#
+#  SAF (yan etkisiz, test edilebilir — tests/test_audit_parsers.sh deseni).
+#  Girdi:
+#    <dir_durumu>   : yok | symlink | dizin
+#    <dir_sahibi>   : kullanıcı adı ('' = okunamadı)
+#    <dir_modu>     : oktal (ör. '710', '2710' — son 3 hane kullanılır)
+#    <kilit_durumu> : yok | symlink | dosya
+#    <kilit_sahibi> : kullanıcı adı ('' = okunamadı)
+#  Çıktı (TEK kelime):
+#    OK             — güvenli
+#    YOK            — ağaç henüz oluşmamış ('/run' tmpfs; ilk deploy/cron-add
+#                     ile oluşur) → WARN, FAIL DEĞİL
+#    KILIT_YOK      — dizin güvenli ama kilit DOSYASI eksik. Yeni modelde
+#                     dosyayı ROOT ön-oluşturur; yoksa flock(1) onu ARTIK
+#                     kendisi yaratamaz (dizinde 'w' yok) ve cron job'u
+#                     EX_NOINPUT ile düşer → WARN (işlevsel, güvenlik değil).
+#    DIZIN_SYMLINK  — kilit dizini sembolik bağ → AKTİF SALDIRI
+#    DIZIN_SAHIBI   — dizin root'a ait DEĞİL → SÖMÜRÜLEBİLİR
+#    DIZIN_YAZILIR  — dizinde grup/diğer YAZMA biti var → SÖMÜRÜLEBİLİR
+#    KILIT_SYMLINK  — kilit dosyası sembolik bağ → AKTİF SALDIRI
+#    KILIT_SAHIBI   — kilit dosyası root'a ait DEĞİL → SÖMÜRÜLEBİLİR
+_audit_lock_dir_verdict() {
+    local dir_state="$1" dir_owner="$2" dir_mode="$3" lock_state="$4" lock_owner="$5"
+
+    case "$dir_state" in
+        yok)     printf 'YOK';           return 0 ;;
+        symlink) printf 'DIZIN_SYMLINK'; return 0 ;;
+    esac
+
+    # Sahiplik: dizin ROOT'a ait OLMALI. Sahibi domain kullanıcısıysa o
+    # kullanıcı dizinde unlink+create yapabilir (dizin modu ne olursa olsun,
+    # sahip chmod'u kendisi geri değiştirebilir) → primitif geri gelir.
+    if [[ -n "$dir_owner" && "$dir_owner" != "root" ]]; then
+        printf 'DIZIN_SAHIBI'; return 0
+    fi
+
+    # Mod: grup/diğer YAZMA biti dizinde unlink+create demektir.
+    if [[ -n "$dir_mode" ]]; then
+        local m="${dir_mode}"
+        [[ "${#m}" -gt 3 ]] && m="${m: -3}"
+        local g="${m:1:1}" o="${m:2:1}"
+        if [[ "$g" =~ ^[0-7]$ && "$o" =~ ^[0-7]$ ]]; then
+            if (( (g & 2) != 0 || (o & 2) != 0 )); then
+                printf 'DIZIN_YAZILIR'; return 0
+            fi
+        fi
+    fi
+
+    case "$lock_state" in
+        symlink) printf 'KILIT_SYMLINK'; return 0 ;;
+        yok)     printf 'KILIT_YOK';     return 0 ;;
+    esac
+    if [[ -n "$lock_owner" && "$lock_owner" != "root" ]]; then
+        printf 'KILIT_SAHIBI'; return 0
+    fi
+
+    printf 'OK'
+    return 0
+}
+
+# Denetim sarmalayıcısı — AYNI explicit-injection deseni (_check_worker_aa /
+# _check_fpm_isolation ile birebir): _check_lock_dir_ownership <on_pass_fn>
+# <on_fail_fn> <on_warn_fn> <domain> <sname>.
+# Yol hesabı core.sh'ın TEK KAYNAK helper'larından gelir — çapraz modül
+# 'source' sorunu YOK (core.sh her modülden ÖNCE koşulsuz source edilir).
+_check_lock_dir_ownership() {
+    local on_pass="$1" on_fail="$2" on_warn="$3" domain="$4" sname="$5"
+    local dom_dir lock_file
+    dom_dir=$(_srvctl_lock_dir_path "$sname")
+    lock_file=$(_srvctl_lock_file_path "$sname")
+
+    local dir_state="yok" dir_owner="" dir_mode=""
+    if [[ -L "$dom_dir" ]]; then
+        dir_state="symlink"
+    elif [[ -d "$dom_dir" ]]; then
+        dir_state="dizin"
+        dir_owner=$(_stat_owner "$dom_dir" 2>/dev/null) || dir_owner=""
+        dir_mode=$(_stat_mode "$dom_dir" 2>/dev/null) || dir_mode=""
+    fi
+
+    local lock_state="yok" lock_owner=""
+    if [[ -L "$lock_file" ]]; then
+        lock_state="symlink"
+    elif [[ -f "$lock_file" ]]; then
+        lock_state="dosya"
+        lock_owner=$(_stat_owner "$lock_file" 2>/dev/null) || lock_owner=""
+    fi
+
+    local verdict
+    verdict=$(_audit_lock_dir_verdict "$dir_state" "$dir_owner" "$dir_mode" "$lock_state" "$lock_owner")
+
+    case "$verdict" in
+        OK)
+            "$on_pass" "${domain}: deploy kilit dizini güvenli (${dom_dir} — 710 root:web_${sname}, kilit dosyası root'a ait)"
+            ;;
+        YOK)
+            "$on_warn" "${domain}: deploy kilit dizini henüz yok (${dom_dir}) — '/run' tmpfs'tir, ilk 'srvctl deploy'/'srvctl cron add' ile oluşur (sorun DEĞİL)"
+            ;;
+        KILIT_YOK)
+            "$on_warn" "${domain}: kilit DİZİNİ güvenli ama kilit DOSYASI yok (${lock_file}) — flock(1) onu artık kendisi yaratamaz (dizinde 'w' yok); 'srvctl domain repair ${domain}' ile ön-oluşturun"
+            ;;
+        DIZIN_SYMLINK)
+            "$on_fail" "${domain}: KRİTİK — deploy kilit DİZİNİ bir SEMBOLİK BAĞ (${dom_dir}). Bu bir AKTİF SALDIRI göstergesidir; 'srvctl domain repair ${domain}' çalıştırın ve sunucuyu ihlal açısından inceleyin."
+            ;;
+        KILIT_SYMLINK)
+            "$on_fail" "${domain}: KRİTİK — deploy kilit DOSYASI bir SEMBOLİK BAĞ (${lock_file}). Domain kullanıcısı root'a keyfi bir dosyayı chown/truncate ettirmeye çalışıyor; 'srvctl domain repair ${domain}' çalıştırın ve sunucuyu ihlal açısından inceleyin."
+            ;;
+        DIZIN_SAHIBI)
+            "$on_fail" "${domain}: KRİTİK — deploy kilit dizini root'a DEĞİL '${dir_owner}' kullanıcısına ait (${dom_dir}, mod ${dir_mode:-?}). Bu kullanıcı kilit dosyasını silip yerine sembolik bağ koyarak ROOT'a yükselebilir; 'srvctl domain repair ${domain}' çalıştırın."
+            ;;
+        DIZIN_YAZILIR)
+            "$on_fail" "${domain}: KRİTİK — deploy kilit dizininde grup/diğer YAZMA biti var (${dom_dir}, mod ${dir_mode}). 710 olmalı; 'srvctl domain repair ${domain}' çalıştırın."
+            ;;
+        KILIT_SAHIBI)
+            "$on_fail" "${domain}: KRİTİK — deploy kilit dosyası root'a DEĞİL '${lock_owner}' kullanıcısına ait (${lock_file}). 660 root:web_${sname} olmalı; 'srvctl domain repair ${domain}' çalıştırın."
+            ;;
+        *)
+            "$on_warn" "${domain}: deploy kilit dizini durumu belirlenemedi (${dom_dir})"
+            ;;
+    esac
+}
+
+# ───────────────────────────────────────────────────────────────
 #  Cross-module yükleyici: harden-fs/harden-fpm domain.sh'taki
 #  _domain_fs_plan / _domain_apply_fs_ownership / _fs_record_before /
 #  _fs_revert / _domain_render_fpm_unit / _domain_activate_fpm_unit /
@@ -847,6 +980,12 @@ _security_audit() {
         # yalnız "tanımlı+aktif ama enforce değil" durumunda artar.
         _check_worker_aa _pass _fail _warn_result "$domain" "$sname"
         _check_scheduler_aa _pass _fail _warn_result "$domain" "$sname"
+
+        # Deploy kilit dizini sahipliği (KRİTİK — bkz. _audit_lock_dir_verdict
+        # başlık yorumu). Kaynak kodu düzeltmek MEVCUT kurulumları onarmaz;
+        # bu kontrol yanlış sahipliği/modu ya da yerleştirilmiş bir sembolik
+        # bağı FAIL olarak raporlar.
+        _check_lock_dir_ownership _pass _fail _warn_result "$domain" "$sname"
 
         # Dosya izinleri
         local perm

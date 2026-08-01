@@ -268,6 +268,22 @@ if command -v srvctl &>/dev/null; then
     echo "    4. İlk domain'i ekleyin:"
     echo "       sudo srvctl domain add example.com"
     echo ""
+    # ─── GÜNCELLEME YAPANLAR İÇİN KRİTİK GÜVENLİK NOTU ───
+    # Bu sürüm, deploy/cron kilit dizini üzerinden ROOT'a ayrıcalık
+    # yükseltmeye izin veren bir sembolik bağ zafiyetini kapatır (canlı bir
+    # üretim sunucusunda SÖMÜRÜLEBİLİRLİĞİ KANITLANDI). ÖNCEKİ sürümlerle
+    # oluşturulmuş '/run/srvctl/locks/<sname>' dizinleri diskte HÂLÂ '700
+    # web_<sname>:web_<sname>' durumundadır. Bir SONRAKİ 'srvctl deploy' /
+    # 'srvctl cron add' bunu KENDİLİĞİNDEN düzeltir (kilit ağacı her
+    # çalıştırmada yeniden uygulanır), ama operatörün BEKLEMEDEN
+    # kapatabilmesi için açık talimat verilir; 'audit' ise onarılmamış her
+    # domaini FAIL olarak raporlar.
+    echo -e "  ${BOLD}⚠ ÖNCEKİ SÜRÜMDEN GÜNCELLİYORSANIZ (KRİTİK GÜVENLİK):${NC}"
+    echo "    Deploy kilit dizini sahipliği düzeltildi (sembolik bağ ile ROOT'a"
+    echo "    ayrıcalık yükseltme). MEVCUT domainleri ONARIN:"
+    echo "       sudo srvctl domain repair --all"
+    echo "       sudo srvctl security audit     # onarılmamış domain FAIL verir"
+    echo ""
 else
     echo -e "${RED}✗${NC}  Kurulum başarısız olmuş olabilir."
     echo "  Kontrol edin: ls -la ${INSTALL_DIR}/bin/srvctl"

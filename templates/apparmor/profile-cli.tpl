@@ -122,6 +122,173 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # o domainlerde ETKİN OLMAZ — bu bir HOST doğrulama/rollout maddesidir.
   /usr/bin/flock rix,
 
+  # ═══════════════════════════════════════════════════════════════
+  #  CRON KOMUT YÜZEYİ — egress'SİZ coreutils + DB dump istemcileri
+  # ═══════════════════════════════════════════════════════════════
+  # HOST BULGUSU (koordinatör, GERÇEK Ubuntu 24.04 üretim sunucusu, gerçek
+  # 'srvctl-dev_designwestgate_art-cli' profili altında 'aa-exec -p <profil>'
+  # ile TEK TEK ölçüldü):
+  #     php8.4  rc=0    flock  rc=0
+  #     date    rc=126  cat    rc=126  echo(/bin/echo)  rc=126
+  #     tar     rc=126  git    rc=126  mysqldump        rc=126
+  #     find    rc=126  curl   rc=126
+  # 'srvctl cron add <domain> --command="echo '\''x'\'' && date +%Y"' unit'i
+  # DOĞRU render ediliyor, ama çalışınca 'Result: exit-code /
+  # ExecMainStatus: 126' veriyordu. Üstelik aynı 8 dakikada kernel'de
+  # 'apparmor.*DENIED' satırı sayısı = 0 ölçüldü: deny SESSİZDİ, operatör
+  # 126'nın sebebini HİÇBİR YERDE göremiyordu.
+  #
+  # KÖK SEBEP (tasarım boşluğu, bir "bug" değil): bu profil DEPLOY akışı
+  # düşünülerek yazılmıştı — php + composer + git zinciri. Ama 'srvctl cron'
+  # alt-komutu KULLANICININ YAZDIĞI SERBEST kabuk komutunu AYNI profil
+  # altında çalıştırıyor (srvctl-cron.service.tpl:118
+  # 'AppArmorProfile=srvctl-{{SAFE_NAME}}-cli' + satır 111
+  # 'ExecStart=<FLOCK_PREFIX>/bin/sh -c <komut>'). FLOCK_PREFIX token'ı
+  # burada BİLEREK süslü parantezsiz yazıldı: BU dosya render EDİLİYOR ve
+  # başka bir şablonun token'ı buraya çift-süslü biçimde yazılırsa
+  # BESLENMEYEN bir yer tutucu olarak çıktıya sızardı (bkz.
+  # lib/domain.sh:_domain_assert_no_leftover_tokens). Meşru bir cron komutu
+  # ('date', 'tar -czf ... ', 'mysqldump ... | gzip > ...') coreutils'e
+  # ihtiyaç duyar; profilde bu ikililer için HİÇBİR kural yoktu →
+  # default-deny → execve EACCES → kabuk 126 ile çıkar. Yani cron özelliği
+  # HER sertleştirilmiş domainde fiilen 'php' + 'sh' dışında hiçbir şey
+  # çalıştıramıyordu.
+  #
+  # ───────────────────────────────────────────────────────────────
+  #  NEDEN 'ix' DOSYA HAPSİNİ ZAYIFLATMAZ (bu bloğun ANA gerekçesi)
+  # ───────────────────────────────────────────────────────────────
+  # 'ix' = INHERIT execute: exec edilen ikili MEVCUT profilin İÇİNDE kalır,
+  # yeni bir profile GEÇMEZ. Yani '/usr/bin/date'e exec izni vermek, date'e
+  # "kendi hakları" vermez — date bu profilin AYNI dosya kuralları altında
+  # çalışır: '{{WEB_ROOT}}/{{DOMAIN}}/**' okur, izinli writable yollara
+  # yazar, BAŞKA bir domain'in dizinine DOKUNAMAZ, '/etc/shadow' okuyamaz,
+  # '/root'a giremez. Tehdit modelinin sınırı "HANGİ İKİLİ çalıştı" değil
+  # "HANGİ DOSYAYA dokunuldu"dur; bu blok DOSYA kurallarının HİÇBİRİNİ
+  # değiştirmez, dolayısıyla domainler-arası izolasyon sınırı AYNEN durur.
+  #
+  # Bunun somut sonucu: 'tar --use-compress-program=...', 'awk system()',
+  # GNU 'sed s///e', 'mysql \!' gibi bu araçların KENDİ komut-çalıştırma
+  # gadget'ları da profil İÇİNDE kalır — açtıkları alt süreç yine yalnızca
+  # bu whitelist'teki ikilileri exec edebilir (default-deny geri kalan HER
+  # ŞEYİ kapatır) ve yine yalnızca bu profilin dosya kurallarını görür. Bu
+  # araçlar "kabuk erişimi" kazandırmaz; zaten '/bin/sh' bu profilde
+  # BAŞTAN BERİ (Symfony/Laravel Process bileşeni için) izinlidir.
+  #
+  # 'ux'/'Ux'/'px'/'Px' KESİNLİKLE KULLANILMAZ (statik kilit:
+  # tests/test_apparmor_cli_cron_exec.sh dedektör 3): bunlar süreci
+  # profilin DIŞINA çıkarır ('ux'/'Ux' = unconfined, 'px'/'Px' = başka bir
+  # profile geçiş) — hapsi ZAYIFLATAN tek şey tam olarak budur. Ek olarak
+  # cron unit'i 'NoNewPrivileges=true' ile çalışır
+  # (srvctl-cron.service.tpl:217); NNP altında çekirdek profil GEÇİŞLERİNİ
+  # zaten reddeder — 'ix' NNP ile uyumlu TEK exec kipidir, yani doğru
+  # seçim hem güvenlik hem işlevsellik açısından aynı yere çıkar.
+  #
+  # NEDEN 'rix', düz 'ix' DEĞİL: Ubuntu'da '/usr/bin/egrep', '/usr/bin/
+  # fgrep', '/usr/bin/gunzip' ve '/usr/bin/zcat' derlenmiş ikili DEĞİL,
+  # '#!/bin/sh' başlıklı sarmalayıcı BETİKtir (ÖLÇÜLDÜ: dördünün de ilk
+  # satırı jammy ve noble'da '#!/bin/sh'). Bir betiği exec etmek için
+  # çekirdek betiğe 'x', yorumlayıcıya 'x' İSTER, ARDINDAN yorumlayıcı
+  # betiği OKUR — 'r' olmadan bu okuma reddedilir ve aynı 126 sınıfı hata
+  # geri gelir. 'r' bir sistem ikilisi için ek saldırı yüzeyi AÇMAZ (bu
+  # dosyalar root:root salt-okunur) ve dosyanın mevcut TÜM exec kuralları
+  # ('/bin/sh rix', '/usr/bin/dash rix', '/usr/bin/flock rix') zaten AYNI
+  # deseni kullanır. 'm' (mmap) BİLİNÇLİ OLARAK VERİLMEZ — bu ikililer
+  # paylaşımlı kütüphane olarak yüklenmiyor, yalnızca exec ediliyor.
+  #
+  # ÇİFT-LTS / SEMBOLİK LİNK NOTLARI (bu proje bu tuzağa DAHA ÖNCE düştü —
+  # bkz. yukarıdaki '/bin/sh' + '/usr/bin/dash' çifti). Aşağıdaki dört
+  # madde VARSAYIM DEĞİL, gerçek jammy + noble kök dosya sistemlerinde
+  # 'readlink -f' ile ÖLÇÜLDÜ (bkz. her maddedeki ölçüm satırı):
+  #   1) usrmerge: HER İKİ LTS'te de '/bin' → 'usr/bin' sembolik linktir
+  #      (ölçüldü: 'readlink /bin' = 'usr/bin', 22.04 ve 24.04). AppArmor
+  #      kararını kernel d_path çözümüne (GERÇEK hedef yola) göre verdiği
+  #      için ASIL eşleşen kural '/usr/bin/...' olanıdır — '/bin/date' tek
+  #      başına yazılsaydı ETKİSİZ kalırdı. Yine de '/bin/...' varyantı da
+  #      yazılır: dosyanın mevcut 'audit deny' listelerindeki (aşağıda)
+  #      AYNI defense-in-depth kararı — merge dışı/legacy bir düzende tek
+  #      dizini eksik bırakmak SESSİZ bir kapsam boşluğu doğurur.
+  #   2) 'awk' bir alternatives sembolik linkidir ('/usr/bin/awk' →
+  #      '/etc/alternatives/awk' → '/usr/bin/mawk' ya da '/usr/bin/gawk';
+  #      ölçüldü: gawk kuruluyken her iki LTS'te de '/usr/bin/gawk',
+  #      Ubuntu minimal'de varsayılan 'mawk'tır). d_path çözümü NİHAİ
+  #      hedefi verdiğinden yalnız 'awk' yazmak İŞE YARAMAZ — üç ad da
+  #      ('awk', 'gawk', 'mawk') listelenir.
+  #   3) DB dump istemcisi: ÖLÇÜM (mariadb-client, varsayılan depolar) HER
+  #      İKİ LTS'te de AYNI yönü verdi — '/usr/bin/mysqldump' →
+  #      '/usr/bin/mariadb-dump' ve '/usr/bin/mysql' → '/usr/bin/mariadb'
+  #      (yani GERÇEK dosya 22.04/MariaDB 10.6'da da 'mariadb-*'). Yani
+  #      YALNIZ 'mysqldump' yazmak HER İKİ LTS'te de ETKİSİZ olurdu; asıl
+  #      gerekli ad 'mariadb-dump'tır. Buna rağmen ESKİ adlar da yazılır:
+  #      MySQL (Oracle) 'mysql-client' paketi kuruluysa '/usr/bin/mysqldump'
+  #      GERÇEK dosyadır ve o durumda 'mariadb-dump' hiç bulunmaz — dört
+  #      adın hepsi ancak birlikte her iki dağıtım kombinasyonunu kapsar.
+  #      (Bu madde önceki turda "yön LTS'e göre TERSİNE döner" diye
+  #      VARSAYILMIŞTI; ölçüm bunu ÇÜRÜTTÜ — dört adı birden yazma kararı
+  #      değişmedi, ama GEREKÇESİ artık ölçüme dayanıyor.)
+  #   4) "Peki neden bunca ismi tek bir '/usr/bin/** rix' ile geçmiyoruz?"
+  #      Çünkü o kural, aşağıdaki 'audit deny' listesindeki (curl, wget,
+  #      nc, socat, python3, perl, bash, base64, gcc, ...) TÜM egress/
+  #      interpreter/gadget araçlarını da açardı ve BUG 1'deki
+  #      'deny her zaman allow'u ezer' tuzağıyla birleşince öngörülemez bir
+  #      profil doğururdu. Adlandırılmış whitelist, bu profilin TEK
+  #      savunulabilir biçimidir.
+  #
+  # DENY POLİTİKASI DEĞİŞMEDİ: aşağıdaki 'audit deny /usr/bin/{bash,curl,
+  # wget,nc,...,find,xargs,env,setsid,nohup,at,crontab} x,' listesine
+  # DOKUNULMADI. Bu blokta o listeyle KESİŞEN TEK BİR AD YOKTUR (statik
+  # kilit: tests/test_apparmor_deny_shadow.sh dedektör 1 + tests/
+  # test_apparmor_cli_cron_exec.sh dedektör 2) — BUG 1'in
+  # 'deny her zaman allow'u ezer' tuzağına TEKRAR düşülmez.
+  #
+  # ÖNEMLİ — MEVCUT DOMAINLER OTOMATİK GÜNCELLENMEZ: bu dosya yalnızca
+  # ŞABLONDUR. Disk üzerindeki '/etc/apparmor.d/srvctl-<sname>-cli' zaten
+  # render EDİLMİŞ domainlerde bu satırları İÇERMEZ; 'srvctl domain repair
+  # <domain>' (profili yeniden render edip 'apparmor_parser -r' ile
+  # yeniden yükler) çalıştırılmadan düzeltme ETKİN OLMAZ — HOST rollout
+  # maddesi (yukarıdaki flock notuyla AYNI).
+
+  # (a) dosya/dizin işlemleri, zaman, kabuk-yardımcıları
+  /usr/bin/{date,cat,mkdir,rm,cp,mv,ls,touch,sleep,mktemp,dirname,basename,realpath,stat,du,df,echo,printf,test,true,false} rix,
+  /bin/{date,cat,mkdir,rm,cp,mv,ls,touch,sleep,mktemp,dirname,basename,realpath,stat,du,df,echo,printf,test,true,false} rix,
+
+  # (b) metin işleme (egrep/fgrep Ubuntu'da '#!/bin/sh' sarmalayıcı BETİK —
+  #     'r' bu yüzden ZORUNLU, bkz. yukarıdaki "NEDEN 'rix'" notu)
+  /usr/bin/{sed,grep,egrep,fgrep,awk,gawk,mawk,sort,head,tail,wc,cut,tr,uniq,tee} rix,
+  /bin/{sed,grep,egrep,fgrep,awk,gawk,mawk,sort,head,tail,wc,cut,tr,uniq,tee} rix,
+
+  # (c) arşiv/sıkıştırma — yedek alan cron'ların çekirdeği
+  #     (gunzip/zcat de sarmalayıcı BETİKtir → 'r' zorunlu)
+  /usr/bin/{tar,gzip,gunzip,zcat,xz,zstd} rix,
+  /bin/{tar,gzip,gunzip,zcat,xz,zstd} rix,
+
+  # (d) '[' (test'in ikinci adı) — DİKKAT, ÖZEL SÖZDİZİMİ:
+  #     AppArmor'da '[' bir KARAKTER SINIFI açar; '/usr/bin/[ rix,' yazmak
+  #     TÜM PROFİLİ parse edilemez hale getirir ("Regex grouping error:
+  #     Unclosed grouping or character class") ve profil HİÇ YÜKLENMEZ —
+  #     yani bir "sertleştirme" denemesi tam kesintiye/MAC'siz çalışmaya
+  #     dönerdi. Literal '[' TEK karakterlik bir sınıf olarak yazılır:
+  #     '[[]'. GERÇEK apparmor_parser ile HER İKİ LTS'te DOĞRULANDI
+  #     (jammy 3.0.4 ve noble 4.0.1 konteynerlerinde 'apparmor_parser -Q'):
+  #     '/usr/bin/[[]' OK, '/usr/bin/[' FAIL, '"/usr/bin/["' (tırnaklı) da
+  #     FAIL. '--dump=rule-exprs' çıktısı anlamı da doğruladı:
+  #     '/usr/bin/[[]  ->  /usr/bin/[\[]' (literal '[' içeren sınıf).
+  #     NOT: pratikte 'test'/'[' dash ve bash'te DAHİLİ komuttur, bu yüzden
+  #     bu satırın tetiklenmesi nadirdir — yine de eksiksizlik ve "aynı
+  #     hatayı bir daha teşhis etmemek" için eklendi.
+  /usr/bin/[[] rix,
+  /bin/[[] rix,
+
+  # (e) DB yedeği — istemci adı SEMBOLİK LİNK zinciriyle çözülür ve gerçek
+  #     hedef kurulu pakete göre değişir ('mariadb-client' → 'mariadb-*',
+  #     Oracle 'mysql-client' → 'mysql*'); bu yüzden dört ad da yazılır
+  #     (ölçüm ve gerekçe: yukarıdaki ÇİFT-LTS notu, madde 3).
+  #     Ağ erişimi bu profilde
+  #     ZATEN açıktı (dosya sonundaki 'network inet stream' — dış API
+  #     çağrıları için); bu satır YENİ bir egress yeteneği AÇMAZ, yalnızca
+  #     yereldeki DB'ye bağlanacak ikilinin exec'ine izin verir.
+  /usr/bin/{mysqldump,mysql,mariadb-dump,mariadb} rix,
+  /bin/{mysqldump,mysql,mariadb-dump,mariadb} rix,
+
   # ─── Deploy kilidi DOSYASI — AYNI HOST BULGUSUNUN İKİNCİ KATMANI ───
   # HOST BULGUSU 2 (koordinatör, aynı Ubuntu 24.04 domain, 'flock' exec
   # düzeltmesinden SONRA ölçüldü): exec artık geçiyor ama flock kendisi
@@ -139,25 +306,33 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # (flock() syscall'ı) 'rw'DEN AYRI bir izindir — yalnız 'r' vermek LOCK_EX
   # için YETMEZDİ (bu oturumda PHP tarafında "Exclusive locks are not
   # supported for this stream" olarak TAM BU sınıf hata zaten görülmüştü).
-  # 'w' + 'r' GNU flock(1)'ün kendi belgelenmiş açma davranışından gelir:
-  # bir dosya YOLU (fd numarası DEĞİL) argüman olarak verildiğinde flock(1)
-  # dosyayı 'O_RDWR|O_CREAT' ile açar (kilit dosyası YOKSA kendisi
-  # oluşturabilsin diye — bu domainin durumunda dosya zaten root tarafından
-  # ÖNCEDEN var edilmiş olsa da açma çağrısı YİNE DE bu bayraklarla yapılır;
-  # AppArmor mediation kararını dosyanın GERÇEKTEN var olup olmadığından
-  # BAĞIMSIZ, açma isteğinin KENDİSİNE göre verir — ölçülen 'denied_mask=
-  # "rc"' bunun R/O_CREAT tarafını yansıtıyor olabilir).
+  # 'r' + O_CREAT'in ('c') gerekliliği flock(1)'ün KAYNAKTAN ÖLÇÜLEN açma
+  # davranışından gelir — util-linux 'sys-utils/flock.c', open_file():
+  #     int fl = *flags == 0 ? O_RDONLY : *flags;
+  #     fl |= O_NOCTTY | O_CREAT;
+  #     fd = open(filename, fl, 0666);
+  # yani bir dosya YOLU (fd numarası DEĞİL) verildiğinde varsayılan açış
+  # 'O_RDONLY | O_CREAT | O_NOCTTY'dir — 'O_RDWR' DEĞİL (bu satırın ESKİ
+  # yorumu 'O_RDWR|O_CREAT' diyordu, YANLIŞTI; Ubuntu 22.04'ün v2.37.2 ve
+  # 24.04'ün v2.39.3 etiketlerinde kod BİREBİR AYNI). 'O_RDWR' YALNIZCA
+  # flock() EIO/EBADF döndüren NFS yolunda ikinci bir deneme olarak
+  # kullanılır. Ölçülen 'denied_mask="rc"' de tam olarak bunu (r + create)
+  # gösteriyordu.
+  #
+  # 'w' bu yüzden STRİKT olarak GEREKLİ DEĞİLDİR; yine de bırakılıyor çünkü
+  # (1) bu profildeki HER flock()-gerektiren yol ZATEN 'rwk,' kullanıyor
+  # (HOST'ta doğrulanmış desen), (2) yukarıdaki NFS geri-çekilme yolu 'w'
+  # ister, (3) 'w' TEK BAŞINA hiçbir yetenek AÇMAZ: kilit dosyasının İÇERİĞİ
+  # anlamsızdır (flock yalnız fd'yi kullanır) ve DİZİN artık domain
+  # kullanıcısına yazılabilir OLMADIĞINDAN dosya SİLİNEMEZ/YERİNE
+  # KONULAMAZ (aşağıdaki "HOST BULGUSU 3 + SAHİPLİK DÜZELTMESİ" notu).
   #
   # DÜRÜSTLÜK NOTU (görev talebi — "ölç, tahmin etme"): bu macOS geliştirme
   # makinesinde GERÇEK bir AppArmor çekirdeği YOK, bu yüzden 'rwk,'nın TAM
-  # OLARAK yeterli/gerekli en dar küme olduğu BURADAN doğrulanamadı — seçim
-  # (1) bu profildeki HER flock()-gerektiren yolun ZATEN kullandığı, HOST'ta
-  # daha önce doğrulanmış 'rwk,' desenine UYMASI ve (2) GNU flock(1)'ün
-  # belgelenmiş 'O_RDWR|O_CREAT' açma davranışına DAYANIYOR — ampirik bir
-  # HOST ölçümü DEĞİL. 'srvctl domain repair <domain>' sonrası GERÇEK
-  # denemede 'rwk,' YETERSİZ ya da FAZLA geniş çıkarsa (ör. yalnız 'r'+'k'
-  # yeterliyse), lütfen tam 'denied_mask' çıktısını paylaşın — bu satır
-  # buna göre daraltılır.
+  # OLARAK yeterli/gerekli en dar küme olduğu BURADAN doğrulanamadı; DAR
+  # olma tarafı (yalnız TEK dosya, glob YOK) doğrulanabilir, GENİŞLİK tarafı
+  # HOST'a bırakılmıştır. 'rwk,' FAZLA geniş çıkarsa (ör. 'rk,' yetiyorsa)
+  # tam 'denied_mask' çıktısıyla daraltılabilir.
   #
   # KAPSAM — TEK domain'in TEK dosyası (görev talebi: "DAR olması önemli"):
   # '{{SAFE_NAME}}' token'ı ile domain'in KENDİ kilit dosyasına SABİTLENİR;
@@ -176,15 +351,28 @@ profile srvctl-{{SAFE_NAME}}-cli flags=(attach_disconnected) {
   # domain cron job'u ise User=web_{{SAFE_NAME}} olarak çalıştığından o
   # dizine AppArmor'dan ÖNCE, saf DAC seviyesinde hiç GİREMİYORDU. Kilit
   # artık domain BAŞINA ayrı bir alt dizinde yaşıyor
-  # ('/run/srvctl/locks/{{SAFE_NAME}}/', 700, sahibi
-  # {{WEB_USER}}:{{WEB_USER}} — bkz. lib/deploy.sh:_deploy_lock_dir /
-  # lib/cron.sh:_cron_lock_dir) — bu satır BİR ALT DİZİN daha ekleyerek
-  # güncellendi; "TEK domain'in TEK dosyası, glob YOK" prensibi AYNEN
-  # KORUNDU. Üst dizinlerin (üst dizin + 'locks/') KENDİSİ için AppArmor
-  # kuralı GEREKMEZ — AppArmor path mediation'ı DOSYANIN TAM YOLUNA göre
-  # çalışır, POSIX dizin 'x' (traverse) izni gibi ARA dizin kuralı İSTEMEZ
-  # (o ayrım saf DAC'ın konusu, üst dizinlerin 711 olması buradan bağımsız
-  # ayrıca sağlanır).
+  # ('/run/srvctl/locks/{{SAFE_NAME}}/' — bkz. lib/deploy.sh:_deploy_lock_dir /
+  # lib/cron.sh:_cron_lock_dir / lib/core.sh:_srvctl_lock_ensure) — bu satır
+  # BİR ALT DİZİN daha ekleyerek güncellendi; "TEK domain'in TEK dosyası,
+  # glob YOK" prensibi AYNEN KORUNDU. Üst dizinlerin (üst dizin + 'locks/' +
+  # domain alt dizini) KENDİSİ için AppArmor kuralı GEREKMEZ — AppArmor path
+  # mediation'ı DOSYANIN TAM YOLUNA göre çalışır, POSIX dizin 'x' (traverse)
+  # izni gibi ARA dizin kuralı İSTEMEZ (o ayrım saf DAC'ın konusu; üst
+  # dizinlerin 711 ve domain alt dizininin 710 root:{{WEB_USER}} olması
+  # buradan bağımsız ayrıca sağlanır).
+  #
+  # ⚠ SAHİPLİK DÜZELTMESİ (KRİTİK — bu satırın izinlerini DEĞİŞTİRMEZ ama
+  # NEDEN hâlâ çalıştığını açıklar): alt dizin ÖNCE '700
+  # {{WEB_USER}}:{{WEB_USER}}' idi; SAHİBİ {{WEB_USER}} olduğu için o
+  # kullanıcı kilit dosyasını UNLINK edip yerine KEYFİ bir hedefe sembolik
+  # bağ koyabiliyordu (canlı Ubuntu 24.04 üretim sunucusunda SÖMÜRÜLDÜ) ve
+  # root olarak çalışan 'srvctl deploy' bunu dereference edip hedefi
+  # chown/chmod/truncate ediyordu. Dizin ARTIK '710 root:{{WEB_USER}}' —
+  # {{WEB_USER}}'da yalnız 'x' (geçiş) var, 'w' YOK: dosya SİLİNEMEZ/YERİNE
+  # KONULAMAZ. Kilit DOSYASI ise '660 root:{{WEB_USER}}' olarak ROOT
+  # tarafından ÖN-OLUŞTURULUR; {{WEB_USER}} grup üzerinden 'rw' ile AÇABİLİR
+  # — yani aşağıdaki 'rwk,' kuralı DAC tarafında karşılığını BULMAYA DEVAM
+  # EDER (bu satırın değişmesine GEREK YOKTUR).
   /run/srvctl/locks/{{SAFE_NAME}}/deploy-{{SAFE_NAME}}.lock rwk,
 
   # ─── Domain ağacı — FPM profiliyle AYNI okuma/yazma yolları ───

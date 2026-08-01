@@ -193,10 +193,21 @@ _aa_shadow_findings() {
     deny_list="$(_aa_extract_deny_x_paths "$profile_text")"
     allow_list="$(_aa_extract_allow_x_paths "$profile_text")"
 
+    # ALLOW tarafı da brace-GENİŞLETİLİR. NEDEN (cron exec yüzeyi turunda
+    # eklendi): profile-cli.tpl'de artık '/usr/bin/{date,cat,...} rix,'
+    # biçiminde adlandırılmış allow LİSTELERİ var. Genişletme YAPILMAZSA
+    # allow tarafı tek bir opak dizge ('/usr/bin/{date,cat,...}') olarak
+    # kalır ve deny globları ona ASLA eşleşmez — yani biri deny
+    # listesindeki bir adı (ör. 'find') yanlışlıkla allow brace listesine
+    # eklerse DEDEKTÖR 1 BUNU KAÇIRIRDI. Genişletme bu sessiz kör noktayı
+    # kapatır (mutasyon testi: fixture 'allow_brace_conflict', aşağıda).
     local -a allow_arr=()
-    local a
+    local a ax
     while IFS= read -r a; do
-        [[ -n "$a" ]] && allow_arr+=("$(_aa_protect_tokens "$a")")
+        [[ -n "$a" ]] || continue
+        while IFS= read -r ax; do
+            [[ -n "$ax" ]] && allow_arr+=("$ax")
+        done <<< "$(_aa_expand_braces "$(_aa_protect_tokens "$a")")"
     done <<< "$allow_list"
 
     local d dp expanded
@@ -384,6 +395,36 @@ out="$(_aa_shadow_findings "$fixture_ok")"
 assert_eq "$out" "" \
     "kontrol grubu: çakışmayan adlandırılmış deny + kalan blanket deny'ler YANLIŞ POZİTİF üretmiyor"
 
+# (c2) MUTASYON — ALLOW tarafı brace listesi: deny politikasındaki bir ad
+#      ('find') yanlışlıkla adlandırılmış allow listesine eklenirse
+#      YAKALANMALI. Bu fixture, allow-tarafı brace genişletmesi EKLENMEDEN
+#      ÖNCE sessizce PASS veriyordu (kör nokta) — cron exec yüzeyi turunda
+#      profile-cli.tpl'e gerçek brace allow listeleri girdiği için artık
+#      GERÇEK bir risk.
+fixture_allow_brace_conflict='
+profile p {
+  /usr/bin/{date,cat,find} rix,
+  audit deny /usr/bin/{curl,find} x,
+}
+'
+out="$(_aa_shadow_findings "$fixture_allow_brace_conflict")"
+assert_contains "$out" "GÖLGELENİYOR" \
+    "mutasyon: adlandırılmış ALLOW listesine sızan deny adı ('find') YAKALANIYOR (allow-tarafı brace genişletmesi)"
+
+# (c3) KONTROL GRUBU — çakışmayan gerçek desen (cron coreutils allow'u +
+#      egress deny listesi) YANLIŞ POZİTİF üretmemeli.
+fixture_allow_brace_ok='
+profile p {
+  /usr/bin/{date,cat,tar} rix,
+  /bin/{date,cat,tar} rix,
+  audit deny /usr/bin/{curl,find,python3*,gcc*,nc.*} x,
+  audit deny /bin/{curl,find,python3*,gcc*,nc.*} x,
+}
+'
+out="$(_aa_shadow_findings "$fixture_allow_brace_ok")"
+assert_eq "$out" "" \
+    "kontrol grubu: cron coreutils allow listesi + egress deny listesi ÇAKIŞMIYOR (yanlış pozitif yok)"
+
 # (d) Exec whitelist kilidi — beklenen kümeyle eşleşiyor mu?
 fixture_whitelist='
 profile p {
@@ -530,10 +571,34 @@ fpm_set="$(_aa_exec_allow_set "$fpm_text")"
 assert_eq "$fpm_set" "/usr/sbin/php-fpm{{PHP_VERSION}}" \
     "profile.tpl: x-izinli TAM yol kümesi yalnızca php-fpm{{PHP_VERSION}}'dan ibaret"
 
-cli_expected="$(printf '%s\n' "/bin/sh" "/usr/bin/dash" "/usr/bin/flock" "/usr/bin/php{{PHP_VERSION}}" | sort | tr '\n' ' ' | sed 's/ *$//')"
+# CLI profilinin x-izinli kural kümesi KURAL YOLU granülerliğinde (brace
+# listeleri BİRER dizge olarak) kilitlenir. Bu, kilidi ZAYIFLATMAZ: dizge
+# BİREBİR karşılaştırıldığından, mevcut bir brace listesine tek bir ad
+# eklemek de yeni bir kural satırı eklemek de bu testi KIRAR.
+#
+# Yeni girenler (cron exec yüzeyi turu — GERÇEK Ubuntu 24.04 üretim
+# ölçümü: 'srvctl cron' komutları 126 ile ölüyordu, çünkü 'date'/'cat'/
+# 'tar'/'mysqldump' için profilde HİÇBİR kural yoktu): egress'SİZ
+# coreutils + DB dump istemcileri, HEPSİ 'rix' (profil DEVRALINIR — exec
+# edilen ikili aynı DOSYA kurallarının içinde kalır, dolayısıyla domain
+# izolasyonu değişmez). Gerekçenin tamamı profile-cli.tpl'deki "CRON
+# KOMUT YÜZEYİ" bloğunda; ikili-bazlı denetim
+# tests/test_apparmor_cli_cron_exec.sh'da.
+_cli_coreutils_a="date,cat,mkdir,rm,cp,mv,ls,touch,sleep,mktemp,dirname,basename,realpath,stat,du,df,echo,printf,test,true,false"
+_cli_coreutils_b="sed,grep,egrep,fgrep,awk,gawk,mawk,sort,head,tail,wc,cut,tr,uniq,tee"
+_cli_coreutils_c="tar,gzip,gunzip,zcat,xz,zstd"
+_cli_db="mysqldump,mysql,mariadb-dump,mariadb"
+cli_expected="$(printf '%s\n' \
+    "/bin/sh" "/usr/bin/dash" "/usr/bin/flock" "/usr/bin/php{{PHP_VERSION}}" \
+    "/usr/bin/{${_cli_coreutils_a}}" "/bin/{${_cli_coreutils_a}}" \
+    "/usr/bin/{${_cli_coreutils_b}}" "/bin/{${_cli_coreutils_b}}" \
+    "/usr/bin/{${_cli_coreutils_c}}" "/bin/{${_cli_coreutils_c}}" \
+    "/usr/bin/[[]" "/bin/[[]" \
+    "/usr/bin/{${_cli_db}}" "/bin/{${_cli_db}}" \
+    | sort | tr '\n' ' ' | sed 's/ *$//')"
 cli_set="$(_aa_exec_allow_set "$cli_text")"
 assert_eq "$cli_set" "$cli_expected" \
-    "profile-cli.tpl: x-izinli TAM yol kümesi yalnızca php{{PHP_VERSION}}/sh/dash/flock'tan ibaret (flock: lib/cron.sh deploy-kilidi — koordinatör HOST bulgusu)"
+    "profile-cli.tpl: x-izinli TAM kural kümesi = php{{PHP_VERSION}}/sh/dash/flock + cron coreutils/DB whitelist'i (başka HİÇBİR x allow'u yok)"
 
 # --- Dedektör 3: düz (audit'siz) exec-only deny invariant'ı ---
 fpm_plain="$(_aa_plain_execonly_deny_findings "profile.tpl" "$fpm_text")"

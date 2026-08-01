@@ -159,7 +159,13 @@ assert_contains "$svc_content" "$expected_execstart" \
 
 timer_content=$(cat "$timer" 2>/dev/null)
 assert_not_contains "$timer_content" "{{" "1) .timer içinde leftover token YOK"
-assert_contains "$timer_content" "OnCalendar=*-*-* 03:00:00 UTC" "1) OnCalendar Türkçe kısayoldan doğru hesaplandı VE 'UTC' eklendi"
+assert_contains "$timer_content" "OnCalendar=*-*-* 03:00:00" "1) OnCalendar Türkçe kısayoldan doğru hesaplandı"
+# ZAMAN DİLİMİ VARSAYILANI DEĞİŞTİ (GERÇEK üretim ölçümü, Europe/Istanbul/+03:
+# 'her gün 04:00' → unit'te '04:00:00 UTC' → systemd 07:00'de ateşliyordu).
+# Artık sonek YOK: systemd soneksiz OnCalendar'ı SİSTEM YEREL saatinde
+# yorumlar — yazdığın saat, çalışan saattir.
+assert_not_contains "$timer_content" "OnCalendar=*-*-* 03:00:00 UTC" \
+    "1) VARSAYILAN: OnCalendar'da ' UTC' soneki YOK (sunucu yerel saati)"
 assert_contains "$timer_content" "RandomizedDelaySec=${CRON_DEFAULT_RANDOMIZED_DELAY}" "1) RandomizedDelaySec varsayılanı uygulandı"
 assert_contains "$timer_content" "Unit=srvctl-cron-${sname}-cache_clear.service" "1) timer doğru .service'e bağlanıyor"
 
@@ -257,8 +263,10 @@ if printf '%s\n' "$sys_content" | grep -Eq '^User='; then user_active="evet"; el
 assert_eq "$user_active" "hayir" "5) sistem cron: AKTİF 'User=' satırı YOK (systemd varsayılanı root)"
 
 sys_timer_content=$(cat "$sys_timer" 2>/dev/null)
-assert_contains "$sys_timer_content" "OnCalendar=*-*-* 02:00:00 UTC" \
+assert_contains "$sys_timer_content" "OnCalendar=*-*-* 02:00:00" \
     "5) sistem cron: standart cron sözdizimi ('0 2 * * *') doğru çevrildi"
+assert_not_contains "$sys_timer_content" "OnCalendar=*-*-* 02:00:00 UTC" \
+    "5) sistem cron da VARSAYILAN olarak sunucu yerel saatinde (' UTC' soneki YOK)"
 
 sys_fail="${SRVCTL_SYSTEMD_DIR}/srvctl-syscronfail-nightly_backup.service"
 assert_eq "$(ex "$sys_fail")" "var" "5) sistem fail-service oluşturuldu"
@@ -295,17 +303,27 @@ assert_contains "$locked_content" "locks/${sname}/deploy-${sname}.lock" \
     "7) kilit dosyası deploy.sh:_deploy_lock İLE AYNI (domain'e özel alt dizinli) yolu kullanıyor"
 
 # DAC/root çelişkisi düzeltmesi (görev): kilit dizin AĞACI GERÇEKTEN
-# oluşturuldu mu ve mod bitleri BEKLENEN (711/711/700) mi? Domain'e özel
+# oluşturuldu mu ve mod bitleri BEKLENEN (711/711/710) mi? Domain'e özel
 # alt dizin cron'un çalıştığı web_<sname> kullanıcısına GİRİLEBİLİR
-# olmalı (700 + doğru sahiplik — sahiplik test_deploy_lock_isolation.sh'ta
-# chown-stub İLE ayrıca doğrulanır), üst dizinler İSE yalnız GEÇİŞE izin
-# vermeli (711).
+# olmalı, üst dizinler İSE yalnız GEÇİŞE izin vermeli (711).
+#
+# ⚠ 700 → 710 (KRİTİK GÜVENLİK DÜZELTMESİ): alt dizin ESKİDEN '700
+# web_<sname>:web_<sname>' idi — SAHİBİ domain kullanıcısı olduğundan o
+# kullanıcı kilit dosyasını UNLINK edip yerine sembolik bağ koyabiliyordu
+# ve root olarak çalışan deploy bunu dereference edip KEYFİ bir dosyayı
+# chown/truncate ediyordu (canlı üretimde SÖMÜRÜLDÜ). Yeni model '710
+# root:web_<sname>': grup 'x' ile GEÇİŞ VAR, 'w' YOK. Sahiplik
+# test_deploy_lock_isolation.sh'ta chown-stub İLE ayrıca doğrulanır.
 assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}" | tail -c 4)" "711" \
     "7) kilit ANA dizini 711 (geçiş serbest, listeleme YOK)"
 assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}/locks" | tail -c 4)" "711" \
     "7) kilit 'locks' ara dizini 711"
-assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}/locks/${sname}" | tail -c 4)" "700" \
-    "7) domain'e ÖZEL kilit alt dizini 700 (yalnız o domain + root)"
+assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}/locks/${sname}" | tail -c 4)" "710" \
+    "7) domain'e ÖZEL kilit alt dizini 710 root:web_<sname> (geçiş VAR, YAZMA YOK — symlink primitifi kapalı)"
+assert_eq "$(test -f "${SRVCTL_LOCK_DIR}/locks/${sname}/deploy-${sname}.lock" && echo VAR || echo YOK)" "VAR" \
+    "7) kilit DOSYASI 'cron add' sırasında ROOT tarafından ÖN-OLUŞTURULDU (flock(1) O_CREAT'ı artık dizinde 'w' olmadığından işe yaramaz)"
+assert_eq "$(_stat_mode "${SRVCTL_LOCK_DIR}/locks/${sname}/deploy-${sname}.lock" | tail -c 4)" "660" \
+    "7) kilit dosyası 660 (grup=web_<sname> okuyabilir — flock(1) O_RDONLY ile açar)"
 assert_contains "$out7" "Deploy kilidi entegrasyonu aktif" \
     "7) flock VARKEN operatöre entegrasyon AÇIKÇA bildiriliyor"
 
@@ -435,7 +453,7 @@ assert_contains "$list_out" "bilinmiyor" "9) 'cron list': systemctl'den okunamay
 show_out=$(_cron_show "$d" cache_clear 2>&1)
 assert_contains "$show_out" "Cache temizligi" "9) 'cron show' açıklamayı GERÇEK unit dosyasından okuyor"
 assert_contains "$show_out" "her gün 03:00" "9) 'cron show' orijinal girilen zamanlamayı sidecar'dan gösteriyor"
-assert_contains "$show_out" "*-*-* 03:00:00 UTC" "9) 'cron show' hesaplanmış OnCalendar'ı gösteriyor"
+assert_contains "$show_out" "OnCalendar       : *-*-* 03:00:00" "9) 'cron show' hesaplanmış OnCalendar'ı gösteriyor"
 assert_contains "$show_out" "telafi edilmez" "9) 'cron show' catch-up-on-boot DAVRANIŞINI (varsayılan: telafi edilmez) AÇIKÇA gösteriyor"
 assert_contains "$show_out" "bilinmiyor" "9) 'cron show': systemctl'den okunamayan canlı alanlar UYDURULMUYOR, 'bilinmiyor' gösteriliyor"
 

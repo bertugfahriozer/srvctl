@@ -38,6 +38,12 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export SRVCTL_RATE_PROFILES="${REPO_ROOT}/conf/rate-profiles.conf"
 export SRVCTL_RESOURCE_PROFILES="${REPO_ROOT}/conf/resource-profiles.conf"
+# Deploy kilit ağacı test tohumu (core.sh:_srvctl_lock_ensure). '_domain_repair'
+# artık kilit dizinini de onarır (KRİTİK güvenlik düzeltmesi —
+# _domain_repair_lock_dir); seam VERİLMEZSE gerçek '/run/srvctl'e dokunmaya
+# çalışır ve macOS'ta (root olmayan) BAŞARISIZ olup repair'i haksız yere
+# 'KISMEN onarıldı' yapardı.
+export SRVCTL_LOCK_DIR="$(mktemp -d)"
 source "${REPO_ROOT}/tests/lib.sh"
 source "${REPO_ROOT}/lib/core.sh"
 SRVCTL_TEMPLATES="${REPO_ROOT}/templates"

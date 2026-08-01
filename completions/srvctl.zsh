@@ -104,6 +104,7 @@ _srvctl() {
                             '--description=:Açıklama'
                             '--timeout=:Azami çalışma süresi (sn)'
                             '--catch-up-on-boot:Kaçan çalışmayı açılışta telafi et'
+                            '--utc:Zamanlamayı UTC'\''ye sabitle (varsayılan: sunucu yerel saati)'
                         )
                         _describe 'cron add seçeneği' cron_add_flags
                     else
