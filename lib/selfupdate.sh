@@ -293,10 +293,16 @@ _selfupdate_backup_current() {
             fi
         fi
     done
-    if [[ -f "${SRVCTL_ROOT}/conf/rate-profiles.conf" ]]; then
-        mkdir -p "${dir}/conf"
-        cp -a "${SRVCTL_ROOT}/conf/rate-profiles.conf" "${dir}/conf/rate-profiles.conf" 2>/dev/null || true
-    fi
+    # İKİ veri dosyası da yedeklenir — resource-profiles.conf eskiden
+    # kapsam DIŞIYDI, yani rollback onu geri getiremiyordu (bkz.
+    # _selfupdate_install_from_staging'deki gerekçe).
+    local pf
+    for pf in rate-profiles.conf resource-profiles.conf; do
+        if [[ -f "${SRVCTL_ROOT}/conf/${pf}" ]]; then
+            mkdir -p "${dir}/conf"
+            cp -a "${SRVCTL_ROOT}/conf/${pf}" "${dir}/conf/${pf}" 2>/dev/null || true
+        fi
+    done
     if [[ -f "$SRVCTL_CURRENT_COMMIT" ]]; then
         cp -a "$SRVCTL_CURRENT_COMMIT" "${dir}/.current-commit" 2>/dev/null || true
     fi
@@ -309,14 +315,47 @@ _selfupdate_backup_current() {
 # VERİ dosyasıdır (kullanıcı ayarı DEĞİL) — install.sh de her kurulumda bunu
 # günceller (bkz. install.sh:170 yorumu); self-update de aynı tutarlılıkla
 # günceller (ESKİ davranışta bu dosya hiç güncellenmiyordu — bkz. rapor).
+# Tek bir dosyayı ATOMİK değiştirir: aynı dizine geçici kopya yazar, sonra
+# 'mv' (rename) ile yerine koyar.
+#
+# 'cp -f' NEDEN KULLANILAMAZ (CANLI SUNUCUDA GÖZLENDİ): cp mevcut inode'u
+# TRUNCATE edip yeniden doldurur — yeni dosya OLUŞTURMAZ. Oysa bash bir
+# script'i baştan sona okuyup tamponlamaz; BYTE OFFSET tutar ve gerektikçe
+# okur. O an ÇALIŞMAKTA OLAN 'bin/srvctl' (ve source edilmiş
+# 'lib/selfupdate.sh'ın KENDİSİ) böyle ezilince bash kalan komutları YENİ
+# içerikten ESKİ offset'ten okur → satır kayması → yarım/anlamsız kod çalışır.
+# Üretimde gözlenen belirti ('srvctl self-update run' çıktısının en sonunda):
+#   /usr/local/bin/srvctl: line 165: plugin_dir: unbound variable
+# Bu, bin/srvctl'e birkaç satır eklendiğinde ORTAYA ÇIKTI — kusur önceden de
+# vardı, kayma yalnızca zararsız bir bölgeye denk geliyordu. SESSİZ olması
+# daha tehlikelidir: kayma bir komutun ortasına denk gelirse ÖNGÖRÜLEMEZ kod
+# çalışır (üstelik güncelleme "başarılı" raporlanır).
+#
+# 'mv' aynı dosya sistemi içinde rename() çağırır: dizin girdisi YENİ inode'a
+# bağlanır, çalışan süreç ESKİ inode'u okumaya devam eder — bozulma OLMAZ.
+# Geçici dosya bu yüzden HEDEFLE AYNI DİZİNDE oluşturulur (farklı dosya
+# sisteminde 'mv' kopyalamaya döner ve atomiklik kaybolur).
+_selfupdate_atomic_install_file() {
+    local src="$1" dst="$2" mode="${3:-}"
+    local tmp="${dst}.srvctl-new.$$"
+    cp -f "$src" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    [[ -n "$mode" ]] && chmod "$mode" "$tmp" 2>/dev/null
+    mv -f "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
 _selfupdate_install_from_staging() {
     local staging="$1"
 
-    cp -f "${staging}/bin/srvctl" "${SRVCTL_ROOT}/bin/srvctl"
-    chmod +x "${SRVCTL_ROOT}/bin/srvctl"
+    # bin/ ve lib/ ATOMİK değiştirilir — ikisi de ŞU AN çalışan/source edilmiş
+    # kod (bkz. _selfupdate_atomic_install_file başlığı).
+    _selfupdate_atomic_install_file "${staging}/bin/srvctl" "${SRVCTL_ROOT}/bin/srvctl" 755
 
-    cp -f "${staging}/lib/"*.sh "${SRVCTL_ROOT}/lib/" 2>/dev/null || true
-    chmod +x "${SRVCTL_ROOT}"/lib/*.sh 2>/dev/null || true
+    local libf
+    for libf in "${staging}/lib/"*.sh; do
+        [[ -f "$libf" ]] || continue
+        _selfupdate_atomic_install_file "$libf" "${SRVCTL_ROOT}/lib/$(basename "$libf")" 755 || true
+    done
 
     if [[ -d "${staging}/templates" ]]; then
         cp -rf "${staging}/templates/"* "${SRVCTL_ROOT}/templates/" 2>/dev/null || true
@@ -326,9 +365,21 @@ _selfupdate_install_from_staging() {
         cp -f "${staging}/completions/"* "${SRVCTL_ROOT}/completions/" 2>/dev/null || true
     fi
 
-    if [[ -f "${staging}/conf/rate-profiles.conf" ]]; then
-        cp -f "${staging}/conf/rate-profiles.conf" "${SRVCTL_ROOT}/conf/rate-profiles.conf" 2>/dev/null || true
-    fi
+    # VERİ dosyaları (kullanıcı ayarı DEĞİL — conf/srvctl.conf'a DOKUNULMAZ).
+    #
+    # resource-profiles.conf ESKİDEN BU LİSTEDE YOKTU: install.sh onu kuruyor,
+    # self-update KURMUYORDU. Yalnız self-update ile yükseltilen bir sunucuda
+    # dosya HİÇ oluşmuyor → resource_profile_line boş dönüyor → HER profil
+    # "bilinmeyen" sayılıyor → '--resources=ecommerce|heavy' ile eklenmiş
+    # domainler SESSİZCE 'standard'a (8 child / 256MB) düşüyordu. Üretimde
+    # gözlenen belirti ('domain repair --all' sırasında, her domain için):
+    #   ⚠ Bilinmeyen kaynak profili: standard — 'standard' kullanılıyor
+    local pf
+    for pf in rate-profiles.conf resource-profiles.conf; do
+        if [[ -f "${staging}/conf/${pf}" ]]; then
+            _selfupdate_atomic_install_file "${staging}/conf/${pf}" "${SRVCTL_ROOT}/conf/${pf}" 644 || true
+        fi
+    done
 }
 
 # Kurulum sonrası duman testi. Herhangi biri başarısız olursa 1 döner —
@@ -394,9 +445,12 @@ _selfupdate_restore_from_backup() {
     chmod +x "${SRVCTL_ROOT}/bin/srvctl" 2>/dev/null || true
     chmod +x "${SRVCTL_ROOT}"/lib/*.sh 2>/dev/null || true
 
-    if [[ -f "${dir}/conf/rate-profiles.conf" ]]; then
-        cp -a "${dir}/conf/rate-profiles.conf" "${SRVCTL_ROOT}/conf/rate-profiles.conf"
-    fi
+    local pf
+    for pf in rate-profiles.conf resource-profiles.conf; do
+        if [[ -f "${dir}/conf/${pf}" ]]; then
+            cp -a "${dir}/conf/${pf}" "${SRVCTL_ROOT}/conf/${pf}"
+        fi
+    done
     if [[ -f "${dir}/.current-commit" ]]; then
         cp -a "${dir}/.current-commit" "$SRVCTL_CURRENT_COMMIT"
     fi
