@@ -21,12 +21,17 @@ _srvctl_completions() {
     # 2. seviye — alt komutlar
     case "${COMP_WORDS[1]}" in
         domain)
-            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources staging migrate rate-limit framework repair worker scheduler"
+            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources reload ini nginx staging migrate rate-limit framework repair worker scheduler"
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$domain_cmds" -- "$cur"))
             elif [[ ${COMP_CWORD} -eq 3 ]]; then
-                # Domain adı tamamlama
+                # Domain adı tamamlama ('reload' ayrıca --all kabul eder)
+                [[ "${COMP_WORDS[2]}" == "reload" ]] && COMPREPLY=($(compgen -W "--all" -- "$cur"))
                 _srvctl_complete_domains
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "reload" ]]; then
+                COMPREPLY=($(compgen -W "--fpm --nginx" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 4 && ( "${COMP_WORDS[2]}" == "ini" || "${COMP_WORDS[2]}" == "nginx" ) ]]; then
+                COMPREPLY=($(compgen -W "--show --file= --force" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "add" ]]; then
                 # 'domain add' bayrak tamamlama (--redis-queue dahil)
                 COMPREPLY=($(compgen -W "--php= --rate= --sensitive= --framework= --resources= --no-ssl --redis-queue" -- "$cur"))

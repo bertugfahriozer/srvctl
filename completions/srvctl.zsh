@@ -50,6 +50,9 @@ _srvctl() {
                         'unsuspend:Bakım modundan çıkar'
                         'php-switch:PHP versiyonu değiştir'
                         'resources:Kaynak limitleri (cgroups)'
+                        'reload:PHP-FPM + nginx reload (doğru unit otomatik bulunur)'
+                        'ini:Domaine özel PHP ayarları (sudo -E)'
+                        'nginx:Domaine özel nginx ayarları (sudo -E)'
                         'staging:Staging ortamı oluştur'
                         'migrate:Sunucular arası taşı'
                         'rate-limit:Rate-limit profili değiştir'
@@ -58,7 +61,23 @@ _srvctl() {
                         'worker:Kuyruk worker yönetimi'
                         'scheduler:Zamanlanmış görev yönetimi'
                     )
-                    if [[ "${words[2]:-}" == "add" && ${#words} -ge 4 ]]; then
+                    if [[ "${words[2]:-}" == "reload" && ${#words} -ge 4 ]]; then
+                        local -a reload_flags
+                        reload_flags=(
+                            '--all:Tüm domainler (hatada durmaz, sonda özetler)'
+                            '--fpm:Yalnız PHP-FPM'
+                            '--nginx:Yalnız nginx'
+                        )
+                        _describe 'domain reload seçeneği' reload_flags
+                    elif [[ ( "${words[2]:-}" == "ini" || "${words[2]:-}" == "nginx" ) && ${#words} -ge 4 ]]; then
+                        local -a conf_flags
+                        conf_flags=(
+                            '--show:İçeriği göster, düzenleme'
+                            '--file=:İçeriği bu dosyadan al (editör açma)'
+                            '--force:İzolasyonu delen ayarı yine de uygula (loglanır)'
+                        )
+                        _describe 'seçenek' conf_flags
+                    elif [[ "${words[2]:-}" == "add" && ${#words} -ge 4 ]]; then
                         local -a add_flags
                         add_flags=(
                             '--php=:PHP versiyonu (ör. 8.3)'
