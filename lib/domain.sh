@@ -4,6 +4,15 @@
 #  Her domain için 12 güvenlik katmanı otomatik
 # ═══════════════════════════════════════════════
 
+# domconf.sh'ı talep üzerine yükler (CLAUDE.md cross-module deseni).
+# _load_and_run yalnız TEK modül source ettiği için, guard'sız bir çağrı
+# çalışma zamanında 'command not found' (exit 127) verirdi.
+_domain_load_conf_lib() {
+    declare -F _domconf_reload >/dev/null 2>&1 && return 0
+    # shellcheck disable=SC1091
+    source "${SRVCTL_ROOT}/lib/domconf.sh" || return 1
+}
+
 cmd_domain() {
     require_root
     case "${1:-help}" in
@@ -16,6 +25,9 @@ cmd_domain() {
         unsuspend) _domain_unsuspend "${@:2}" ;;
         php-switch) _domain_php_switch "${@:2}" ;;
         resources) _domain_resources "${@:2}" ;;
+        reload)    _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_reload "${@:2}" ;;
+        ini)       _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_edit_ini "${@:2}" ;;
+        nginx)     _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_edit_nginx "${@:2}" ;;
         staging)   _domain_staging "${@:2}" ;;
         migrate)    _domain_migrate "${@:2}" ;;
         rate-limit) _domain_rate_limit "${@:2}" ;;
@@ -47,6 +59,21 @@ cmd_domain() {
             echo "    unsuspend <domain>              Bakım modundan çıkar"
             echo "    php-switch <domain> <versiyon>  PHP versiyonu değiştir"
             echo "    resources <domain> [seçenekler] Kaynak limitleri (cgroups v2)"
+            echo "    reload <domain>|--all [--fpm|--nginx]"
+            echo "                                     PHP-FPM + nginx reload. Domainin GERÇEKTEN"
+            echo "                                     kullandığı unit'i kendi bulur (izole FPM'de"
+            echo "                                     'systemctl reload php<ver>-fpm' sessizce hiçbir"
+            echo "                                     şey yapmaz). --all hatada durmaz, sonda özetler."
+            echo "    ini <domain> [--show] [--file <yol>] [--force]"
+            echo "                                     Domaine özel PHP ayarları (/etc/srvctl/php.d/)."
+            echo "                                     Pool'a php_admin_value olarak enjekte edilir;"
+            echo "                                     'repair'/'php-switch' EZMEZ. İzolasyonu delen"
+            echo "                                     anahtarlar --force ister. \$EDITOR için 'sudo -E'."
+            echo "    nginx <domain> [--show] [--file <yol>] [--force]"
+            echo "                                     Domaine özel nginx ayarları"
+            echo "                                     (/etc/nginx/custom.d/<safe_name>/). vhost'a en"
+            echo "                                     sonda include edilir; 'repair' EZMEZ. İzolasyonu"
+            echo "                                     delen direktifler --force ister. 'sudo -E'."
             echo "    staging <domain>                Staging ortamı oluştur"
             echo "    migrate <domain> <user@host>    Sunucular arası taşı"
             echo "    rate-limit <domain> <profil>    Rate-limit profilini değiştir/göster"
@@ -1655,6 +1682,88 @@ _domain_write_vhost() {
     _domain_assert_no_leftover_tokens "${sites}/${domain}.conf"
 }
 
+# ───────────────────────────────────────────────────────────────
+#  Per-domain conf dosyaları — yaşam döngüsü kancaları
+#  (domain add / remove / clone tarafından çağrılır)
+# ───────────────────────────────────────────────────────────────
+
+# İskeletleri oluşturur. MEVCUT dosyanın ÜZERİNE YAZMAZ — operatörün
+# ayarlarını silmek, bu özelliğin çözmeye çalıştığı problemin ta kendisi
+# olurdu (elle yapılan ayarın sessizce kaybolması).
+_domain_provision_conf_skeletons() {
+    local domain="$1"
+    local sname; sname=$(safe_name "$domain")
+    [[ -n "$sname" ]] || return 0
+    _domain_load_conf_lib || { warn "domconf modülü yüklenemedi — conf iskeletleri oluşturulmadı"; return 0; }
+
+    local ini_dir="${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}"
+    local ini="${ini_dir}/${sname}.ini"
+    mkdir -p "$ini_dir"
+    if [[ ! -f "$ini" ]]; then
+        _domconf_ini_skeleton "$domain" > "$ini"
+        chmod 644 "$ini"
+    fi
+
+    local ng_dir="${SRVCTL_NGINX_CUSTOM_DIR:-/etc/nginx/custom.d}/${sname}"
+    local ng="${ng_dir}/00-custom.conf"
+    mkdir -p "$ng_dir"
+    if [[ ! -f "$ng" ]]; then
+        _domconf_nginx_skeleton "$domain" > "$ng"
+        chmod 644 "$ng"
+    fi
+}
+
+# 'domain remove' temizliği. sname BOŞSA hiçbir şey silmez — aksi halde
+# 'rm -rf <dizin>/' kök dizini süpürürdü (bkz. bu kod tabanındaki diğer
+# rm -rf yollarında uygulanan aynı isim doğrulaması).
+_domain_purge_conf_files() {
+    local domain="$1"
+    local sname; sname=$(safe_name "$domain")
+    [[ -n "$sname" ]] || return 0
+    rm -f -- "${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}/${sname}.ini"
+    rm -rf -- "${SRVCTL_NGINX_CUSTOM_DIR:-/etc/nginx/custom.d}/${sname}"
+}
+
+# 'domain clone' kopyalaması — klonun amacı kaynağın davranışını taşımaktır.
+_domain_clone_conf_files() {
+    local src="$1" dst="$2"
+    local s_sname; s_sname=$(safe_name "$src")
+    local d_sname; d_sname=$(safe_name "$dst")
+    [[ -n "$s_sname" && -n "$d_sname" ]] || return 0
+    local ini_dir="${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}"
+    local ng_root="${SRVCTL_NGINX_CUSTOM_DIR:-/etc/nginx/custom.d}"
+
+    mkdir -p "$ini_dir" "${ng_root}/${d_sname}"
+    if [[ -f "${ini_dir}/${s_sname}.ini" ]]; then
+        cp "${ini_dir}/${s_sname}.ini" "${ini_dir}/${d_sname}.ini"
+        chmod 644 "${ini_dir}/${d_sname}.ini"
+    fi
+    if [[ -f "${ng_root}/${s_sname}/00-custom.conf" ]]; then
+        cp "${ng_root}/${s_sname}/00-custom.conf" "${ng_root}/${d_sname}/00-custom.conf"
+        chmod 644 "${ng_root}/${d_sname}/00-custom.conf"
+    fi
+    return 0
+}
+
+# Per-domain .ini override'larını 'php_admin_value[...]' satırlarına çevirir.
+# parse_php_ini_overrides ÇIKTISINI alır (kendisi parse ETMEZ) — çağıran o
+# sonucu şablon satırlarını düşürmek için zaten kullanıyor, iki kez parse
+# etmenin anlamı yok.
+# Boş girdide HİÇBİR ŞEY basmaz (pool çıktısı bugünküyle birebir aynı kalır).
+#
+# Neden hepsi php_admin_value (php_value DEĞİL): bu değerlerin uygulama
+# içinden ini_set() ile değiştirilebilir olması İSTENMİYOR.
+_domain_render_php_overrides() {
+    local parsed="$1" ini_file="$2"
+    [[ -n "$parsed" ]] || return 0
+    printf '\n; ─── per-domain override (%s) ───\n' "$ini_file"
+    local kv
+    while IFS= read -r kv; do
+        [[ -z "$kv" ]] && continue
+        printf 'php_admin_value[%s] = %s\n' "${kv%%=*}" "${kv#*=}"
+    done <<< "$parsed"
+}
+
 # Per-domain FPM config (global+pool) + systemd unit dosyalarını RENDER eder.
 # systemctl ÇAĞIRMAZ (aktivasyon _domain_activate_fpm_unit, [HOST]).
 # Test için SRVCTL_FPM_DIR / SRVCTL_SYSTEMD_DIR override edilebilir.
@@ -1686,8 +1795,21 @@ _domain_render_fpm_unit() {
     # disable_functions gevşetmesi AÇIK beyan ister (bkz. _domain_framework_declared)
     local unit_fw_declared; unit_fw_declared=$(_domain_framework_declared "$domain")
 
+    # ─── Per-domain .ini override'ları (2026-08-03) ───
+    # Kaynak render'ın DIŞINDA (/etc/srvctl/php.d/<sname>.ini), uygulanması
+    # render'ın İÇİNDE — böylece repair/php-switch/harden-fpm gibi pool'u
+    # yeniden üreten HER yol override'ları otomatik yeniden uygular ve elle
+    # yapılmış ayar bir daha SESSİZCE kaybolmaz.
+    local ini_file="${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}/${sname}.ini"
+    local parsed_ini=""
+    if [[ -f "$ini_file" ]]; then
+        parsed_ini=$(parse_php_ini_overrides "$ini_file") \
+            || error "Geçersiz per-domain PHP ini: ${ini_file} — yukarıdaki satırı düzeltin ('srvctl domain ini ${domain}')"
+    fi
+
     # config = [global] + pool (pool.conf.tpl TEK kaynak, kopyalanmaz)
-    {
+    local pool_out
+    pool_out=$( {
         render_template "${SRVCTL_TEMPLATES}/php-fpm/fpm-global.conf.tpl" \
             "DOMAIN=${domain}" "SAFE_NAME=${sname}" "WEB_ROOT=${WEB_ROOT}"
         render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
@@ -1699,6 +1821,29 @@ _domain_render_fpm_unit() {
             "PM_MAX_SPARE_SERVERS=${RES_PM_MAX_SPARE_SERVERS}" \
             "MEMORY_LIMIT=${RES_MEMORY_LIMIT_MB}M" \
             "DISABLE_FUNCTIONS=$(_domain_disable_functions_for "$unit_fw_declared")"
+    } )
+
+    # Override edilen anahtarların ŞABLON satırlarını DÜŞÜR — böylece pool'da
+    # her anahtar TEK KEZ görünür ve php-fpm'in çift tanımda hangi değeri
+    # seçtiğine (BELGELENMEMİŞ davranış) bağımlı kalmayız. Ayrıca üretilen
+    # dosyaya bakan operatör hangi değerin yürürlükte olduğunu tek bakışta görür.
+    #
+    # '.' karakteri grep deseninde 'herhangi bir karakter' demektir —
+    # 'opcache.memory_consumption' gibi anahtarlarda KAÇIRILMALI, aksi halde
+    # desen istenmeyen satırlarla da eşleşir.
+    if [[ -n "$parsed_ini" ]]; then
+        local ov_key ov_esc
+        while IFS= read -r ov_key; do
+            [[ -z "$ov_key" ]] && continue
+            ov_key="${ov_key%%=*}"
+            ov_esc="${ov_key//./\\.}"
+            pool_out=$(grep -v "^php_admin_value\[${ov_esc}\][[:space:]]*=" <<< "$pool_out" || true)
+        done <<< "$parsed_ini"
+    fi
+
+    {
+        printf '%s\n' "$pool_out"
+        _domain_render_php_overrides "$parsed_ini" "$ini_file"
     } > "$fpm_conf"
     _domain_assert_no_leftover_tokens "$fpm_conf"
     render_template "${SRVCTL_TEMPLATES}/systemd/srvctl-fpm.service.tpl" \
@@ -2621,6 +2766,10 @@ _domain_add() {
     # 'harden-fs --apply' bu satırı SESSİZCE atar (bkz. _meta_rewrite_whitelist).
     write_meta "$domain" "RESOURCE_PROFILE" "$resource_profile"
 
+    # Per-domain conf iskeletleri (.ini + nginx custom.d). vhost render'ından
+    # ÖNCE: custom.d dizini böylece ilk render'da zaten yerinde olur.
+    _domain_provision_conf_skeletons "$domain"
+
     _domain_write_vhost "$domain" "$php_version" "$rate_profile" http
 
     ln -sf "/etc/nginx/sites-available/${domain}.conf" \
@@ -3034,6 +3183,13 @@ _domain_purge_resources() {
 
     # 5. Nginx vhost
     rm -f -- "/etc/nginx/sites-enabled/${domain}.conf" "/etc/nginx/sites-available/${domain}.conf"
+
+    # 5.5. Per-domain conf override'ları (.ini + nginx custom.d).
+    #      vhost SİLİNDİKTEN SONRA ama nginx reload'dan ÖNCE — custom.d
+    #      dizini hâlâ include edilirken silinirse arada geçersiz bir an
+    #      oluşmaz (vhost zaten yok).
+    _domain_purge_conf_files "$domain"
+
     nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
 
     # 6. Paylaşılan PHP-FPM pool (harden-fpm hiç uygulanmamış domainler için)
@@ -3580,6 +3736,12 @@ _domain_clone() {
     local dst_base="${WEB_ROOT}/${dst}"
     local dst_web_user="web_${dst_sname}"
     local dst_db="db_${dst_sname}"
+
+    # Per-domain conf override'larını klona taşı — klonun amacı kaynağın
+    # DAVRANIŞINI taşımaktır; memory_limit/client_max_body_size gibi ayarlar
+    # geride kalırsa klon "aynı site" olmaz. _domain_add iskeletleri zaten
+    # oluşturdu; burada kaynağın gerçek içeriğiyle ÜZERİNE yazılıyor.
+    _domain_clone_conf_files "$src" "$dst"
 
     step "2/4" "Dosyalar kopyalanıyor..."
     if [[ -d "${src_base}/public_html" ]]; then

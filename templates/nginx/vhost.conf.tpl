@@ -154,4 +154,15 @@ server {
     # webhook AÇIKÇA kurulmuş domain'lerde büyür. İçerik ve gerekçe için
     # templates/nginx/webhook-location.conf.tpl'e bakın.
     include /etc/nginx/webhook.d/{{SAFE_NAME}}/*.conf;
+
+    # ─── Operatör override'ları (srvctl domain nginx <domain>) ───
+    # EN SONDA include ediliyor ve bu KASITLI: nginx'te regex location'lar
+    # TANIM SIRASINA göre eşleşir, yani yukarıdaki deny kuralları (/\.,
+    # \.(env|git|...)$, spark, composer.json) HER ZAMAN önce değerlendirilir —
+    # buraya eklenen bir regex location onları BYPASS EDEMEZ. Prefix
+    # location'lar en-uzun-eşleşme ile çalıştığından meşru kullanım
+    # (ör. 'location /api/') bu sıralamadan ETKİLENMEZ.
+    # Glob include sıfır eşleşmeyi hatasız kabul eder (webhook.d ile aynı
+    # gerekçe — dizin hiç oluşmamışsa vhost yine geçerlidir).
+    include /etc/nginx/custom.d/{{SAFE_NAME}}/*.conf;
 }

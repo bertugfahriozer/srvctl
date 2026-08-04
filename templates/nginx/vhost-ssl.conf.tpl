@@ -124,4 +124,13 @@ server {
 
     # ─── Webhook auto-deploy (OPT-IN, DALGA 6) — bkz. vhost.conf.tpl yorumu ───
     include /etc/nginx/webhook.d/{{SAFE_NAME}}/*.conf;
+
+    # ─── Operatör override'ları (srvctl domain nginx <domain>) ───
+    # EN SONDA include ediliyor ve bu KASITLI: nginx'te regex location'lar
+    # TANIM SIRASINA göre eşleşir, yani yukarıdaki deny kuralları HER ZAMAN
+    # önce değerlendirilir — buraya eklenen bir regex location onları BYPASS
+    # EDEMEZ. Prefix location'lar en-uzun-eşleşme ile çalıştığından meşru
+    # kullanım (ör. 'location /api/') bu sıralamadan ETKİLENMEZ.
+    # Glob include sıfır eşleşmeyi hatasız kabul eder (webhook.d ile aynı gerekçe).
+    include /etc/nginx/custom.d/{{SAFE_NAME}}/*.conf;
 }

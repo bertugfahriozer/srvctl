@@ -1488,3 +1488,124 @@ write_meta() {
     chmod 644 "$meta_file" 2>/dev/null || true
     chown root:root "$meta_file" 2>/dev/null || true
 }
+
+# ───────────────────────────────────────────────────────────────
+#  Per-domain FPM servis katmanı (paylaşılan kontrat)
+#
+#  HOST BULGUSU (gerçek Laravel deploy'u, Ubuntu 22.04 — lib/deploy.sh'tan
+#  taşındı): izole domainde (DOMAIN_ISOLATED_FPM=true — varsayılan) paylaşılan
+#  php<ver>-fpm servisi havuzsuz kaldığı için BİLEREK durdurulmuş durumdadır;
+#  onu reload/restart etmek başarısız olur. Domain'in GERÇEKTEN kullandığı
+#  unit'i hedeflemek gerekir.
+#
+#  sname/php_version alır, domain ALMAZ: domain alsaydık _derive_php →
+#  read_credentials zinciri tetiklenir, o da DB_PASS/REDIS_PASS gibi global
+#  değişkenleri ezerdi (bkz. read_credentials başlık yorumu, O2 düzeltmesi).
+# ───────────────────────────────────────────────────────────────
+domain_fpm_unit() {
+    local sname="$1" php_version="$2"
+    local iso="srvctl-fpm-${sname}.service"
+    if systemctl list-units --all --plain --no-legend "$iso" 2>/dev/null | grep -q .; then
+        printf '%s\n' "$iso"
+    else
+        printf 'php%s-fpm\n' "$php_version"
+    fi
+}
+
+# reload → başarısızsa restart → her iki durumda da is-active TEYİDİ.
+# PREDİKAT: 0=servis ayakta, 1=değil. Çağıran fail-closed davranmalıdır.
+#
+# is-active teyidi neden şart: lib/init.sh 'opcache.validate_timestamps = 0'
+# set eder. 'systemctl reload' sıfır dönüp servis yine de ölmüşse worker'lar
+# YENİ kodu ASLA görmez ve site SÜRESİZ eski bytecode servis eder — komutun
+# hata vermemesi yeterli kanıt DEĞİLDİR.
+reload_domain_fpm() {
+    local sname="$1" php_version="$2"
+    local unit; unit=$(domain_fpm_unit "$sname" "$php_version")
+
+    if systemctl reload "$unit" 2>/dev/null; then
+        systemctl is-active --quiet "$unit" && return 0
+        warn "${unit} reload sıfır döndü ama servis aktif değil — 'restart' deneniyor..."
+    else
+        warn "${unit} reload başarısız — 'restart' deneniyor..."
+    fi
+
+    if systemctl restart "$unit" 2>/dev/null && systemctl is-active --quiet "$unit"; then
+        warn "${unit} restart ile kurtarıldı — reload'un neden başarısız olduğu araştırılmalı (systemctl status ${unit})"
+        return 0
+    fi
+    return 1
+}
+
+# ───────────────────────────────────────────────────────────────
+#  Per-domain PHP .ini override parse'ı (paylaşılan kontrat)
+#
+#  Neden core.sh: hem lib/domain.sh'ın pool render'ı hem lib/domconf.sh'ın
+#  düzenleme akışı AYNI parse'a ihtiyaç duyuyor. domconf.sh'a koysaydık
+#  domain.sh → domconf.sh yönünde ZORUNLU bir bağımlılık doğardı ve
+#  _load_and_run tek modül source ettiği için exit 127 riski oluşurdu.
+#
+#  Çıktı biçimi: her geçerli satır için 'anahtar=değer' (tek satır).
+#  PREDİKAT: 0=geçerli, 1=sözdizimi hatası (mesaj stderr'e, satır numaralı).
+#
+#  GÜVENLİK: değer, pool config'ine 'php_admin_value[anahtar] = değer'
+#  olarak DOĞRUDAN basılır. Değerde satır sonu karakteri kabul edilirse
+#  'user = root' gibi KEYFİ bir FPM direktifi enjekte edilebilir — 'read -r'
+#  LF'i zaten satır sınırında keser, CR ise BURADA açıkça reddedilir.
+# ───────────────────────────────────────────────────────────────
+parse_php_ini_overrides() {
+    local file="$1"
+    local line key val lineno=0
+    local -a seen=()
+    local s
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        # CRLF dosyalarında SATIR SONU CR'ını kırp (değere sızmasın).
+        # Satır ORTASINDAKİ CR aşağıda ayrıca reddedilir.
+        line="${line%$'\r'}"
+
+        # boş satır / yorum
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*[\;\#] ]] && continue
+
+        if [[ "$line" =~ ^[[:space:]]*\[ ]]; then
+            printf 'satır %d: [section] başlığı desteklenmiyor — pool config'"'"'ine çevrilemez\n' "$lineno" >&2
+            return 1
+        fi
+
+        if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_.]*)[[:space:]]*=(.*)$ ]]; then
+            printf 'satır %d: '"'"'anahtar = değer'"'"' biçiminde değil: %s\n' "$lineno" "$line" >&2
+            return 1
+        fi
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        # baş/son boşluk kırp
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+
+        if [[ -z "$val" ]]; then
+            printf 'satır %d: '"'"'%s'"'"' için değer boş\n' "$lineno" "$key" >&2
+            return 1
+        fi
+        if [[ "$val" == *$'\r'* || "$val" == *$'\n'* ]]; then
+            printf 'satır %d: değer satır sonu karakteri içeremez (config enjeksiyonu koruması)\n' "$lineno" >&2
+            return 1
+        fi
+        if [[ "$val" == *'{{'* ]]; then
+            printf 'satır %d: değer '"'"'{{'"'"' içeremez (şablon token'"'"'ı ile karışır)\n' "$lineno" >&2
+            return 1
+        fi
+
+        for s in ${seen[@]+"${seen[@]}"}; do
+            if [[ "$s" == "$key" ]]; then
+                printf 'satır %d: '"'"'%s'"'"' birden fazla kez tanımlanmış\n' "$lineno" "$key" >&2
+                return 1
+            fi
+        done
+        seen+=("$key")
+
+        printf '%s=%s\n' "$key" "$val"
+    done < "$file"
+    return 0
+}

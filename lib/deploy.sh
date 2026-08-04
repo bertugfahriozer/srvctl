@@ -1195,30 +1195,38 @@ _deploy_link_shared() {
 # kurtarmayı dene; o da başarısızsa fail-closed dur (PHP-FPM muhtemelen
 # çalışmıyordur — sessiz eski-sürüm servisi yerine gürültülü hata tercih
 # edilir).
+# HOST BULGUSU (gerçek Laravel deploy'u, Ubuntu 22.04): bu fonksiyon HER
+# ZAMAN paylaşılan php<ver>-fpm servisini reload ediyordu. İzole domainde
+# (DOMAIN_ISOLATED_FPM=true — varsayılan) o servis havuzsuz kaldığı için
+# BİLEREK durdurulmuş durumdadır; reload da restart da başarısız olur ve
+# deploy, aslında SORUNSUZ tamamlanmış bir switch'ten sonra "PHP-FPM
+# çalışmıyor olabilir" diyerek error ile ölüyordu. Domainin gerçekte
+# kullandığı unit'i reload etmek gerekiyor.
+#
+# NOT (2026-08-03): unit çözümleme ve reload→restart→is-active zinciri
+# lib/core.sh'taki 'domain_fpm_unit' / 'reload_domain_fpm' fonksiyonlarına
+# TAŞINDI — 'srvctl domain reload' komutu da AYNI zinciri kullanıyor, iki
+# kopya sürüklemek istemiyoruz. Buradaki fail-closed 'error' politikası
+# (deploy yarıda kalmasın) KORUNDU; core.sh helper'ı yalnız predikat döndürür.
+# core.sh ayrıca reload sonrası 'is-active' TEYİDİ ekler — eskiden 'systemctl
+# reload' sıfır dönüp servis yine de ölmüşse bu fonksiyon başarı raporluyordu
+# (opcache.validate_timestamps=0 ile: süresiz eski bytecode servisi).
 _deploy_reload_fpm() {
     local php_version="$1" sname="${2:-}"
-    local unit="php${php_version}-fpm"
 
-    # HOST BULGUSU (gerçek Laravel deploy'u, Ubuntu 22.04): bu fonksiyon HER
-    # ZAMAN paylaşılan php<ver>-fpm servisini reload ediyordu. İzole domainde
-    # (DOMAIN_ISOLATED_FPM=true — varsayılan) o servis havuzsuz kaldığı için
-    # BİLEREK durdurulmuş durumdadır; reload da restart da başarısız olur ve
-    # deploy, aslında SORUNSUZ tamamlanmış bir switch'ten sonra "PHP-FPM
-    # çalışmıyor olabilir" diyerek error ile ölüyordu. Domainin gerçekte
-    # kullandığı unit'i reload etmek gerekiyor.
-    if [[ -n "$sname" ]] && systemctl list-units --all --plain --no-legend \
-            "srvctl-fpm-${sname}.service" 2>/dev/null | grep -q .; then
-        unit="srvctl-fpm-${sname}.service"
+    if [[ -z "$sname" ]]; then
+        # sname verilmemiş eski çağrı biçimi: paylaşılan servisi hedefle.
+        local unit="php${php_version}-fpm"
+        systemctl reload "$unit" 2>/dev/null && return 0
+        warn "${unit} reload başarısız — 'restart' deneniyor..."
+        systemctl restart "$unit" 2>/dev/null && return 0
+        error "${unit} restart de başarısız — PHP-FPM ÇALIŞMIYOR OLABİLİR, site 502/503 dönüyor olabilir. Manuel müdahale: systemctl status ${unit} / journalctl -u ${unit}"
     fi
-    if systemctl reload "$unit" 2>/dev/null; then
-        return 0
-    fi
-    warn "${unit} reload başarısız — 'restart' deneniyor..."
-    if systemctl restart "$unit" 2>/dev/null; then
-        warn "${unit} restart ile kurtarıldı — reload'un neden başarısız olduğu araştırılmalı (systemctl status ${unit})"
-        return 0
-    fi
-    error "${unit} restart de başarısız — PHP-FPM ÇALIŞMIYOR OLABİLİR, site 502/503 dönüyor olabilir. Manuel müdahale: systemctl status ${unit} / journalctl -u ${unit}"
+
+    reload_domain_fpm "$sname" "$php_version" && return 0
+
+    local unit; unit=$(domain_fpm_unit "$sname" "$php_version")
+    error "${unit} reload/restart başarısız — PHP-FPM ÇALIŞMIYOR OLABİLİR, site 502/503 dönüyor olabilir. Manuel müdahale: systemctl status ${unit} / journalctl -u ${unit}"
 }
 
 # ───────────────────────────────────────────────────────────────

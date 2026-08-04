@@ -162,6 +162,62 @@ sudo srvctl domain rate-limit <domain> [profil]     # Rate-limit profilini deği
 sudo srvctl domain repair <domain>|--all             # Eksik chroot kütüphanelerini tamir et
 ```
 
+### Per-domain yapılandırma ve reload
+```bash
+sudo srvctl domain reload example.com                # PHP-FPM + nginx reload
+sudo srvctl domain reload example.com --fpm          # yalnız PHP-FPM
+sudo srvctl domain reload --all                      # tüm domainler (nginx bir kez)
+
+sudo -E srvctl domain ini example.com                # domaine özel PHP ayarları
+sudo -E srvctl domain nginx example.com              # domaine özel nginx ayarları
+sudo srvctl domain ini example.com --show            # düzenlemeden içeriği gör
+sudo srvctl domain ini example.com --file ayar.ini   # betikten uygula (editör açmaz)
+```
+
+**`domain reload` neden gerekli:** `DOMAIN_ISOLATED_FPM=true` (varsayılan) olan bir
+kurulumda her domainin kendi `srvctl-fpm-<safe_name>.service` unit'i vardır ve
+paylaşılan `php<ver>-fpm` servisi havuzsuz kaldığı için **bilerek durdurulmuştur**.
+Refleks olarak çalıştırılan `systemctl reload php8.3-fpm` bu yüzden hiçbir şey
+yapmaz — ve hata da vermez. `init` sırasında `opcache.validate_timestamps = 0`
+ayarlandığından, fark edilmeyen bir reload başarısızlığı **süresiz eski bytecode
+servisi** demektir. `domain reload` doğru unit'i kendi bulur, reload başarısız
+olursa `restart` ile kurtarmayı dener ve sonunda `systemctl is-active` ile
+gerçekten ayakta olduğunu teyit eder.
+
+**Override dosyaları nerede:**
+
+| | Yol | Nasıl uygulanır |
+|---|---|---|
+| PHP | `/etc/srvctl/php.d/<safe_name>.ini` | Pool config'ine `php_admin_value[...]` olarak enjekte edilir; aynı isimli şablon satırı düşürülür (her anahtar pool'da tek kez görünür) |
+| nginx | `/etc/nginx/custom.d/<safe_name>/00-custom.conf` | vhost'un `server{}` bloğuna **en sonda** include edilir |
+
+Her ikisi de render'ın **dışındadır**: `domain repair`, `domain php-switch` ve
+`security harden-fpm` bunları **ezmez**, her seferinde yeniden uygular. Bu, elle
+düzenlenen bir ayarın bir sonraki bakım komutunda sessizce kaybolması sorununu
+kapatır.
+
+Kaydettiğinizde srvctl önce sözdizimini (`php-fpm -t` / `nginx -t`), sonra
+izolasyonu delen ayarları tarar. Bir sorun bulunursa değişiklik **uygulanmaz**;
+`.ini` durumunda ondan türetilen pool da eski haline döndürülür ve reload
+yapılmaz. `--force` ile bilerek geçebilirsiniz — o durumda olay `log_action`'a ve
+bildirim kanalına düşer.
+
+> **`sudo -E` notu:** `sudo` varsayılan olarak `env_reset` uygular ve `$EDITOR`'ü
+> temizler. `sudo srvctl domain ini example.com` bu yüzden sizin editörünüzü değil
+> `nano`'yu açar. Kendi editörünüz için `sudo -E srvctl domain ini example.com`
+> çalıştırın.
+
+> **nginx override'ının kısıtı:** Bir include dosyası mevcut direktifleri **ezemez**
+> — nginx çoğu direktifte "is duplicate" hatası verir. Buraya *ekleme* yapılır,
+> *override* değil. (`client_max_body_size` vhost'ta tanımlı olmadığı için serbestçe
+> eklenebilir.) Ayrıca bir `location{}` bloğu içinde `add_header` kullanırsanız o
+> location için üst bloğun **tüm** güvenlik başlıkları sessizce düşer; kullanacaksanız
+> üsttekileri o blokta tekrarlayın.
+
+> **Bu sürümden önce oluşturulmuş domainler:** vhost'larında `custom.d` include
+> satırı yoktur. `domain nginx` bunu fark edip durur ve `srvctl domain repair
+> <domain>` önerir — sessizce etkisiz kalmasındansa açıkça durması tercih edildi.
+
 ### Deploy (zero-downtime)
 ```bash
 sudo srvctl deploy example.com [branch]      # atomic switch + health check
