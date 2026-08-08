@@ -49,7 +49,7 @@ _srvctl() {
                         'suspend:Bakım moduna al'
                         'unsuspend:Bakım modundan çıkar'
                         'php-switch:PHP versiyonu değiştir'
-                        'resources:Kaynak limitleri (cgroups)'
+                        'resources:Kaynak limitleri (cgroups) — --reset ile profile döner'
                         'reload:PHP-FPM + nginx reload (doğru unit otomatik bulunur)'
                         'ini:Domaine özel PHP ayarları (sudo -E)'
                         'nginx:Domaine özel nginx ayarları (sudo -E)'
@@ -70,6 +70,16 @@ _srvctl() {
                             '--nginx:Yalnız nginx'
                         )
                         _describe 'domain reload seçeneği' reload_flags
+                    elif [[ "${words[2]:-}" == "resources" && ${#words} -ge 4 ]]; then
+                        local -a res_flags
+                        res_flags=(
+                            '--memory=:Bellek TAVANI (High/SwapMax ondan türetilir)'
+                            '--cpu=:CPUQuota (ör. 200%)'
+                            '--io=:IOWeight (1-10000)'
+                            '--reset:Bellek üçlüsü + TasksMax profile döner (CPU/IO korunur)'
+                            '--show:Yürürlükteki limitleri göster'
+                        )
+                        _describe 'domain resources seçeneği' res_flags
                     elif [[ "${words[2]:-}" == "open-basedir" && ${#words} -ge 4 ]]; then
                         local -a ob_flags
                         ob_flags=(

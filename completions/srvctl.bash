@@ -33,6 +33,8 @@ _srvctl_completions() {
                 COMPREPLY=($(compgen -W "--fpm --nginx" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "open-basedir" ]]; then
                 COMPREPLY=($(compgen -W "on off --show --all" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "resources" ]]; then
+                COMPREPLY=($(compgen -W "--memory= --cpu= --io= --reset --show" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && ( "${COMP_WORDS[2]}" == "ini" || "${COMP_WORDS[2]}" == "nginx" ) ]]; then
                 COMPREPLY=($(compgen -W "--show --file= --force" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "add" ]]; then

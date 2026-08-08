@@ -59,7 +59,12 @@ cmd_domain() {
             echo "    suspend <domain>                Bakım moduna al"
             echo "    unsuspend <domain>              Bakım modundan çıkar"
             echo "    php-switch <domain> <versiyon>  PHP versiyonu değiştir"
-            echo "    resources <domain> [seçenekler] Kaynak limitleri (cgroups v2)"
+            echo "    resources <domain> [--memory=2G] [--cpu=200%] [--io=100] [--reset] [--show]"
+            echo "                                     Kaynak limitleri (cgroups v2). --memory verilen"
+            echo "                                     değeri TAVAN (MemoryMax) tutar; MemoryHigh ve"
+            echo "                                     MemorySwapMax ondan türetilir (throttle payı"
+            echo "                                     korunur). --reset bellek üçlüsünü + TasksMax'ı"
+            echo "                                     kaynak profiline döndürür (CPU/IO korunur)."
             echo "    reload <domain>|--all [--fpm|--nginx]"
             echo "                                     PHP-FPM + nginx reload. Domainin GERÇEKTEN"
             echo "                                     kullandığı unit'i kendi bulur (izole FPM'de"
@@ -1073,11 +1078,99 @@ SQL
     # (Bulgu 1). Fonksiyon de SIFIRDAN FARKLI döner ki '--all' dalı VE
     # doğrudan tek-domain çağrısı gerçek durumu (ve doğru exit kodunu)
     # yansıtsın.
+    # ─── cgroups slice: eksikse oluştur, bozuksa UYAR ───
+    # Bu adım eskiden HİÇ YOKTU: '_apply_cgroups_slice' yalnız 'domain add'
+    # yolundan çağrılıyordu, dolayısıyla kaynak profili sistemine geçildikten
+    # SONRA mevcut domainler slice'larını ASLA güncellemiyordu. HOST'ta
+    # ölçüldü: profil sisteminden ÖNCE oluşturulmuş bir domain'in slice'ı
+    # aylarca eski sabitlerde (MemoryMax=512M/MemoryHigh=450M/MemorySwapMax=0)
+    # kalmıştı — oysa 'standard' profili 2048M/2304M/256M üretir. 'repair'
+    # adı "onar" derken kaynak limitlerini onarmıyordu.
+    _domain_repair_cgroups_slice "$target" "$sname" || repair_failed=true
+
     if $repair_failed; then
         warn "Domain KISMEN onarıldı — yukarıdaki hata(lar)a bakın: ${target}"
         return 1
     fi
     success "Domain onarıldı: ${target}"
+    return 0
+}
+
+# ───────────────────────────────────────────────────────────────
+#  repair adımı — cgroups slice'ı denetler.
+#
+#  İKİ FARKLI DURUM, İKİ FARKLI DAVRANIŞ:
+#   1) Slice dosyası YOK → gerçek bir EKSİKLİK, profilden sessizce oluşturulur.
+#   2) Slice VAR → ASLA körlemesine ezilmez. Operatör 'domain resources' ile
+#      bilinçli bir ayar yapmış olabilir; onu 'repair'in sessizce geri alması,
+#      bu dosyada başka bir yerde (bkz. _domain_resources alan-koruma yorumu)
+#      zaten bir kez yaşanmış regresyon sınıfıdır.
+#
+#  PEKİ DRIFT NASIL YAKALANIR: "profilden farklı" olmak TEK BAŞINA bulgu
+#  SAYILMAZ — o çoğu zaman operatörün tercihidir ve her repair'de gürültü
+#  üretirdi. Yalnızca OBJEKTİF OLARAK YANLIŞ, hiçbir operatörün bilerek
+#  istemeyeceği üç durum raporlanır:
+#    a) MemorySwapMax=0  → conf/resource-profiles.conf'un kendi notu bunun
+#       iki eşzamanlı ağır istekte OOM-kill ürettiğini HOST'ta doğrulanmış
+#       olarak kaydediyor.
+#    b) MemoryHigh == MemoryMax → kernel'in throttle/reclaim aşaması TAMAMEN
+#       atlanır; süreç yavaşlamadan doğrudan OOM-kill yer.
+#    c) MemoryMax < pool'un teorik tepe talebi (max_children × memory_limit)
+#       → havuz tam dolduğunda cgroup tavanı MATEMATİKSEL OLARAK yetmez.
+#  Üçü de 'srvctl domain resources <domain> --reset' ile tek komutta düzelir.
+#
+#  PREDİKAT: 0 = slice sağlıklı ya da oluşturuldu, 1 = oluşturma başarısız.
+#  Bulgu raporlamak fonksiyonu BAŞARISIZ yapmaz — repair'in exit kodu
+#  "site ayakta mı" sorusunu yanıtlar, "limitler ideal mi" sorusunu değil.
+# ───────────────────────────────────────────────────────────────
+_domain_repair_cgroups_slice() {
+    local domain="$1" sname="$2"
+    local slice_path="${SRVCTL_SYSTEMD_DIR:-/etc/systemd/system}/srvctl-${sname}.slice"
+    local profile; profile=$(_domain_read_resource_profile "$domain")
+
+    if [[ ! -f "$slice_path" ]]; then
+        info "cgroups slice eksik — '${profile}' profilinden oluşturuluyor"
+        # _apply_cgroups_slice içindeki yazmalar '2>/dev/null' ile susturulmuş
+        # olduğundan dönüş değeri TEK BAŞINA kanıt DEĞİL: dosyanın gerçekten
+        # oluştuğunu ayrıca doğrula (fail-closed).
+        _apply_cgroups_slice "$domain" "$sname" "$profile" || true
+        if [[ ! -s "$slice_path" ]]; then
+            warn "cgroups slice oluşturulamadı: ${slice_path}"
+            return 1
+        fi
+        return 0
+    fi
+
+    resource_profile_load "$profile"
+    local cur_high cur_max cur_swap
+    cur_high=$(grep -m1 '^MemoryHigh='    "$slice_path" 2>/dev/null | cut -d= -f2)
+    cur_max=$(grep -m1  '^MemoryMax='     "$slice_path" 2>/dev/null | cut -d= -f2)
+    cur_swap=$(grep -m1 '^MemorySwapMax=' "$slice_path" 2>/dev/null | cut -d= -f2)
+
+    local -a findings=()
+    [[ "$cur_swap" == "0" ]] && \
+        findings+=("MemorySwapMax=0 — eşzamanlı ağır isteklerde OOM-kill riski (profil önerisi: ${RES_MEMORY_SWAP})")
+    [[ -n "$cur_high" && "$cur_high" == "$cur_max" ]] && \
+        findings+=("MemoryHigh == MemoryMax (${cur_max}) — throttle aşaması atlanır, doğrudan OOM-kill")
+
+    # Kapasite: cgroup tavanı, FPM havuzunun teorik tepe talebini karşılıyor mu?
+    # 'infinity' bir tavan değil, sınırsızlıktır — kıyaslama yapılmaz.
+    if [[ -n "$cur_max" && "$cur_max" != "infinity" ]]; then
+        local cur_max_mb
+        if cur_max_mb=$(_domain_mem_to_mb "$cur_max"); then
+            (( cur_max_mb < RES_MEMORY_HIGH_MB )) && \
+                findings+=("MemoryMax=${cur_max} < havuz tepe talebi ${RES_MEMORY_HIGH} (${RES_MAX_CHILDREN} worker × ${RES_MEMORY_LIMIT_MB}M) — havuz dolduğunda tavan yetmez")
+        fi
+    fi
+
+    if (( ${#findings[@]} > 0 )); then
+        warn "cgroups slice'ta düzeltilmesi gereken ayar(lar) — '${domain}' (profil: ${profile}):"
+        local f
+        for f in "${findings[@]}"; do
+            warn "  • ${f}"
+        done
+        warn "  Düzeltmek için: srvctl domain resources ${domain} --reset"
+    fi
     return 0
 }
 
@@ -3668,7 +3761,12 @@ _domain_cgroups_defaults() {
 # ───────────────────────────────────────────────────────────────
 _apply_cgroups_slice() {
     local domain="$1" sname="$2" profile="${3:-standard}"
-    local slice_file="/etc/systemd/system/srvctl-${sname}.slice"
+    # SRVCTL_SYSTEMD_DIR test-seam'i (CLAUDE.md Faz 2 konvansiyonu). Yol
+    # eskiden HARDCODED'dı: komşu render fonksiyonları (_domain_render_fpm_unit,
+    # _domain_resources) seam'i zaten onurlandırdığı için bu tek fonksiyon
+    # macOS/CI'da test edilemiyordu — ve aşağıdaki '2>/dev/null' yüzünden
+    # yazamadığında SESSİZCE "başarılı" görünüyordu.
+    local slice_file="${SRVCTL_SYSTEMD_DIR:-/etc/systemd/system}/srvctl-${sname}.slice"
     local mem_high mem_max mem_swap tasks_max
     read -r mem_high mem_max mem_swap tasks_max <<< "$(_domain_cgroups_defaults "$profile")"
 
@@ -3966,6 +4064,29 @@ _domain_valid_mem_value() {
     [[ "$1" =~ ^[0-9]+[KMGT]?$ ]]
 }
 
+# systemd bellek değerini MB tamsayısına çevirir (stdout).
+# PREDİKAT: 0=çevrildi, 1=çevrilemez ('infinity' ve geçersiz biçim dahil).
+#
+# TUZAK: systemd'de SONEKSİZ değer BAYT'tır, MB DEĞİL — '_domain_valid_mem_value'
+# soneksiz değere izin verdiği için burada da doğru yorumlanmalı, aksi halde
+# 'MemoryMax=2048' (2 KB'lık bir limit) yanlışlıkla 2 GB sanılırdı.
+# Taban 1M: aşağı yuvarlama 0 üretirse cgroup'a '0M' yazmak yerine 1M'ye çekilir.
+_domain_mem_to_mb() {
+    local num unit mb
+    [[ "$1" =~ ^([0-9]+)([KMGT]?)$ ]] || return 1
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        "") mb=$(( num / 1048576 )) ;;
+        K)  mb=$(( num / 1024 )) ;;
+        M)  mb=$num ;;
+        G)  mb=$(( num * 1024 )) ;;
+        T)  mb=$(( num * 1048576 )) ;;
+        *)  return 1 ;;
+    esac
+    (( mb >= 1 )) || mb=1
+    printf '%s' "$mb"
+}
+
 # systemd CPUQuota değeri: tamsayı yüzde, sonunda '%' zorunlu (örn. 50%, 150%).
 _domain_valid_cpu_value() {
     [[ "$1" =~ ^[0-9]+%$ ]]
@@ -3985,7 +4106,7 @@ _domain_resources() {
     # olduğunda fonksiyon root olmayan ortamda hiçbir şey yazmadan sessizce
     # "başarılı" dönüyordu — alan-koruma regresyonu test edilemez hale geliyordu.
     local slice_path="${SRVCTL_SYSTEMD_DIR:-/etc/systemd/system}/${slice}"
-    local mem="" cpu="" io="" show=0
+    local mem="" cpu="" io="" show=0 reset=0
 
     for arg in "$@"; do
         case "$arg" in
@@ -3993,6 +4114,7 @@ _domain_resources() {
             --cpu=*)    cpu="${arg#--cpu=}" ;;
             --io=*)     io="${arg#--io=}" ;;
             --show)     show=1 ;;
+            --reset)    reset=1 ;;
             *) warn "Bilinmeyen seçenek: ${arg}" ;;
         esac
     done
@@ -4000,7 +4122,13 @@ _domain_resources() {
     if [[ "$show" == "1" ]]; then
         header "Kaynak Durumu: ${domain}"
         if systemctl show "$slice" >/dev/null 2>&1; then
-            systemctl show "$slice" -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax -p MemoryCurrent 2>/dev/null | sed 's/^/  /'
+            # MemoryHigh ve MemorySwapMax da GÖSTERİLİR: ikisi de sessiz OOM
+            # kaynağıdır (High==Max → throttle aşaması atlanır; SwapMax=0 →
+            # eşzamanlı ağır isteklerde kill). Yalnız MemoryMax'a bakan operatör
+            # slice'ın sağlıklı olduğunu sanabilirdi.
+            systemctl show "$slice" \
+                -p MemoryMax -p MemoryHigh -p MemorySwapMax \
+                -p CPUQuotaPerSecUSec -p TasksMax -p MemoryCurrent 2>/dev/null | sed 's/^/  /'
         else
             echo "  (Henüz kaynak limiti tanımlı değil)"
         fi
@@ -4008,7 +4136,8 @@ _domain_resources() {
         return
     fi
 
-    [[ -z "$mem$cpu$io" ]] && error "En az bir limit verin: --memory=512M / --cpu=50% / --io=100"
+    [[ -z "$mem$cpu$io" && "$reset" != "1" ]] && \
+        error "En az bir limit verin: --memory=512M / --cpu=50% / --io=100 / --reset"
 
     # ─── Doğrulama — unit dosyasına yazılmadan ÖNCE ───
     # systemd'nin anlamadığı bir değer TÜM slice'ı reddedebilir (bkz.
@@ -4042,17 +4171,68 @@ _domain_resources() {
     cur_cpu=$(grep -m1      '^CPUQuota='      "$slice_path" 2>/dev/null | cut -d= -f2)
     cur_io=$(grep -m1       '^IOWeight='      "$slice_path" 2>/dev/null | cut -d= -f2)
 
-    local mem_max mem_high
+    # ─── --reset: bellek üçlüsü + TasksMax'ı PROFİLE geri döndürür ───
+    # Mevcut dosyayı otorite sayan alan-koruma mantığının kaçınılmaz yan etkisi
+    # şuydu: eski bir sürümden kalma YANLIŞ bir değer (ör. MemorySwapMax=0)
+    # sonsuza kadar "korunuyordu" — hiçbir komut onu profile geri getiremiyordu.
+    # 'domain repair' bu tür bozuklukları artık raporluyor ve düzeltme yolu
+    # olarak burayı gösteriyor.
+    # CPUQuota ve IOWeight BİLİNÇLİ OLARAK sıfırlanmaz: ikisi de
+    # conf/resource-profiles.conf'ta YOKTUR (profil sözleşmesi 5 alan:
+    # pm_mode/max_children/memory_limit_mb/tasks_max), yani "profil değeri"
+    # diye dönülecek bir kaynakları yok — operatör tercihi olarak korunurlar.
+    # Aynı komutta verilen açık bayraklar (--memory/--cpu/--io) reset'in
+    # ÜSTÜNE yazar; sıra bu yüzden önemlidir.
+    if [[ "$reset" == "1" ]]; then
+        cur_mem_high="$mem_high_def"
+        cur_mem_max="$mem_max_def"
+        cur_swap="$mem_swap_def"
+        cur_tasks="$tasks_def"
+        info "Kaynak limitleri '${resources_profile}' profiline döndürülüyor (CPU/IO korunur)"
+    fi
+
+    # ─── Manuel --memory override: High/Max AYRIMI KORUNUR ───
+    # ESKİ DAVRANIŞ (BUG): Max ve High AYNI değere ayarlanıyor, MemorySwapMax ise
+    # dosyadaki eski değeriyle bırakılıyordu. İkisi de sessiz bir OOM tuzağıydı:
+    #  - MemoryHigh == MemoryMax olduğunda kernel'in throttle/reclaim AŞAMASI
+    #    TAMAMEN ATLANIR. MemoryHigh "yavaşlat ve geri kazan" eşiği, MemoryMax
+    #    "hard kill" eşiğidir; eşitlenirse süreç yavaşlamadan doğrudan OOM-kill
+    #    yer. conf/resource-profiles.conf'un %12,5'lik payı tam bunun içindir ve
+    #    profil yolunda uygulanıyordu — kullanılabilirlik komutu onu geri alıyordu.
+    #  - MemorySwapMax dosyadan korunduğu için, eski sürümlerde '0' yazılmış bir
+    #    slice'ta '0' SONSUZA KADAR kalıyordu. O dosyanın kendi yorumu
+    #    (conf/resource-profiles.conf) MemorySwapMax=0 iken iki eşzamanlı ağır
+    #    isteğin OOM-kill ürettiğini HOST'ta doğrulanmış olarak not ediyor.
+    #
+    # YENİ DAVRANIŞ: verilen değer TAVAN (MemoryMax) olarak KORUNUR — operatör
+    # "512M'yi geçme" dediğinde tavanın sessizce 576M'ye çıkması sürpriz olurdu.
+    # High ve Swap bu tavandan TÜRETİLİR (profil formülünün tersten uygulanması;
+    # sonuç aynı oran: High ≈ Max×8/9, yani Max ≈ High×9/8 ve Swap = High/8).
+    # 'infinity' özel değerdir: türetme yapılmaz, mevcut swap korunur.
+    local mem_max mem_high mem_swap
     if [[ -n "$mem" ]]; then
-        # Manuel --memory override: ESKİ davranışla uyumlu — Max ve High AYNI
-        # değere ayarlanır (yüksek/tepe ayrımı manuel override'da korunmaz).
-        mem_max="$mem"
-        mem_high="$mem"
+        if [[ "$mem" == "infinity" ]]; then
+            mem_max="infinity"
+            mem_high="infinity"
+            mem_swap="${cur_swap:-$mem_swap_def}"
+        else
+            local mem_mb high_mb swap_mb
+            mem_mb=$(_domain_mem_to_mb "$mem") \
+                || error "--memory değeri MB'a çevrilemedi: ${mem}"
+            high_mb=$(( mem_mb * 8 / 9 )); (( high_mb >= 1 )) || high_mb=1
+            swap_mb=$(( high_mb / 8 ));    (( swap_mb >= 1 )) || swap_mb=1
+            # MemoryMax operatörün YAZDIĞI biçimde kalır ('1G' → '1G', '1024M'
+            # değil): systemd için eşdeğer olsa da dosyaya bakan insan kendi
+            # yazdığı değeri görmeli. Türetilenler MB olarak basılır.
+            mem_max="$mem"
+            mem_high="${high_mb}M"
+            mem_swap="${swap_mb}M"
+        fi
     else
         mem_max="${cur_mem_max:-$mem_max_def}"
         mem_high="${cur_mem_high:-$mem_high_def}"
+        mem_swap="${cur_swap:-$mem_swap_def}"
     fi
-    local mem_swap="${cur_swap:-$mem_swap_def}"
     local tasks="${cur_tasks:-$tasks_def}"
     local cpu_q="${cpu:-${cur_cpu:-100%}}"
     local io_weight="${io:-${cur_io:-100}}"
@@ -4074,10 +4254,18 @@ _domain_resources() {
     systemctl daemon-reload
     systemctl start "$slice" 2>/dev/null || true
 
-    [[ -n "$mem" ]] && success "Bellek limiti: ${mem}"
+    # Türetilen değerler AÇIKÇA yazdırılır: operatör yalnız '--memory=2048M'
+    # yazdı ama slice'a üç ayrı anahtar gitti — hangi eşiklerin yürürlüğe
+    # girdiğini 'systemctl show' çalıştırmadan görebilmeli.
+    if [[ -n "$mem" || "$reset" == "1" ]]; then
+        success "Bellek limiti: Max=${mem_max}  High=${mem_high}  SwapMax=${mem_swap}"
+        [[ -n "$mem" && "$mem" != "infinity" ]] && \
+            info "  (High ve SwapMax --memory tavanından türetildi — throttle payı korunur)"
+        [[ "$reset" == "1" ]] && success "TasksMax:      ${tasks}"
+    fi
     [[ -n "$cpu" ]] && success "CPU limiti:    ${cpu}"
     [[ -n "$io"  ]] && success "IO ağırlığı:   ${io}"
-    log_action "DOMAIN RESOURCES: ${domain} (mem=${mem} cpu=${cpu} io=${io})"
+    log_action "DOMAIN RESOURCES: ${domain} (mem=${mem} max=${mem_max} high=${mem_high} swap=${mem_swap} cpu=${cpu} io=${io})"
 }
 
 # ───────────────────────────────────────────────────────────────

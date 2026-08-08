@@ -74,6 +74,22 @@ assert_fail _domain_valid_cpu_value "50"
 assert_fail _domain_valid_cpu_value "-50%"
 assert_fail _domain_valid_cpu_value "abc"
 
+# ═══ _domain_mem_to_mb — birim dönüşümü (systemd'de SONEKSİZ = BAYT tuzağı) ═══
+assert_eq "$(_domain_mem_to_mb 512M)"    "512"     "512M → 512 MB"
+assert_eq "$(_domain_mem_to_mb 1G)"      "1024"    "1G → 1024 MB"
+assert_eq "$(_domain_mem_to_mb 2G)"      "2048"    "2G → 2048 MB"
+assert_eq "$(_domain_mem_to_mb 1T)"      "1048576" "1T → 1048576 MB"
+assert_eq "$(_domain_mem_to_mb 1048576K)" "1024"   "1048576K → 1024 MB"
+# KRİTİK: soneksiz değer systemd'de BAYT'tır. '2048' 2 GB DEĞİL 2 KB'dır;
+# MB sanılsaydı slice'a bin kat yanlış bir limit yazılırdı. Taban 1M devreye girer.
+assert_eq "$(_domain_mem_to_mb 2048)"    "1"       "soneksiz 2048 = 2048 BAYT → taban 1M"
+assert_eq "$(_domain_mem_to_mb 1073741824)" "1024" "soneksiz 1073741824 bayt → 1024 MB"
+# NOT: assert_ok/assert_fail mesaj parametresi ALMAZ — tüm argümanlar komuta
+# geçer. Bu yüzden bu üç satırda açıklama yorum olarak duruyor:
+assert_fail _domain_mem_to_mb "infinity"    # 'infinity' çevrilemez (çağıran özel ele alır)
+assert_fail _domain_mem_to_mb "abc"         # geçersiz biçim reddedilir
+assert_fail _domain_mem_to_mb "512X"        # bilinmeyen sonek reddedilir
+
 # ═══════════════ Enjeksiyon/sınır girdileri _domain_resources seviyesinde reddediliyor ═══════════════
 # Bu blok slice_path'e HİÇ ULAŞMAZ (validation write'lardan önce) — hardcoded
 # path sorunundan BAĞIMSIZ, güvenle ve anlamlı biçimde test edilebilir.
@@ -112,17 +128,26 @@ if [[ -f "$seam_slice" ]]; then
     assert_contains "$conf1" "CPUQuota=50%"      "ilk çağrı: cpu uygulandı"
     assert_contains "$conf1" "IOWeight=150"      "ilk çağrı: io uygulandı"
     assert_contains "$conf1" "TasksMax=120"      "ilk çağrı: varsayılan (standard profili) TasksMax dolduruldu"
-    assert_contains "$conf1" "MemorySwapMax=256M" "ilk çağrı: varsayılan (standard profili) MemorySwapMax dolduruldu"
+    # DAVRANIŞ DEĞİŞİKLİĞİ (bilinçli): --memory verildiğinde MemoryHigh ve
+    # MemorySwapMax artık dosyadaki/profildeki değerden DEĞİL, verilen TAVANDAN
+    # türetilir — High=Max×8/9, Swap=High/8. Eski davranışta High, Max'a EŞİTLENİYOR
+    # (throttle aşaması atlanıyor → doğrudan OOM-kill) ve Swap dosyadaki eski
+    # değeriyle (eski slice'larda '0') SONSUZA KADAR kalıyordu.
+    # 512M → High=512×8/9=455M, Swap=455/8=56M
+    assert_contains "$conf1" "MemoryHigh=455M"   "ilk çağrı: High tavandan türetildi (Max'a EŞİT DEĞİL)"
+    assert_contains "$conf1" "MemorySwapMax=56M" "ilk çağrı: SwapMax High'tan türetildi (0 DEĞİL)"
 
     # 2) İkinci çağrı: SADECE memory değiştirilir. cpu/io/tasks/swap KORUNMALI
     #    (regresyon: eski kod bunları burada sessizce silerdi).
     SRVCTL_SYSTEMD_DIR="$p_dir" _run_isolated _domain_resources "$d2" --memory=1G >/dev/null 2>&1
     conf2=$(cat "$sl")
-    assert_contains "$conf2" "MemoryMax=1G"       "ikinci çağrı: yalnız memory güncellendi"
+    assert_contains "$conf2" "MemoryMax=1G"       "ikinci çağrı: yalnız memory güncellendi (yazılan biçim korunur)"
     assert_contains "$conf2" "CPUQuota=50%"       "ikinci çağrı: ÖNCEKİ cpu KORUNDU"
     assert_contains "$conf2" "IOWeight=150"       "ikinci çağrı: ÖNCEKİ io KORUNDU"
     assert_contains "$conf2" "TasksMax=120"       "ikinci çağrı: TasksMax KORUNDU"
-    assert_contains "$conf2" "MemorySwapMax=256M" "ikinci çağrı: MemorySwapMax KORUNDU"
+    # 1G = 1024M → High=1024×8/9=910M, Swap=910/8=113M (yeni tavandan yeniden türetilir)
+    assert_contains "$conf2" "MemoryHigh=910M"    "ikinci çağrı: High YENİ tavandan türetildi"
+    assert_contains "$conf2" "MemorySwapMax=113M" "ikinci çağrı: SwapMax YENİ tavandan türetildi"
 
     # 3) Üçüncü çağrı: SADECE io değiştirilir. memory/cpu KORUNMALI.
     SRVCTL_SYSTEMD_DIR="$p_dir" _run_isolated _domain_resources "$d2" --io=300 >/dev/null 2>&1
@@ -130,6 +155,9 @@ if [[ -f "$seam_slice" ]]; then
     assert_contains "$conf3" "IOWeight=300"  "üçüncü çağrı: yalnız io güncellendi"
     assert_contains "$conf3" "MemoryMax=1G"  "üçüncü çağrı: ÖNCEKİ memory KORUNDU"
     assert_contains "$conf3" "CPUQuota=50%"  "üçüncü çağrı: ÖNCEKİ cpu KORUNDU"
+    # --memory VERİLMEDİĞİNDE türetme YAPILMAZ; alan-koruma mantığı aynen sürer.
+    assert_contains "$conf3" "MemoryHigh=910M"    "üçüncü çağrı: ÖNCEKİ High KORUNDU (yeniden türetilmedi)"
+    assert_contains "$conf3" "MemorySwapMax=113M" "üçüncü çağrı: ÖNCEKİ SwapMax KORUNDU"
 
     rm -rf "$p_dir"
 else

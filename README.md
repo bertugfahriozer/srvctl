@@ -151,6 +151,7 @@ sudo srvctl domain suspend example.com               # bakım modu (503 + sayfa)
 sudo srvctl domain unsuspend example.com
 sudo srvctl domain php-switch example.com 8.2        # PHP sürümü değiştir
 sudo srvctl domain resources example.com --memory=512M --cpu=50% --io=100
+sudo srvctl domain resources example.com --reset      # kaynak profiline döndür
 sudo srvctl domain resources example.com --show
 sudo srvctl domain staging example.com               # staging.example.com klonu
 sudo srvctl domain migrate example.com user@host [--auto]
@@ -161,6 +162,46 @@ sudo srvctl domain scheduler <domain> <start|stop|status|enable|disable>
 sudo srvctl domain rate-limit <domain> [profil]     # Rate-limit profilini değiştir/göster
 sudo srvctl domain repair <domain>|--all             # Eksik chroot kütüphanelerini tamir et
 ```
+
+**Bellek eşikleri — `--memory` ne yapar:** verdiğiniz değer **tavan** (`MemoryMax`)
+olarak kalır; `MemoryHigh` ve `MemorySwapMax` ondan türetilir (`High ≈ Max×8/9`,
+`Swap = High/8`). Bu ayrım kritiktir: `MemoryHigh` kernel'in *yavaşlat ve geri
+kazan* eşiği, `MemoryMax` ise *hard kill* eşiğidir. İkisi eşitlenirse throttle
+aşaması tamamen atlanır ve süreç yavaşlamadan doğrudan OOM-kill yer. Daha önce
+`--memory` ikisini eşitliyor, `MemorySwapMax`'ı ise dosyadaki eski değeriyle
+(eski slice'larda `0`) bırakıyordu — ikisi de sessiz OOM kaynağıydı.
+
+**`--reset` ne zaman gerekir:** `domain resources` mevcut slice dosyasını otorite
+sayar (operatörün bilinçli ayarını korumak için). Bunun yan etkisi, eski bir
+sürümden kalma **yanlış** bir değerin sonsuza kadar "korunmasıydı" — hiçbir komut
+onu profile geri getiremiyordu. `--reset` bellek üçlüsünü ve `TasksMax`'ı kaynak
+profiline döndürür; `CPUQuota` ile `IOWeight` **korunur** (ikisi
+`conf/resource-profiles.conf` sözleşmesinde yoktur, dönülecek bir profil değerleri
+yok). Aynı komutta verilen açık bayraklar reset'in üstüne yazar:
+`--reset --cpu=200%` geçerlidir.
+
+**`domain repair` artık cgroups slice'ı da denetler.** Daha önce
+`_apply_cgroups_slice` yalnızca `domain add` yolundan çağrılıyordu; kaynak profili
+sistemine geçildikten sonra mevcut domainlerin slice'ları hiç güncellenmiyordu.
+Repair şimdi:
+
+- slice dosyası **yoksa** profilden oluşturur (gerçek eksiklik → sessizce onarılır),
+- slice **varsa** onu asla körlemesine ezmez — operatörün bilinçli ayarını geri
+  almak, bu kod tabanında bir kez yaşanmış regresyon sınıfıdır.
+
+"Profilden farklı olmak" tek başına bulgu sayılmaz (çoğu zaman operatör tercihidir
+ve her repair'de gürültü üretirdi). Yalnızca **objektif olarak yanlış**, hiçbir
+operatörün bilerek istemeyeceği üç durum raporlanır:
+
+| Bulgu | Neden yanlış |
+|---|---|
+| `MemorySwapMax=0` | Eşzamanlı ağır isteklerde OOM-kill — `conf/resource-profiles.conf` bunu host'ta doğrulanmış olarak not ediyor |
+| `MemoryHigh == MemoryMax` | Throttle/reclaim aşaması atlanır, doğrudan hard kill |
+| `MemoryMax < max_children × memory_limit` | Havuz tam dolduğunda tavan matematiksel olarak yetmez |
+
+Üçü de `srvctl domain resources <domain> --reset` ile tek komutta düzelir. Bulgu
+raporlanması repair'i **başarısız saymaz**: repair'in çıkış kodu "site ayakta mı"
+sorusunu yanıtlar, "limitler ideal mi" sorusunu değil.
 
 ### Per-domain yapılandırma ve reload
 ```bash
