@@ -28,6 +28,7 @@ cmd_domain() {
         reload)    _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_reload "${@:2}" ;;
         ini)       _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_edit_ini "${@:2}" ;;
         nginx)     _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_edit_nginx "${@:2}" ;;
+        open-basedir) _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_open_basedir "${@:2}" ;;
         staging)   _domain_staging "${@:2}" ;;
         migrate)    _domain_migrate "${@:2}" ;;
         rate-limit) _domain_rate_limit "${@:2}" ;;
@@ -69,6 +70,13 @@ cmd_domain() {
             echo "                                     Pool'a php_admin_value olarak enjekte edilir;"
             echo "                                     'repair'/'php-switch' EZMEZ. İzolasyonu delen"
             echo "                                     anahtarlar --force ister. \$EDITOR için 'sudo -E'."
+            echo "    open-basedir <domain>|--all <on|off> [--show]"
+            echo "                                     open_basedir'i AÇ/KAPAT. 'off' ayarı gevşetmez,"
+            echo "                                     TAMAMEN kaldırır; sınır chroot'a kalır. Kazanç:"
+            echo "                                     open_basedir set iken PHP realpath cache'i"
+            echo "                                     kapatır (ölçüm: CI4 bootstrap 1.28s → 0.032s)."
+            echo "                                     Varsayılan DEĞİŞMEZ; .ini'de saklanır, 'repair'"
+            echo "                                     ve 'php-switch' EZMEZ. --show durumu listeler."
             echo "    nginx <domain> [--show] [--file <yol>] [--force]"
             echo "                                     Domaine özel nginx ayarları"
             echo "                                     (/etc/nginx/custom.d/<safe_name>/). vhost'a en"
@@ -1753,15 +1761,44 @@ _domain_clone_conf_files() {
 #
 # Neden hepsi php_admin_value (php_value DEĞİL): bu değerlerin uygulama
 # içinden ini_set() ile değiştirilebilir olması İSTENMİYOR.
+#
+# ─── 'open_basedir = off' ÖZEL DEĞERİ (KALDIRMA EMRİ, DEĞER DEĞİL) ───
+# Bu tek anahtar için 'off' bir php.ini değeri olarak BASILMAZ, çünkü PHP'de
+# open_basedir'i kapatmanın yolu ayarı HİÇ SET ETMEMEKTİR: boş olmayan HERHANGİ
+# bir değer (literal 'off' ya da '/' dahil) ayarı "set edilmiş" sayar. Dahası
+# 'off' literal olarak basılsaydı PHP onu 'off' ADLI GÖRECELİ BİR DİZİN sanıp
+# tüm dosya erişimini kırardı.
+# Çağıran (_domain_render_fpm_unit) şablondaki 'php_admin_value[open_basedir]'
+# satırını override edilen her anahtar için ZATEN düşürdüğünden, burada hiçbir
+# şey basmamak ayarı pool'dan TAMAMEN kaldırır — istenen sonuç tam olarak budur.
+#
+# NEDEN İSTENİR (ölçüm): open_basedir set edildiğinde PHP realpath cache'i
+# devre dışı bırakır; her dosya erişimi baştan tam yol çözümlemesi öder. Üretim
+# ölçümünde (Ubuntu, PHP 8.3, chroot'lu pool) 58 dosyalık bir filemtime
+# döngüsü 48.95ms → 3.29ms (dosya başına 0.84ms → 0.057ms) ve CI4 bootstrap
+# 1.28s → 0.032s oldu. Güvenlik ödünü DAR: pool zaten 'chroot = WEB_ROOT/DOMAIN'
+# ile çalışıyor ve chroot open_basedir'den DAHA GÜÇLÜ bir sınırdır; şablondaki
+# open_basedir listesi de chroot içindeki dizinlerin neredeyse tamamını
+# kapsıyordu (dışarıda kalan yalnızca /logs/ ve /etc/). Yine de VARSAYILAN
+# DEĞİŞMEDİ — bu yalnızca operatörün açıkça talep ettiğinde devreye girer
+# (srvctl domain open-basedir <domain> off).
 _domain_render_php_overrides() {
     local parsed="$1" ini_file="$2"
     [[ -n "$parsed" ]] || return 0
-    printf '\n; ─── per-domain override (%s) ───\n' "$ini_file"
-    local kv
+    local kv key val body=""
     while IFS= read -r kv; do
         [[ -z "$kv" ]] && continue
-        printf 'php_admin_value[%s] = %s\n' "${kv%%=*}" "${kv#*=}"
+        key="${kv%%=*}"
+        val="${kv#*=}"
+        [[ "$key" == "open_basedir" && "$val" == "off" ]] && continue
+        body+="php_admin_value[${key}] = ${val}"$'\n'
     done <<< "$parsed"
+    # Yalnız 'open_basedir = off' içeren bir .ini'de basılacak satır KALMAZ;
+    # o durumda başlık yorumunu da basmayız (boş bir override bloğu, dosyaya
+    # bakan operatöre "burada bir ayar var" izlenimi verirdi).
+    [[ -n "$body" ]] || return 0
+    printf '\n; ─── per-domain override (%s) ───\n' "$ini_file"
+    printf '%s' "$body"
 }
 
 # Per-domain FPM config (global+pool) + systemd unit dosyalarını RENDER eder.

@@ -53,6 +53,7 @@ _srvctl() {
                         'reload:PHP-FPM + nginx reload (doğru unit otomatik bulunur)'
                         'ini:Domaine özel PHP ayarları (sudo -E)'
                         'nginx:Domaine özel nginx ayarları (sudo -E)'
+                        'open-basedir:open_basedir aç/kapat (kapalı = sınır chroot)'
                         'staging:Staging ortamı oluştur'
                         'migrate:Sunucular arası taşı'
                         'rate-limit:Rate-limit profili değiştir'
@@ -69,6 +70,15 @@ _srvctl() {
                             '--nginx:Yalnız nginx'
                         )
                         _describe 'domain reload seçeneği' reload_flags
+                    elif [[ "${words[2]:-}" == "open-basedir" && ${#words} -ge 4 ]]; then
+                        local -a ob_flags
+                        ob_flags=(
+                            'on:Şablon varsayılanına dön (open_basedir yürürlükte)'
+                            'off:Ayarı tamamen kaldır — sınır chroot olarak kalır'
+                            '--all:Tüm domainler (hatada durmaz, sonda özetler)'
+                            '--show:Durumu listele, değişiklik yapma'
+                        )
+                        _describe 'domain open-basedir seçeneği' ob_flags
                     elif [[ ( "${words[2]:-}" == "ini" || "${words[2]:-}" == "nginx" ) && ${#words} -ge 4 ]]; then
                         local -a conf_flags
                         conf_flags=(

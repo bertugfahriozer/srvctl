@@ -218,6 +218,83 @@ bildirim kanalına düşer.
 > satırı yoktur. `domain nginx` bunu fark edip durur ve `srvctl domain repair
 > <domain>` önerir — sessizce etkisiz kalmasındansa açıkça durması tercih edildi.
 
+### `open_basedir` — performans / savunma derinliği dengesi
+
+```bash
+sudo srvctl domain open-basedir --show                # tüm domainlerin durumu
+sudo srvctl domain open-basedir example.com --show    # tek domain
+sudo srvctl domain open-basedir example.com off       # kaldır (sınır chroot'a kalır)
+sudo srvctl domain open-basedir example.com on        # şablon varsayılanına dön
+sudo srvctl domain open-basedir --all off             # tüm domainlere uygula
+```
+
+**Varsayılan değişmedi.** Hiçbir domain bu komut açıkça çağrılmadan etkilenmez;
+yeni domainler de `open_basedir` yürürlükteyken oluşur. Ayar
+`/etc/srvctl/php.d/<safe_name>.ini` içinde saklandığı için `domain repair`,
+`domain php-switch` ve `security harden-fpm` bunu **ezmez**.
+
+**Neden bir seçenek:** `open_basedir` set edildiğinde PHP **realpath cache'ini
+devre dışı bırakır** — `realpath_cache_size` ayarlı olsa bile kullanımı sıfır
+kalır ve her dosya erişimi baştan tam yol çözümlemesi öder. Üretim ölçümü
+(Ubuntu, PHP 8.3, chroot'lu izole pool, 50 modüllü CI4 uygulaması):
+
+| Ölçüm | `open_basedir` açık | kapalı |
+|---|---|---|
+| 58 dosyalık `filemtime` döngüsü | 48.95 ms | **3.29 ms** |
+| Dosya başına | 0.84 ms | **0.057 ms** |
+| CI4 bootstrap (TTFB) | 1.28–1.60 s | **0.030–0.032 s** |
+| realpath cache kullanımı | 0 KB | dolu |
+
+Etki uygulamanın dosya sistemine ne kadar dokunduğuyla **çarpımsaldır**: çok
+sayıda modül/paket tarayan (HMVC, `discoverInComposer`, cache'siz `development`
+modu) uygulamalarda fark saniyelere çıkar; tek dosyalık bir PHP betiğinde
+ölçülemez.
+
+**Güvenlik ödünü nedir:** Pool zaten `chroot = WEB_ROOT/DOMAIN` ile çalışıyor ve
+**chroot `open_basedir`'den daha güçlü bir sınırdır** — PHP süreci o dizinin
+dışını göremez. Şablondaki `open_basedir` listesi
+(`/public_html/ /private/ /tmp/ /sessions/ /releases/ /shared/`) chroot içindeki
+dizinlerin neredeyse tamamını zaten kapsıyor; kaldırıldığında PHP'ye ek olarak
+açılan tek şey chroot içindeki `/logs/` ve `/etc/`. Yani kaybedilen, ihlal
+durumunda ikinci bir kat; kaybedilmeyen ise asıl sınır.
+
+**Hangi domainde ne yapmalı:**
+
+| Durum | Öneri |
+|---|---|
+| Geliştirme/staging, ölçülen TTFB > 300 ms | `off` — kazanç büyük, ortam zaten dış trafiğe kapalı |
+| Üretim, ağır framework (çok modüllü CI4/Laravel), ölçülen fark belirgin | `off` — chroot sınırı korunur; kararı ölçüme dayandırın |
+| Üretim, üçüncü taraf/müşteri kodu barındıran paylaşımlı kiracı | `on` bırakın — savunma derinliği burada ölçülen milisaniyelerden değerli |
+| Ölçüm yapılmamış | Önce ölçün (aşağıdaki yöntem), sonra karar verin |
+
+**Karar öncesi ölçüm** — `off` yapmadan önce ve sonra aynı isteği karşılaştırın:
+
+```bash
+D=example.com
+curl -s -o /dev/null -H "Host: $D" -w "ONCE:  %{time_total}s\n" http://127.0.0.1/index.php
+sudo srvctl domain open-basedir $D off
+curl -s -o /dev/null -H "Host: $D" -w "SONRA: %{time_total}s\n" http://127.0.0.1/index.php
+```
+
+Aynı domainde bir statik dosya (`/robots.txt`) süresi **değişmemelidir** — değişirse
+ölçtüğünüz şey bu ayar değildir. Cloudflare arkasındaki bir siteye sunucunun kendi
+public hostname'inden `curl` atmak `000` döndürebilir; bu yüzden `Host:` başlığı +
+`127.0.0.1` kullanın.
+
+> **`none` veya boş değer YAZMAYIN.** `.ini` dosyasına elle `open_basedir = none`
+> yazmak işe yaramaz, **zararlıdır**: PHP `none`'ı özel bir değer saymaz, `none`
+> adlı göreli bir dizin olarak yorumlar ve domainin tüm dosya erişimini kırar.
+> Boş değer de yazılamaz (`parse_php_ini_overrides` reddeder), `/` de kazanç
+> vermez — boş olmayan **herhangi** bir değer PHP'ye ayarı "set edilmiş"
+> saydırır ve realpath cache kapalı kalır. Ayarın kalkmasının tek doğru yolu
+> pool'a o satırın hiç basılmamasıdır; `open-basedir off` tam olarak bunu yapar.
+> `.ini`'ye elle yazmak isterseniz kabul edilen tek biçim `open_basedir = off`
+> beyanıdır — bu, izolasyonu delen bir gevşetme sayılmadığı için `--force`
+> istemez, ama başka her `open_basedir` değeri reddedilmeye devam eder.
+
+**Geri alma:** `sudo srvctl domain open-basedir <domain> on` — beyan `.ini`'den
+silinir, şablon satırı geri gelir ve FPM reload edilir.
+
 ### Deploy (zero-downtime)
 ```bash
 sudo srvctl deploy example.com [branch]      # atomic switch + health check
