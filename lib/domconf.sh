@@ -135,7 +135,7 @@ _domconf_ini_deny_reason() {
         extension|zend_extension)
             echo "FPM master ROOT olarak başlar — keyfi .so yükleme = root kod çalıştırma" ;;
         open_basedir)
-            echo "chroot içi dosya erişim sınırını gevşetir" ;;
+            echo "chroot içi dosya erişim sınırını gevşetir (tek istisna: 'open_basedir = off' — ayarı gevşetmez, tamamen kaldırıp sınırı chroot'a bırakır; 'srvctl domain open-basedir <domain> off')" ;;
         disable_functions|disable_classes)
             echo "hardening listesini gevşetir (bkz. pool.conf.tpl BUG 2 notu)" ;;
         sendmail_path)
@@ -149,15 +149,28 @@ _domconf_ini_deny_reason() {
 }
 
 # PREDİKAT: 0=temiz, 1=reddedilen anahtar bulundu (rapor stdout'a).
+#
+# Tarama ANAHTAR bazlıdır, TEK bir DEĞER-farkında istisna dışında:
+# 'open_basedir = off'. Bu istisna izolasyonu GEVŞETMEZ — ayarı tamamen
+# kaldırır ve dosya erişim sınırını pool'un ZATEN uyguladığı
+# 'chroot = WEB_ROOT/DOMAIN'e bırakır (chroot open_basedir'den daha güçlü bir
+# sınırdır; ayrıntılı gerekçe ve ölçüm: lib/domain.sh
+# _domain_render_php_overrides başlık yorumu). Bu yüzden --force İSTEMEZ.
+# Başka HER open_basedir değeri (ör. listeye yeni bir yol eklemek) reddedilmeye
+# DEVAM EDER: o gerçek bir gevşetmedir.
 _domconf_scan_ini() {
     local file="$1"
-    local line key deny lineno=0 found=0
+    local line key val deny lineno=0 found=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         lineno=$((lineno + 1))
         line="${line%$'\r'}"
         [[ "$line" =~ ^[[:space:]]*[\;\#] ]] && continue
-        [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_.]*)[[:space:]]*= ]] || continue
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_.]*)[[:space:]]*=(.*)$ ]] || continue
         key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        [[ "$key" == "open_basedir" && "$val" == "off" ]] && continue
         for deny in "${_DOMCONF_INI_DENY[@]}"; do
             if [[ "$key" == "$deny" ]]; then
                 echo "    satır ${lineno}: ${key} — $(_domconf_ini_deny_reason "$key")"
@@ -331,6 +344,141 @@ _domconf_edit_ini() {
 
     success "PHP ayarları uygulandı ve FPM reload edildi: ${domain}"
     log_action "DOMAIN INI: ${domain}"
+}
+
+# ───────────────────────────────────────────────────────────────
+#  srvctl domain open-basedir <domain>|--all <on|off> [--show]
+#
+#  NE YAPAR: pool'daki 'php_admin_value[open_basedir]' satırını per-domain
+#  .ini üzerinden AÇAR/KAPATIR. Kapatmak ayarı GEVŞETMEZ, TAMAMEN KALDIRIR —
+#  dosya erişim sınırı pool'un zaten uyguladığı 'chroot = WEB_ROOT/DOMAIN'e
+#  kalır (chroot daha güçlü bir sınırdır).
+#
+#  NEDEN AYRI BİR KOMUT: 'off' değeri .ini'ye elle de yazılabilir, ama üç
+#  tuzağı vardır ve bu komut üçünü de kapatır:
+#    1) 'none' YAZILAMAZ — PHP'de özel değer değildir, 'none' ADLI göreli bir
+#       dizin sanılır ve tüm dosya erişimi kırılır.
+#    2) BOŞ değer YAZILAMAZ — parse_php_ini_overrides boş değeri reddeder
+#       (lib/core.sh, "değer boş" hatası).
+#    3) '/' de İŞE YARAMAZ — boş olmayan HERHANGİ bir değer PHP'ye ayarı
+#       "set edilmiş" saydırır ve realpath cache kapalı kalır; kazanç sıfır.
+#
+#  VARSAYILAN DEĞİŞMEDİ: hiçbir domain bu komut çağrılmadan etkilenmez.
+#  Ayar .ini'de saklandığı için 'repair'/'php-switch'/'harden-fpm' EZMEZ.
+# ───────────────────────────────────────────────────────────────
+
+# PREDİKAT: 0 = bu domainde open_basedir KAPALI (.ini'de 'off' beyanı var).
+_domconf_open_basedir_is_off() {
+    local ini="$1"
+    [[ -f "$ini" ]] || return 1
+    grep -qE '^[[:space:]]*open_basedir[[:space:]]*=[[:space:]]*off[[:space:]]*$' "$ini"
+}
+
+_domconf_open_basedir_show_one() {
+    local domain="$1"
+    local sname; sname=$(safe_name "$domain")
+    local ini="${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}/${sname}.ini"
+    local pool="${SRVCTL_FPM_DIR:-/etc/srvctl/fpm}/${sname}.conf"
+    local beyan="on" pool_satiri="YOK"
+    _domconf_open_basedir_is_off "$ini" && beyan="off"
+    # Yürürlükteki GERÇEK durum pool'dur; .ini beyanı ile pool ayrışmışsa
+    # (ör. .ini elle düzenlenmiş ama reload edilmemiş) operatör bunu görmeli.
+    grep -qE '^php_admin_value\[open_basedir\][[:space:]]*=' "$pool" 2>/dev/null && pool_satiri="VAR"
+    printf '  %-38s beyan=%-3s  pool_satiri=%s\n' "$domain" "$beyan" "$pool_satiri"
+}
+
+# Tek domaine uygular. Hata durumunda 'error' ile çıkar (çağıran --all
+# döngüsü bu yüzden subshell kullanır — bir domainin hatası diğerlerini
+# durdurmasın, 'domain reload --all' deseniyle aynı).
+_domconf_open_basedir_one() {
+    local domain="$1" state="$2"
+    local sname; sname=$(safe_name "$domain")
+    local ini_dir="${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}"
+    local ini="${ini_dir}/${sname}.ini"
+    mkdir -p "$ini_dir"
+    [[ -f "$ini" ]] || { _domconf_ini_skeleton "$domain" > "$ini"; chmod 644 "$ini"; }
+
+    # Mevcut .ini KORUNUR; yalnız open_basedir satırı çıkarılır/eklenir.
+    local cand; cand=$(mktemp)
+    grep -vE '^[[:space:]]*open_basedir[[:space:]]*=' "$ini" > "$cand" || true
+    [[ "$state" == "off" ]] && printf 'open_basedir = off\n' >> "$cand"
+
+    if cmp -s "$cand" "$ini"; then
+        rm -f "$cand"
+        info "${domain}: open_basedir zaten '${state}' — değişiklik yok"
+        return 0
+    fi
+
+    # Doğrulama + render + php-fpm -t + reload + rollback: hepsi _domconf_edit_ini'de.
+    # Yeniden yazmıyoruz — o yol rollback bütünlüğü için zaten tek doğru yer.
+    _domconf_edit_ini "$domain" --file "$cand"
+    rm -f "$cand"
+    log_action "DOMAIN OPEN-BASEDIR: ${domain} → ${state}"
+}
+
+_domconf_open_basedir() {
+    local domain="" state="" show=0 all=0 arg
+    while [[ $# -gt 0 ]]; do
+        arg="$1"
+        case "$arg" in
+            --show)  show=1 ;;
+            --all)   all=1 ;;
+            on|off)  state="$arg" ;;
+            -*)      error "Bilinmeyen seçenek: ${arg}" ;;
+            *)       domain="$arg" ;;
+        esac
+        shift
+    done
+
+    if [[ "$show" == "1" ]]; then
+        header "open_basedir durumu"
+        echo ""
+        if [[ "$all" == "1" || -z "$domain" ]]; then
+            local d
+            while IFS= read -r d; do
+                [[ -n "$d" ]] || continue
+                _domconf_open_basedir_show_one "$d"
+            done < <(list_all_domains)
+        else
+            domain_exists "$domain" || error "Domain bulunamadı: ${domain}"
+            _domconf_open_basedir_show_one "$domain"
+        fi
+        echo ""
+        echo "  beyan=off  → pool'da open_basedir satırı BASILMAZ, sınır chroot'tur"
+        echo "  beyan=on   → şablon varsayılanı yürürlükte (değişiklik yapılmamış)"
+        echo ""
+        return 0
+    fi
+
+    [[ "$state" == "on" || "$state" == "off" ]] \
+        || error "Kullanım: srvctl domain open-basedir <domain>|--all <on|off> [--show]"
+
+    if [[ "$all" == "1" ]]; then
+        # Ad NOTU: 'failed' bu dosyada başka bir fonksiyonda DİZİ olarak
+        # kullanılıyor; aynı adı burada skaler olarak kullanmak shellcheck
+        # SC2178/SC2128 üretiyordu. Ayrı ad bilinçli.
+        local d total=0 fail_count=0
+        while IFS= read -r d; do
+            [[ -n "$d" ]] || continue
+            total=$((total + 1))
+            # Subshell: bir domainin 'error'ü tüm döngüyü düşürmesin.
+            if ! ( _domconf_open_basedir_one "$d" "$state" ); then
+                warn "${d}: uygulanamadı — atlandı"
+                fail_count=$((fail_count + 1))
+            fi
+        done < <(list_all_domains)
+        echo ""
+        if [[ "$fail_count" -gt 0 ]]; then
+            warn "open_basedir=${state}: ${total} domainden ${fail_count} tanesi BAŞARISIZ"
+            return 1
+        fi
+        success "open_basedir=${state} uygulandı: ${total} domain"
+        return 0
+    fi
+
+    [[ -n "$domain" ]] || error "Kullanım: srvctl domain open-basedir <domain>|--all <on|off> [--show]"
+    domain_exists "$domain" || error "Domain bulunamadı: ${domain}"
+    _domconf_open_basedir_one "$domain" "$state"
 }
 
 # ───────────────────────────────────────────────────────────────

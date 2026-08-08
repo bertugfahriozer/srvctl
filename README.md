@@ -151,6 +151,7 @@ sudo srvctl domain suspend example.com               # bakım modu (503 + sayfa)
 sudo srvctl domain unsuspend example.com
 sudo srvctl domain php-switch example.com 8.2        # PHP sürümü değiştir
 sudo srvctl domain resources example.com --memory=512M --cpu=50% --io=100
+sudo srvctl domain resources example.com --reset      # kaynak profiline döndür
 sudo srvctl domain resources example.com --show
 sudo srvctl domain staging example.com               # staging.example.com klonu
 sudo srvctl domain migrate example.com user@host [--auto]
@@ -161,6 +162,46 @@ sudo srvctl domain scheduler <domain> <start|stop|status|enable|disable>
 sudo srvctl domain rate-limit <domain> [profil]     # Rate-limit profilini değiştir/göster
 sudo srvctl domain repair <domain>|--all             # Eksik chroot kütüphanelerini tamir et
 ```
+
+**Bellek eşikleri — `--memory` ne yapar:** verdiğiniz değer **tavan** (`MemoryMax`)
+olarak kalır; `MemoryHigh` ve `MemorySwapMax` ondan türetilir (`High ≈ Max×8/9`,
+`Swap = High/8`). Bu ayrım kritiktir: `MemoryHigh` kernel'in *yavaşlat ve geri
+kazan* eşiği, `MemoryMax` ise *hard kill* eşiğidir. İkisi eşitlenirse throttle
+aşaması tamamen atlanır ve süreç yavaşlamadan doğrudan OOM-kill yer. Daha önce
+`--memory` ikisini eşitliyor, `MemorySwapMax`'ı ise dosyadaki eski değeriyle
+(eski slice'larda `0`) bırakıyordu — ikisi de sessiz OOM kaynağıydı.
+
+**`--reset` ne zaman gerekir:** `domain resources` mevcut slice dosyasını otorite
+sayar (operatörün bilinçli ayarını korumak için). Bunun yan etkisi, eski bir
+sürümden kalma **yanlış** bir değerin sonsuza kadar "korunmasıydı" — hiçbir komut
+onu profile geri getiremiyordu. `--reset` bellek üçlüsünü ve `TasksMax`'ı kaynak
+profiline döndürür; `CPUQuota` ile `IOWeight` **korunur** (ikisi
+`conf/resource-profiles.conf` sözleşmesinde yoktur, dönülecek bir profil değerleri
+yok). Aynı komutta verilen açık bayraklar reset'in üstüne yazar:
+`--reset --cpu=200%` geçerlidir.
+
+**`domain repair` artık cgroups slice'ı da denetler.** Daha önce
+`_apply_cgroups_slice` yalnızca `domain add` yolundan çağrılıyordu; kaynak profili
+sistemine geçildikten sonra mevcut domainlerin slice'ları hiç güncellenmiyordu.
+Repair şimdi:
+
+- slice dosyası **yoksa** profilden oluşturur (gerçek eksiklik → sessizce onarılır),
+- slice **varsa** onu asla körlemesine ezmez — operatörün bilinçli ayarını geri
+  almak, bu kod tabanında bir kez yaşanmış regresyon sınıfıdır.
+
+"Profilden farklı olmak" tek başına bulgu sayılmaz (çoğu zaman operatör tercihidir
+ve her repair'de gürültü üretirdi). Yalnızca **objektif olarak yanlış**, hiçbir
+operatörün bilerek istemeyeceği üç durum raporlanır:
+
+| Bulgu | Neden yanlış |
+|---|---|
+| `MemorySwapMax=0` | Eşzamanlı ağır isteklerde OOM-kill — `conf/resource-profiles.conf` bunu host'ta doğrulanmış olarak not ediyor |
+| `MemoryHigh == MemoryMax` | Throttle/reclaim aşaması atlanır, doğrudan hard kill |
+| `MemoryMax < max_children × memory_limit` | Havuz tam dolduğunda tavan matematiksel olarak yetmez |
+
+Üçü de `srvctl domain resources <domain> --reset` ile tek komutta düzelir. Bulgu
+raporlanması repair'i **başarısız saymaz**: repair'in çıkış kodu "site ayakta mı"
+sorusunu yanıtlar, "limitler ideal mi" sorusunu değil.
 
 ### Per-domain yapılandırma ve reload
 ```bash
@@ -217,6 +258,83 @@ bildirim kanalına düşer.
 > **Bu sürümden önce oluşturulmuş domainler:** vhost'larında `custom.d` include
 > satırı yoktur. `domain nginx` bunu fark edip durur ve `srvctl domain repair
 > <domain>` önerir — sessizce etkisiz kalmasındansa açıkça durması tercih edildi.
+
+### `open_basedir` — performans / savunma derinliği dengesi
+
+```bash
+sudo srvctl domain open-basedir --show                # tüm domainlerin durumu
+sudo srvctl domain open-basedir example.com --show    # tek domain
+sudo srvctl domain open-basedir example.com off       # kaldır (sınır chroot'a kalır)
+sudo srvctl domain open-basedir example.com on        # şablon varsayılanına dön
+sudo srvctl domain open-basedir --all off             # tüm domainlere uygula
+```
+
+**Varsayılan değişmedi.** Hiçbir domain bu komut açıkça çağrılmadan etkilenmez;
+yeni domainler de `open_basedir` yürürlükteyken oluşur. Ayar
+`/etc/srvctl/php.d/<safe_name>.ini` içinde saklandığı için `domain repair`,
+`domain php-switch` ve `security harden-fpm` bunu **ezmez**.
+
+**Neden bir seçenek:** `open_basedir` set edildiğinde PHP **realpath cache'ini
+devre dışı bırakır** — `realpath_cache_size` ayarlı olsa bile kullanımı sıfır
+kalır ve her dosya erişimi baştan tam yol çözümlemesi öder. Üretim ölçümü
+(Ubuntu, PHP 8.3, chroot'lu izole pool, 50 modüllü CI4 uygulaması):
+
+| Ölçüm | `open_basedir` açık | kapalı |
+|---|---|---|
+| 58 dosyalık `filemtime` döngüsü | 48.95 ms | **3.29 ms** |
+| Dosya başına | 0.84 ms | **0.057 ms** |
+| CI4 bootstrap (TTFB) | 1.28–1.60 s | **0.030–0.032 s** |
+| realpath cache kullanımı | 0 KB | dolu |
+
+Etki uygulamanın dosya sistemine ne kadar dokunduğuyla **çarpımsaldır**: çok
+sayıda modül/paket tarayan (HMVC, `discoverInComposer`, cache'siz `development`
+modu) uygulamalarda fark saniyelere çıkar; tek dosyalık bir PHP betiğinde
+ölçülemez.
+
+**Güvenlik ödünü nedir:** Pool zaten `chroot = WEB_ROOT/DOMAIN` ile çalışıyor ve
+**chroot `open_basedir`'den daha güçlü bir sınırdır** — PHP süreci o dizinin
+dışını göremez. Şablondaki `open_basedir` listesi
+(`/public_html/ /private/ /tmp/ /sessions/ /releases/ /shared/`) chroot içindeki
+dizinlerin neredeyse tamamını zaten kapsıyor; kaldırıldığında PHP'ye ek olarak
+açılan tek şey chroot içindeki `/logs/` ve `/etc/`. Yani kaybedilen, ihlal
+durumunda ikinci bir kat; kaybedilmeyen ise asıl sınır.
+
+**Hangi domainde ne yapmalı:**
+
+| Durum | Öneri |
+|---|---|
+| Geliştirme/staging, ölçülen TTFB > 300 ms | `off` — kazanç büyük, ortam zaten dış trafiğe kapalı |
+| Üretim, ağır framework (çok modüllü CI4/Laravel), ölçülen fark belirgin | `off` — chroot sınırı korunur; kararı ölçüme dayandırın |
+| Üretim, üçüncü taraf/müşteri kodu barındıran paylaşımlı kiracı | `on` bırakın — savunma derinliği burada ölçülen milisaniyelerden değerli |
+| Ölçüm yapılmamış | Önce ölçün (aşağıdaki yöntem), sonra karar verin |
+
+**Karar öncesi ölçüm** — `off` yapmadan önce ve sonra aynı isteği karşılaştırın:
+
+```bash
+D=example.com
+curl -s -o /dev/null -H "Host: $D" -w "ONCE:  %{time_total}s\n" http://127.0.0.1/index.php
+sudo srvctl domain open-basedir $D off
+curl -s -o /dev/null -H "Host: $D" -w "SONRA: %{time_total}s\n" http://127.0.0.1/index.php
+```
+
+Aynı domainde bir statik dosya (`/robots.txt`) süresi **değişmemelidir** — değişirse
+ölçtüğünüz şey bu ayar değildir. Cloudflare arkasındaki bir siteye sunucunun kendi
+public hostname'inden `curl` atmak `000` döndürebilir; bu yüzden `Host:` başlığı +
+`127.0.0.1` kullanın.
+
+> **`none` veya boş değer YAZMAYIN.** `.ini` dosyasına elle `open_basedir = none`
+> yazmak işe yaramaz, **zararlıdır**: PHP `none`'ı özel bir değer saymaz, `none`
+> adlı göreli bir dizin olarak yorumlar ve domainin tüm dosya erişimini kırar.
+> Boş değer de yazılamaz (`parse_php_ini_overrides` reddeder), `/` de kazanç
+> vermez — boş olmayan **herhangi** bir değer PHP'ye ayarı "set edilmiş"
+> saydırır ve realpath cache kapalı kalır. Ayarın kalkmasının tek doğru yolu
+> pool'a o satırın hiç basılmamasıdır; `open-basedir off` tam olarak bunu yapar.
+> `.ini`'ye elle yazmak isterseniz kabul edilen tek biçim `open_basedir = off`
+> beyanıdır — bu, izolasyonu delen bir gevşetme sayılmadığı için `--force`
+> istemez, ama başka her `open_basedir` değeri reddedilmeye devam eder.
+
+**Geri alma:** `sudo srvctl domain open-basedir <domain> on` — beyan `.ini`'den
+silinir, şablon satırı geri gelir ve FPM reload edilir.
 
 ### Deploy (zero-downtime)
 ```bash
