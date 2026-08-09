@@ -336,6 +336,19 @@ public hostname'inden `curl` atmak `000` döndürebilir; bu yüzden `Host:` baş
 **Geri alma:** `sudo srvctl domain open-basedir <domain> on` — beyan `.ini`'den
 silinir, şablon satırı geri gelir ve FPM reload edilir.
 
+> **`opcache.preload` neden yok:** aynı turda denendi ve gerçek sunucuda
+> ölçüldü — pool'a `php_admin_value[opcache.preload]` yazıldığında `ini_get`
+> değeri görüyor ama `opcache_get_status()` **`preload_statistics` üretmiyor**;
+> yani preload hiç çalışmıyor. Üstelik tamamen sessiz: `php-fpm -t` temiz
+> geçiyor, servis ayakta kalıyor, FPM günlüğünde tek uyarı yok. Nedeni
+> zamanlama — preload **master süreç başlangıcında** çalışır, pool ayarları ise
+> worker'a fork sonrası uygulanır. Eklenmesi için ayarın master'ın okuduğu
+> php.ini seviyesine taşınması, chroot yol uyuşmazlığının çözülmesi ve deploy
+> akışının `reload`'dan `restart`'a geçmesi gerekir (aksi halde "deploy ettim
+> ama değişiklik yansımadı" sınıfı sessiz bir hata doğar). `open_basedir`
+> kazancından sonra tipik katkısı 5-10 ms olduğu için bilinçli olarak
+> eklenmedi; ayrıntı `templates/php-fpm/pool.conf.tpl` sonundaki notta.
+
 ### Deploy (zero-downtime)
 ```bash
 sudo srvctl deploy example.com [branch]      # atomic switch + health check

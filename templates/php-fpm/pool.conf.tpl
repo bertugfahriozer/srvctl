@@ -194,3 +194,39 @@ access.format = "%R - %u %t \"%m %r\" %s %f %{mili}d %{kilo}M %C%%"
 ; ─── Slowlog (yavaş sorguları yakala) ───
 slowlog = {{WEB_ROOT}}/{{DOMAIN}}/logs/php-slow.log
 request_slowlog_timeout = 5s
+
+; ═══════════════════════════════════════════════
+;  opcache.preload BU DOSYAYA EKLENMEZ — HOST'ta ÖLÇÜLDÜ, ETKİSİZ
+; ═══════════════════════════════════════════════
+; Performans turunda denendi ve GERÇEK sunucuda (Ubuntu, PHP 8.4, chroot'lu
+; izole pool) ölçüldü. Sonuç:
+;
+;   php_admin_value[opcache.preload]      = <host yolu>   → ini_get GÖRÜYOR
+;   php_admin_value[opcache.preload_user] = web_<sname>   → ini_get GÖRÜYOR
+;   opcache_get_status()['preload_statistics']            → YOK (preload OLMADI)
+;
+; Yani ayar worker'a ULAŞIYOR ama preload HİÇ ÇALIŞMIYOR ve PHP bunu hiçbir
+; yerde BİLDİRMİYOR: 'php-fpm -t' temiz geçer, servis ayakta kalır, FPM
+; günlüğünde tek bir uyarı satırı bile YOKTUR. Tamamen sessiz bir etkisizlik.
+;
+; KÖK NEDEN (zamanlama): opcache.preload, MASTER süreç başlangıcında opcache
+; modülü ilklendirilirken çalıştırılır. Pool'un php_admin_value ayarları ise
+; worker'a fork SONRASI uygulanır — preload anı çoktan geçmiştir. Bu yüzden
+; sorun 'yanlış değer' değildir; bu dosya preload için YANLIŞ YERDİR.
+;
+; EKLEMEK İSTEYEN İÇİN — üç ön koşul (hiçbiri bugün karşılanmıyor):
+;   1) Ayar MASTER'ın okuduğu php.ini seviyesine taşınmalı (FPM unit'e
+;      per-domain PHP_INI_SCAN_DIR ya da '-d'). Pool yolu ölçümle elendi.
+;   2) chroot uyuşmazlığı çözülmeli: preload master'da, chroot'un DIŞINDA,
+;      gerçek yollarla yapılır; worker chroot İÇİNDE '/public_html/...'
+;      uzayında çalışır. Bu farkın sonucu ÖLÇÜLMEDİ.
+;   3) Deploy akışı restart'a geçmeli: preload edilen dosya değiştiğinde
+;      'reload' YETMEZ, restart ŞARTTIR. lib/deploy.sh bugün reload kullanıyor
+;      — preload eklenirse "deploy ettim ama değişiklik yansımadı" sınıfı
+;      SESSİZ bir hata kapısı açılır (opcache.validate_timestamps=0 tuzağının
+;      daha ağır bir versiyonu).
+;
+; GETİRİ/MALİYET: aynı sunucuda 'open_basedir = off' (bkz. srvctl domain
+; open-basedir) istek süresini 1.28s → 0.031s'ye indirdi. Preload'ın bu
+; noktadan sonraki tipik katkısı 5-10ms — yukarıdaki üç riskin karşılığı
+; olarak ölçüm gürültüsüne yakın. Bilinçli karar: EKLENMEDİ.
