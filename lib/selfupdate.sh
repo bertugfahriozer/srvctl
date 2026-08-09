@@ -265,8 +265,27 @@ _selfupdate_verify_tag_signature() {
     fi
 }
 
+# ───────────────────────────────────────────────────────────────
+#  self-update'in yönettiği VERİ config'leri (kullanıcı AYARI DEĞİL).
+#
+#  Ayrım şudur: conf/srvctl.conf OPERATÖRÜN dosyasıdır (sırlar/ayarlar) ve
+#  self-update ona ASLA dokunmaz. Buradaki dosyalar ise srvctl'in KENDİ veri
+#  tabloları — sürümle birlikte gelirler ve install.sh her kurulumda üzerine
+#  yazar (bkz. install.sh:170 ve :209 yorumları).
+#
+#  NEDEN LİSTE (tek satır yerine): bu dosyalar ÜÇ ayrı yerde ele alınmalı —
+#  yedekle, kur, geri yükle. Üçü elle senkron tutulduğunda asimetri kaçınılmaz
+#  oldu: 'rate-profiles.conf' üçünde de vardı ama 'resource-profiles.conf'
+#  HİÇBİRİNDE yoktu. Sonuç sessizdi — install.sh ile kuranlar profil dosyasını
+#  alıyor, 'self-update' ile güncelleyenler ALMIYORDU; profil değerleri
+#  değiştiğinde bu ikinci grup sessizce eski tabloda kalır ve
+#  resource_profile_load (lib/core.sh) dosya bulunamadığında gömülü
+#  varsayılanlara düşerek farkı GİZLERDİ. Yeni bir veri config'i eklenirken
+#  yalnız bu diziye eklemek yeterlidir.
+_SELFUPDATE_DATA_CONFS=(rate-profiles.conf resource-profiles.conf)
+
 # Yalnız self-update'in DOKUNDUĞU yolları yedekler: bin/lib/templates/
-# completions + conf/rate-profiles.conf + .current-commit. conf/srvctl.conf
+# completions + conf/ veri tabloları + .current-commit. conf/srvctl.conf
 # ASLA yedeklenmez (bkz. O12: eski davranış REDIS_ADMIN_PASS/CF_API_TOKEN
 # içeren srvctl.conf'u her güncellemede yeni bir '.backup.*' kopyasına
 # TAŞIYIP HİÇBİRİNİ silmiyordu → sınırsız sır birikimi). Yedek SRVCTL_ROOT/
@@ -293,10 +312,13 @@ _selfupdate_backup_current() {
             fi
         fi
     done
-    if [[ -f "${SRVCTL_ROOT}/conf/rate-profiles.conf" ]]; then
-        mkdir -p "${dir}/conf"
-        cp -a "${SRVCTL_ROOT}/conf/rate-profiles.conf" "${dir}/conf/rate-profiles.conf" 2>/dev/null || true
-    fi
+    local dataconf
+    for dataconf in "${_SELFUPDATE_DATA_CONFS[@]}"; do
+        if [[ -f "${SRVCTL_ROOT}/conf/${dataconf}" ]]; then
+            mkdir -p "${dir}/conf"
+            cp -a "${SRVCTL_ROOT}/conf/${dataconf}" "${dir}/conf/${dataconf}" 2>/dev/null || true
+        fi
+    done
     if [[ -f "$SRVCTL_CURRENT_COMMIT" ]]; then
         cp -a "$SRVCTL_CURRENT_COMMIT" "${dir}/.current-commit" 2>/dev/null || true
     fi
@@ -305,10 +327,10 @@ _selfupdate_backup_current() {
 }
 
 # staging'den canlı kuruluma dosyaları kopyalar. conf/srvctl.conf'a
-# KESİNLİKLE DOKUNULMAZ (ayarlar/sırlar korunur). conf/rate-profiles.conf
-# VERİ dosyasıdır (kullanıcı ayarı DEĞİL) — install.sh de her kurulumda bunu
-# günceller (bkz. install.sh:170 yorumu); self-update de aynı tutarlılıkla
-# günceller (ESKİ davranışta bu dosya hiç güncellenmiyordu — bkz. rapor).
+# KESİNLİKLE DOKUNULMAZ (ayarlar/sırlar korunur). conf/ altındaki VERİ
+# tabloları (_SELFUPDATE_DATA_CONFS — kullanıcı ayarı DEĞİL) install.sh ile
+# aynı tutarlılıkla güncellenir; hangi dosyaların bu sınıfa girdiği ve neden
+# tek bir listeden yönetildiği için bkz. o dizinin başlık yorumu.
 _selfupdate_install_from_staging() {
     local staging="$1"
 
@@ -326,9 +348,13 @@ _selfupdate_install_from_staging() {
         cp -f "${staging}/completions/"* "${SRVCTL_ROOT}/completions/" 2>/dev/null || true
     fi
 
-    if [[ -f "${staging}/conf/rate-profiles.conf" ]]; then
-        cp -f "${staging}/conf/rate-profiles.conf" "${SRVCTL_ROOT}/conf/rate-profiles.conf" 2>/dev/null || true
-    fi
+    local dataconf
+    for dataconf in "${_SELFUPDATE_DATA_CONFS[@]}"; do
+        if [[ -f "${staging}/conf/${dataconf}" ]]; then
+            mkdir -p "${SRVCTL_ROOT}/conf"
+            cp -f "${staging}/conf/${dataconf}" "${SRVCTL_ROOT}/conf/${dataconf}" 2>/dev/null || true
+        fi
+    done
 }
 
 # Kurulum sonrası duman testi. Herhangi biri başarısız olursa 1 döner —
@@ -394,9 +420,12 @@ _selfupdate_restore_from_backup() {
     chmod +x "${SRVCTL_ROOT}/bin/srvctl" 2>/dev/null || true
     chmod +x "${SRVCTL_ROOT}"/lib/*.sh 2>/dev/null || true
 
-    if [[ -f "${dir}/conf/rate-profiles.conf" ]]; then
-        cp -a "${dir}/conf/rate-profiles.conf" "${SRVCTL_ROOT}/conf/rate-profiles.conf"
-    fi
+    local dataconf
+    for dataconf in "${_SELFUPDATE_DATA_CONFS[@]}"; do
+        if [[ -f "${dir}/conf/${dataconf}" ]]; then
+            cp -a "${dir}/conf/${dataconf}" "${SRVCTL_ROOT}/conf/${dataconf}"
+        fi
+    done
     if [[ -f "${dir}/.current-commit" ]]; then
         cp -a "${dir}/.current-commit" "$SRVCTL_CURRENT_COMMIT"
     fi
