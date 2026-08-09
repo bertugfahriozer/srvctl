@@ -398,6 +398,14 @@ sudo srvctl self-update rollback [ad]  # Son (veya belirtilen) yedeğe geri dön
 > bile çalıştırmıştır). Operatör kontrolü gözarı edilemez; tedarik zinciri saldırısı 
 > karşı kalkan.
 >
+> **Neler taşınır:** `bin/`, `lib/`, `templates/`, `completions/` ve `conf/`
+> altındaki **veri tabloları** (`rate-profiles.conf`, `resource-profiles.conf`).
+> `conf/srvctl.conf` operatörün dosyasıdır — ayarlarınız ve sırlarınız asla
+> kopyalanmaz, yedeklenmez, üzerine yazılmaz. Veri tabloları tek bir listeden
+> (`_SELFUPDATE_DATA_CONFS`) yönetilir; yedekleme, kurulum ve geri yükleme
+> yollarının üçü de o listeyi kullanır, böylece biri diğerlerinden geride
+> kalamaz.
+>
 > `run`, pin dosyası yoksa (yani `check` hiç çalıştırılmamışsa) hiçbir dosyayı
 > değiştirmeden durur ve size `sudo srvctl self-update check` çalıştırmanızı
 > açıkça söyler — neden iki aşamalı olduğunu da (check ile run arasında içeriğin
