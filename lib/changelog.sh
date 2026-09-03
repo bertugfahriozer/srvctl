@@ -63,14 +63,27 @@ _changelog_search() {
     echo ""
 }
 
+# O1 DÜZELTMESİ (haftalık denetim 2026-09): varsayılan çıktı yolu
+# '/tmp/srvctl-changelog-YYYYMMDD.txt' idi — tarih dışında sabit ve tahmin
+# edilebilir. Yerel bir kullanıcı o adı önceden symlink olarak koyarsa root'un
+# 'cp'si hedefi izleyip ÜZERİNE YAZAR (keyfi root dosya yazımı); 0666 düz
+# dosya koyarsa 'cp' modu korur ve denetim izi dünya-okunur olur.
+# YENİ: varsayılan SRVCTL_ROOT/logs (root-only), symlink kapısı, umask 077,
+# --no-dereference; mevcut hedef yalnız düz ve root sahipli dosyaysa yazılır.
 _changelog_export() {
-    local output="${1:-/tmp/srvctl-changelog-$(date +%Y%m%d).txt}"
+    local output="${1:-}"
+    [[ -n "$output" ]] || output="${SRVCTL_ROOT:-/usr/local/srvctl}/logs/changelog-$(date +%Y%m%d-%H%M%S).txt"
 
-    if [[ ! -f "$CHANGELOG_FILE" ]]; then
-        error "Changelog dosyası bulunamadı."
+    [[ -f "$CHANGELOG_FILE" ]] || error "Changelog dosyası bulunamadı."
+    [[ -L "$output" ]] && error "GÜVENLİK: ${output} bir sembolik bağ — dışa aktarma İPTAL."
+    [[ -e "$output" && ! -f "$output" ]] && error "GÜVENLİK: ${output} düz dosya değil — dışa aktarma İPTAL."
+    if [[ -e "$output" ]]; then
+        local own; own="$(_stat_owner "$output" 2>/dev/null)" || own=""
+        [[ "$own" == "root" ]] || error "GÜVENLİK: ${output} root'a ait değil (${own:-?}) — üzerine yazılmadı."
     fi
-
-    cp "$CHANGELOG_FILE" "$output"
+    ( umask 077; cp --no-dereference -- "$CHANGELOG_FILE" "$output" ) \
+        || error "Dışa aktarma başarısız: ${output}"
+    chmod 600 -- "$output" 2>/dev/null || true
     success "Changelog dışa aktarıldı: ${output}"
 }
 
