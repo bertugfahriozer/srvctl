@@ -414,6 +414,22 @@ validate_ip_or_cidr() {
     return 0
 }
 
+# ─── Y2 DÜZELTMESİ (haftalık denetim 2026-09): genişlik tavanlı IP/CIDR ───
+# validate_ip_or_cidr yalnız SÖZDİZİMİ doğrular; '/0' dahil her prefix geçer.
+# Dışarıdan ÇEKİLEN listeler (trusted sync → fail2ban ignoreip + nginx
+# set_real_ip_from) için bu yetmez: tek bir '0.0.0.0/0' satırı fail2ban'i
+# tamamen susturur ve nginx'in HER istemciden gelen CF-Connecting-IP'ye
+# güvenmesine (serbest IP spoofing) yol açar; 'nginx -t' bunu geçerli sayar.
+# Bu doğrulayıcı en az $2 (v4) / $3 (v6) bitlik prefix ister.
+# Kullanım: validate_ip_or_cidr_narrow <ip/cidr> [min_v4=8] [min_v6=16]
+validate_ip_or_cidr_narrow() {
+    local v="$1" min4="${2:-8}" min6="${3:-16}" p
+    validate_ip_or_cidr "$v" || return 1
+    [[ "$v" == */* ]] || return 0
+    p="${v#*/}"
+    if [[ "${v%%/*}" == *:* ]]; then (( p >= min6 )); else (( p >= min4 )); fi
+}
+
 # Ülke kodu: 2 büyük harf
 validate_country() {
     [[ "$1" =~ ^[A-Z]{2}$ ]]
@@ -800,6 +816,84 @@ require_root() {
     if [[ $EUID -ne 0 ]]; then
         error "Bu komut root yetkisi gerektirir. Kullanım: sudo srvctl $*"
     fi
+}
+
+# ─── O5 DÜZELTMESİ (haftalık denetim 2026-09): srvctl.conf'a güvenli yazım ───
+# ESKİ: notify.sh ve cloudflare.sh'ta KOPYA '_update_conf', değeri kaçışsız
+# olarak hem sed RHS'ine ("&" → eşleşmenin tamamı, "|" → ayırıcı bozulur;
+# Discord URL'lerindeki '?wait=true&thread_id=' sessizce bozuluyordu) hem de
+# 'source' edilen dosyaya yazıyordu: '$(...)'/backtick içeren bir değer
+# sonraki HER 'srvctl' çağrısında root olarak çalışırdı.
+# YENİ: tek kopya, karakter allowlist'i (URL/token/e-posta için yeterli;
+# tırnak, $, `, boşluk, ; YOK) ve tek-tırnaklı yazım.
+_conf_value_safe() {
+    [[ "$1" =~ ^[A-Za-z0-9._:/@+=?\&%~-]*$ ]]
+}
+_update_conf() {
+    local key="$1" value="$2" esc
+    assert_safe_ident "$key" || error "Config anahtarı geçersiz: '${key}'"
+    _conf_value_safe "$value" \
+        || error "Güvensiz yapılandırma değeri REDDEDİLDİ (${key}): yalnız A-Z a-z 0-9 . _ : / @ + = ? & % ~ - kabul edilir"
+    esc="${value//&/\\&}"; esc="${esc//|/\\|}"
+    if grep -q "^${key}=" "${SRVCTL_CONF}" 2>/dev/null; then
+        _sed_inplace "${SRVCTL_CONF}" -e "s|^${key}=.*|${key}='${esc}'|" \
+            || error "Config güncellenemedi: ${SRVCTL_CONF} (${key})"
+    else
+        printf "%s='%s'\n" "$key" "$value" >> "${SRVCTL_CONF}" \
+            || error "Config'e yazılamadı: ${SRVCTL_CONF} (${key})"
+    fi
+}
+
+# ─── Y1 DÜZELTMESİ (haftalık denetim 2026-09): CLI tarafında RBAC kapısı ───
+# sudoers argüman eşleşmesi fnmatch(FNM_PATHNAME) ile yapılır; '*' boşluk
+# dahil her şeyi eşleştirir. Bu yüzden 'srvctl domain info *' satırı
+# 'domain info x.com --show-secrets'i de GEÇİRİR — viewer rolü bile tüm DB
+# parolalarını okuyabiliyordu. Ayrıca 'user grant' ile yazılan DOMAINS=
+# alanı kod tabanında HİÇBİR yerde okunmuyordu (RBAC dekoratifti).
+# Gerçek karar artık burada, sudo'nun kim adına çalıştığına (SUDO_USER) göre
+# verilir. Doğrudan root (SUDO_USER boş) ve admin rolü her şeyi yapabilir.
+#
+# _rbac_caller_read <ROLE_var> <DOMAINS_var>  — çağıranın conf'unu okur (0/1)
+# Dönüş: 0=çağıran yazıldı, 1=doğrudan root (kapı yok), 2=geçersiz ad (fail-closed)
+_rbac_caller() {
+    local caller="${SUDO_USER:-}"
+    [[ -n "$caller" && "$caller" != "root" ]] || return 1   # doğrudan root
+    validate_username "$caller" || return 2
+    printf '%s' "$caller"
+}
+
+# _rbac_resolve <var> — çağıranı $var'a yazar; root ise 0 döner ve var boş kalır.
+_rbac_resolve() {
+    local __rc=0 __val
+    __val="$(_rbac_caller)" || __rc=$?
+    printf -v "$1" '%s' "$__val"
+    case "$__rc" in
+        0|1) return 0 ;;
+        *) security_error "Yetki yok: SUDO_USER geçersiz ('${SUDO_USER:-}') — istek reddedildi" ;;
+    esac
+}
+
+# require_role <rol>...  — çağıran root ya da listelenen rollerden biri değilse exit.
+require_role() {
+    local caller="" ROLE=""
+    _rbac_resolve caller; [[ -n "$caller" ]] || return 0
+    read_kv_file "${SRVCTL_USERS_DIR:-/etc/srvctl/users}/${caller}.conf" ROLE
+    local want
+    for want in "$@"; do [[ "$ROLE" == "$want" ]] && return 0; done
+    security_error "Yetki yok: '${caller}' (rol=${ROLE:-tanımsız}) — bu işlem için gereken rol: $*"
+}
+
+# require_domain_grant <domain> — çağıranın DOMAINS= listesinde değilse exit.
+# Boş DOMAINS = tüm domainler (mevcut 'user info' çıktısındaki "tümü" anlamı
+# korunur; geriye uyumlu). admin rolü her zaman geçer.
+require_domain_grant() {
+    local domain="$1" caller="" ROLE="" DOMAINS=""
+    _rbac_resolve caller; [[ -n "$caller" ]] || return 0
+    read_kv_file "${SRVCTL_USERS_DIR:-/etc/srvctl/users}/${caller}.conf" ROLE DOMAINS
+    [[ "$ROLE" == "admin" ]] && return 0
+    [[ -z "$DOMAINS" ]] && return 0
+    [[ ",${DOMAINS}," == *",${domain},"* ]] && return 0
+    security_error "Yetki yok: '${caller}' için '${domain}' domain'ine erişim tanımlı değil (srvctl user grant)"
 }
 
 # Domain adından güvenli kullanıcı adı üret

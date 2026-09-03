@@ -315,8 +315,15 @@ _init_step_proc_isolation() {
     if ! grep -q "/run/shm.*noexec" /etc/fstab; then
         echo "tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0" >> /etc/fstab
     fi
-    mount -o remount /proc 2>/dev/null || true
-    success "hidepid=2 aktif — process'ler izole"
+    # O2 eki (denetim 2026-09): remount başarısızlığı SESSİZCE yutuluyor ve
+    # "aktif" deniyordu; bu, "sır argv'de görünmez" varsayımının tek dayanağı.
+    # Artık gerçek durum /proc/mounts'tan doğrulanır.
+    mount -o remount,hidepid=2,gid=adm /proc 2>/dev/null || true
+    if grep -qE '^proc /proc proc [^ ]*hidepid=(2|invisible)' /proc/mounts 2>/dev/null; then
+        success "hidepid=2 aktif — process'ler izole"
+    else
+        warn "hidepid=2 fstab'a yazıldı ama /proc CANLIDA remount EDİLEMEDİ — yeniden başlatmaya kadar diğer kullanıcılar 'ps' ile root süreçlerini görebilir"
+    fi
 }
 
 _init_step_ssh_hardening() {

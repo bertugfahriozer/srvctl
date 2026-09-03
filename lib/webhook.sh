@@ -353,6 +353,25 @@ User=root
 Group=root
 StandardOutput=append:${WEBHOOK_LOG}
 StandardError=append:${WEBHOOK_LOG}
+# O3 (haftalık denetim 2026-09): bu servis ağa (nginx üzerinden) açık, root
+# çalışan bir bash HTTP ayrıştırıcısıdır; eskiden hiçbir sertleştirme yoktu.
+# Aşağıdaki küme, listener'ın tetiklediği 'srvctl deploy'u KIRMAYAN alt
+# kümedir. ProtectSystem=strict ve MemoryMax BİLEREK dışarıda bırakıldı:
+# deploy'un yazma kümesi framework'e bağlıdır (bkz. srvctl-cron.service.tpl
+# ReadWritePaths= yorumu) ve composer büyük projelerde 512M'ı aşabilir.
+NoNewPrivileges=true
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target
@@ -458,7 +477,13 @@ handle_request() {
         fi
     done
 
-    # Body oku
+    # Body oku — O3: uygulama tarafı tavan (nginx'in client_max_body_size 1m
+    # sınırı 127.0.0.1:${WEBHOOK_PORT}'a doğrudan bağlanan yerel işlem için
+    # geçerli değil). 1 MiB üstü: 413, hiç okunmaz.
+    if (( content_length > 1048576 )); then
+        printf 'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+        return
+    fi
     if [[ $content_length -gt 0 ]]; then
         body=$(head -c "$content_length")
     fi

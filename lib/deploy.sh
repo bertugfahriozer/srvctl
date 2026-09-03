@@ -19,9 +19,9 @@
 cmd_deploy() {
     require_root
     case "${1:-}" in
-        rollback) _deploy_rollback "${@:2}" ;;
-        health)   _deploy_health "${@:2}" ;;
-        list)     _deploy_list "${@:2}" ;;
+        rollback) require_domain_grant "${2:-}"; _deploy_rollback "${@:2}" ;;
+        health)   require_domain_grant "${2:-}"; _deploy_health "${@:2}" ;;
+        list)     require_domain_grant "${2:-}"; _deploy_list "${@:2}" ;;
         prune)
             # Standalone 'srvctl deploy prune' çağrısı (deploy sonundaki OTOMATİK
             # prune'dan AYRI): --apply verilmişse operatöre gerçek sonucu bildir.
@@ -55,7 +55,7 @@ cmd_deploy() {
             echo "  içeriğine göre OTOMATİK DEĞİŞMEZ (uyuşmazlıkta yalnız uyarır)."
             echo ""
             ;;
-        *) _deploy_run "$@" ;;
+        *) require_domain_grant "$1"; _deploy_run "$@" ;;   # Y1: DOMAINS= kapısı
     esac
 }
 

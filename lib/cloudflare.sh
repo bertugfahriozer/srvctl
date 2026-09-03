@@ -50,14 +50,17 @@ _cf_api() {
     local endpoint="$2"
     local data="${3:-}"
 
-    local args=(-sf -X "$method"
-        -H "Authorization: Bearer ${CF_API_TOKEN}"
+    # O2 (denetim 2026-09): token '-H "Authorization: Bearer ..."' ile argv'de
+    # görünüyordu ('ps auxww' / /proc/<pid>/cmdline). Artık '--config -' ile
+    # stdin'den verilir; argv'de yalnız sırsız argümanlar kalır.
+    local args=(--config - -sf -X "$method"
         -H "Content-Type: application/json"
         "https://api.cloudflare.com/client/v4${endpoint}")
 
     [[ -n "$data" ]] && args+=(-d "$data")
 
-    curl "${args[@]}" 2>/dev/null
+    printf 'header = "Authorization: Bearer %s"\n' "$CF_API_TOKEN" \
+        | curl "${args[@]}" 2>/dev/null
 }
 
 _cf_get_zone_id() {
@@ -79,9 +82,9 @@ _cf_setup() {
 
     # Token'ı test et
     local verify
-    verify=$(curl -sf -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-        -H "Authorization: Bearer ${token}" \
-        -H "Content-Type: application/json" 2>/dev/null)
+    verify=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+        | curl --config - -sf -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+            -H "Content-Type: application/json" 2>/dev/null)   # O2: token argv'de değil
 
     local status
     status=$(echo "$verify" | jq -r '.result.status // "error"' 2>/dev/null)
@@ -271,13 +274,4 @@ _cf_status() {
     echo ""
 }
 
-_update_conf() {
-    local key="$1"
-    local value="$2"
-    if grep -q "^${key}=" "${SRVCTL_CONF}" 2>/dev/null; then
-        _sed_inplace "${SRVCTL_CONF}" -e "s|^${key}=.*|${key}=${value}|" \
-            || error "Config güncellenemedi: ${SRVCTL_CONF} (${key})"
-    else
-        echo "${key}=${value}" >> "${SRVCTL_CONF}"
-    fi
-}
+# _update_conf → lib/core.sh (O5: tek kopya, doğrulamalı, tırnaklı yazım)

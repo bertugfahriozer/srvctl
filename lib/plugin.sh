@@ -56,7 +56,7 @@ cmd_plugin() {
             echo ""
             echo "  Kullanım: srvctl plugin <install|remove|list|enable|disable|create>"
             echo ""
-            echo "    install <git_url>       Plugin kur (git repo)"
+            echo "    install <git_url> [--yes]  Plugin kur (git repo; --yes: onay sorma)"
             echo "    remove <isim>           Plugin kaldır"
             echo "    list                    Yüklü plugin'leri listele"
             echo "    enable <isim>           Plugin'i aktifleştir"
@@ -67,9 +67,30 @@ cmd_plugin() {
     esac
 }
 
+# ─── Y4 DÜZELTMESİ (haftalık denetim 2026-09): plugin tedarik zinciri ───
+# ESKİ: 'git clone --depth 1' HEAD'den, pin/imza/checksum YOK; ardından
+# 'chown -R root:root' klonlanan HER dosyayı root'a çevirdiği için aşağıdaki
+# assert_root_owned_path kapıları taze klon için HER ZAMAN geçiyordu — yani
+# yorumlarda güvenlik kontrolü olarak sunulan kapılar hiçbir şey doğrulamıyor,
+# tek gerçek kontrol 'bash -n' idi. Kaynak repo/hesap ele geçirilirse
+# 'plugin install' → 'load_plugins' üzerinden her srvctl çağrısında root RCE.
+# YENİ (selfupdate.sh'ın pinned-commit + TOFU modeliyle hizalı):
+#   * klon SONRASI commit hash'i ve varsa imzalı tag doğrulaması gösterilir,
+#   * root olarak source/bash ETMEDEN ÖNCE açık operatör onayı istenir
+#     ('--yes' ile atlanabilir; cron/CI için),
+#   * hash '.pinned-commit' olarak kaydedilir ('plugin list' gösterir),
+#   * dizin kaynağı için 'chown -R' yerine sahiplik ÖNCEDEN doğrulanır —
+#     kapı gerçekten kapı olur.
 _plugin_install() {
     require_root
-    local source="$1"
+    local source="" assume_yes=0 _a
+    for _a in "$@"; do
+        case "$_a" in
+            --yes|-y) assume_yes=1 ;;
+            -*) error "Bilinmeyen seçenek: ${_a}" ;;
+            *) source="$_a" ;;
+        esac
+    done
     [[ -z "$source" ]] && error "Git URL veya plugin dizini belirtilmedi."
 
     # Plugin dizinini root:root 755 olarak güvenli kur (dünyaya yazılabilir
@@ -87,7 +108,12 @@ _plugin_install() {
 
     step "1/3" "Plugin indiriliyor: ${plugin_name}"
 
+    local pinned_commit="" sig_state="dizin kaynağı (imza yok)"
     if [[ -d "$source" ]]; then
+        # Y4: kaynak dizinin sahipliği KOPYALAMADAN ÖNCE doğrulanır; 'chown -R'
+        # ile sonradan root'a çevirmek kapıyı anlamsız kılıyordu.
+        _plugin_assert_source_dir_trusted "$source" \
+            || error "Plugin kaynağı reddedildi: '${source}' root'a ait değil ya da grup/diğer-yazılabilir"
         cp -r -- "$source" "${SRVCTL_PLUGINS_DIR}/${plugin_name}"
     else
         # O13-a: yalnız https://, ssh://, git@host:path — 'ext::'/'file::' gibi
@@ -96,6 +122,21 @@ _plugin_install() {
             || error "Güvensiz/desteklenmeyen kaynak: ${source} (yalnız https://, ssh://, git@host:path kabul edilir)"
         GIT_ALLOW_PROTOCOL='https:ssh:git' git clone --depth 1 -- "$source" "${SRVCTL_PLUGINS_DIR}/${plugin_name}" 2>/dev/null || \
             error "Plugin indirilemedi: ${source}"
+        pinned_commit="$(git -C "${SRVCTL_PLUGINS_DIR}/${plugin_name}" rev-parse HEAD 2>/dev/null)" || pinned_commit=""
+        [[ "$pinned_commit" =~ ^[0-9a-f]{40}$ ]] \
+            || { rm -rf -- "${SRVCTL_PLUGINS_DIR:?}/${plugin_name}"; error "Plugin commit hash'i okunamadı: ${source}"; }
+        sig_state="$(_plugin_signature_state "${SRVCTL_PLUGINS_DIR}/${plugin_name}" "$pinned_commit")"
+    fi
+
+    # Y4: root olarak source/bash ETMEDEN ÖNCE operatör onayı.
+    echo ""
+    echo "  Kaynak : ${source}"
+    [[ -n "$pinned_commit" ]] && echo "  Commit : ${pinned_commit}"
+    echo "  İmza   : ${sig_state}"
+    warn "Bu içerik root olarak 'source'/'bash' EDİLECEK ve her 'srvctl' çağrısında yüklenecek."
+    if [[ "$assume_yes" != "1" ]]; then
+        confirm "Plugin kurulumuna devam?" \
+            || { rm -rf -- "${SRVCTL_PLUGINS_DIR:?}/${plugin_name}"; info "Kurulum iptal edildi."; return 0; }
     fi
 
     # Klonlanan/kopyalanan ağacı kökten itibaren root'a sabitle ve
@@ -138,6 +179,11 @@ _plugin_install() {
     # Aktif olarak işaretle
     touch "${SRVCTL_PLUGINS_DIR}/${plugin_name}/.enabled"
     chown root:root "${SRVCTL_PLUGINS_DIR}/${plugin_name}/.enabled" 2>/dev/null || true
+    # Y4: kurulan commit'i pinle (denetim izi; 'plugin list' gösterir)
+    if [[ -n "$pinned_commit" ]]; then
+        printf '%s\n' "$pinned_commit" > "${SRVCTL_PLUGINS_DIR}/${plugin_name}/.pinned-commit"
+        chmod 644 "${SRVCTL_PLUGINS_DIR}/${plugin_name}/.pinned-commit"
+    fi
 
     # Install hook varsa çalıştır — root ÇALIŞTIRMA ÖNCESİ sahiplik kapısı.
     local install_hook="${SRVCTL_PLUGINS_DIR}/${plugin_name}/hooks/install.sh"
@@ -150,12 +196,37 @@ _plugin_install() {
     fi
 
     success "Plugin yüklendi: ${plugin_name}"
+    [[ -n "$pinned_commit" ]] && echo "  Commit:      ${pinned_commit:0:12} (${sig_state})"
     echo "  Versiyon:    ${PLUGIN_VERSION:-1.0.0}"
     echo "  Açıklama:    ${PLUGIN_DESCRIPTION:-Belirtilmemiş}"
     echo "  Komut:       srvctl ${plugin_name}"
     echo ""
 
-    log_action "PLUGIN INSTALL: ${plugin_name}"
+    log_action "PLUGIN INSTALL: ${plugin_name}${pinned_commit:+ @${pinned_commit:0:12}} [${sig_state}]"
+}
+
+# Y4 yardımcıları (predicate/saf; test edilebilir)
+# Dizin kaynağı güvenilir mi: root sahipli, symlink değil, grup/diğer-yazılabilir değil
+# (kaynağın içindeki HER dosya için — 'find' ile).
+_plugin_assert_source_dir_trusted() {
+    local dir="$1"
+    [[ -d "$dir" && ! -L "$dir" ]] || return 1
+    local bad
+    bad="$(find "$dir" \( ! -user root -o -perm /022 -o -type l \) -print -quit 2>/dev/null)"
+    [[ -z "$bad" ]]
+}
+
+# HEAD'e işaret eden imzalı bir tag var mı ve doğrulanıyor mu? (stdout: durum metni)
+_plugin_signature_state() {
+    local repo="$1" commit="$2" tag
+    tag="$(git -C "$repo" tag --points-at "$commit" 2>/dev/null | head -1)"
+    if [[ -z "$tag" ]]; then
+        echo "imzalı tag YOK — içerik yalnız operatör onayına dayanıyor"
+    elif git -C "$repo" tag -v "$tag" >/dev/null 2>&1; then
+        echo "imzalı tag DOĞRULANDI (${tag})"
+    else
+        echo "tag var (${tag}) ama imza DOĞRULANAMADI — anahtar yüklü değil ya da imzasız"
+    fi
 }
 
 _plugin_remove() {
@@ -185,7 +256,7 @@ _plugin_remove() {
 _plugin_list() {
     header "Yüklü Plugin'ler"
 
-    printf "  ${DIM}%-20s %-10s %-8s %-35s${NC}\n" "İSİM" "VERSİYON" "DURUM" "AÇIKLAMA"
+    printf "  ${DIM}%-20s %-10s %-8s %-13s %-35s${NC}\n" "İSİM" "VERSİYON" "DURUM" "COMMIT" "AÇIKLAMA"
     divider
 
     local count=0
@@ -194,7 +265,8 @@ _plugin_list() {
         local name
         name=$(basename "$plugin_dir")
 
-        local version="?" description="?" status_text
+        local version="?" description="?" status_text pin=""
+        [[ -f "${plugin_dir}/.pinned-commit" ]] && pin="$(head -c 12 "${plugin_dir}/.pinned-commit" 2>/dev/null)"
 
         if [[ -f "${plugin_dir}/plugin.conf" ]]; then
             # O13-b: 'source' ÖNCESİ sahiplik kapısı — sahipliği/izinleri
@@ -219,7 +291,7 @@ _plugin_list() {
             status_text="${DIM}kapalı${NC}"
         fi
 
-        printf "  %-20s %-10s %-8b %-35s\n" "$name" "$version" "$status_text" "$description"
+        printf "  %-20s %-10s %-8b %-13s %-35s\n" "$name" "$version" "$status_text" "${pin:--}" "$description"
         count=$((count + 1))
     done
 

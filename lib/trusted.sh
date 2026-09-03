@@ -14,16 +14,28 @@ _trusted_parse_validate() {
         line="${line%%#*}"                 # satır-içi yorumu at
         line="${line//[$' \t\r']/}"        # boşluk/tab/CR temizle
         [[ -n "$line" ]] || continue
-        validate_ip_or_cidr "$line" && echo "$line"
+        # Y2: '/0' gibi aşırı geniş aralıklar REDDEDİLİR (bkz. core.sh
+        # validate_ip_or_cidr_narrow gerekçesi). Bu liste fail2ban allowlist'ine
+        # ve nginx set_real_ip_from'a gider; genişlik tavanı fail-closed'dır.
+        if ! validate_ip_or_cidr "$line"; then
+            continue
+        fi
+        if ! validate_ip_or_cidr_narrow "$line" 8 16; then
+            warn "trusted: AŞIRI GENİŞ aralık REDDEDİLDİ: ${line} (v4 ≥ /8, v6 ≥ /16 gerekli)"
+            continue
+        fi
+        echo "$line"
     done < "$file"
 }
 
 # Liste yeterli mi (boş/çöp yanıt koruması). $1=min satır sayısı, $2=dosya.
+# Y2: bir de ÜST sınır var — Cloudflare ~22, UptimeRobot ~100 satır yayınlar;
+# binlerce satırlık bir yanıt (yanlış URL, ele geçirilmiş kaynak) reddedilir.
 _trusted_sane() {
-    local min="$1" file="$2" count
+    local min="$1" file="$2" count max="${TRUSTED_MAX_LINES:-500}"
     [[ -f "$file" ]] || return 1
     count=$(grep -c . "$file" 2>/dev/null || echo 0)
-    (( count >= min ))
+    (( count >= min && count <= max ))
 }
 
 # CF listesinden nginx real-ip bloğu üret (stdout). Yalnız Cloudflare aralıkları.
@@ -62,7 +74,10 @@ _trusted_fetch() {
         cat "${SRVCTL_TRUSTED_FIXTURE_DIR}/${name}" > "$dest"
         return 0
     fi
-    curl -sf --max-time 20 "$url" -o "$dest" 2>/dev/null
+    # Y2: yalnız HTTPS + TLS1.2+ ve yönlendirme YOK (init.sh'daki composer
+    # indirmesiyle aynı desen). Config'te URL 'http://'ye çevrilse bile
+    # düz metin çekilmez — curl '--proto' ihlalinde başarısız döner.
+    curl -sf --proto '=https' --tlsv1.2 --max-redirs 0 --max-time 20 "$url" -o "$dest" 2>/dev/null
 }
 
 # ignoreip'i fail2ban jail.local'e uygula (+ reload, fail2ban varsa).
@@ -74,8 +89,10 @@ _trusted_apply_ignoreip() {
         "${TRUSTED_STATE_DIR}/cloudflare.conf" "${TRUSTED_STATE_DIR}/uptimerobot.conf")
     [[ -f "$jail" ]] || return 0
     if grep -q '^ignoreip = ' "$jail"; then
-        tmp=$(mktemp)
-        sed "s|^ignoreip = .*|ignoreip = ${line}|" "$jail" > "$tmp" && mv "$tmp" "$jail"
+        # Düşük (denetim 2026-09): eski 'mktemp + mv' jail.local'in modunu/
+        # sahipliğini mktemp'in 0600'üne indirgiyordu; _sed_inplace korur.
+        _sed_inplace "$jail" -e "s|^ignoreip = .*|ignoreip = ${line}|" \
+            || { warn "fail2ban ignoreip güncellenemedi: ${jail}"; return 1; }
     else
         printf '\n[DEFAULT]\nignoreip = %s\n' "$line" >> "$jail"
     fi

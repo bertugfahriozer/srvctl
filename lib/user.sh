@@ -5,6 +5,57 @@
 
 # Test için override edilebilir (SITES_AVAILABLE / SRVCTL_FPM_DIR ile aynı desen)
 SRVCTL_USERS_DIR="${SRVCTL_USERS_DIR:-/etc/srvctl/users}"
+# Ev dizini tabanı — test seam'i (K1 düzeltmesi, aşağıya bkz.). Üretimde /home.
+SRVCTL_HOME_BASE="${SRVCTL_HOME_BASE:-/home}"
+
+# ─── K1 DÜZELTMESİ (haftalık denetim 2026-09) — ev dizini altına ROOT yazımı ───
+# ESKİ DAVRANIŞ: 'user key add|remove' ve 'user 2fa setup' (fallback dalı),
+# '/home/<u>/.ssh/authorized_keys' ve '/home/<u>/.google_authenticator'a root
+# olarak '>>' / ': >' ile yazıyor, ardından 'chmod' + 'chown' (-h OLMADAN)
+# uyguluyordu. '_user_add' bu dizini zaten hedef kullanıcıya 'chown -R' ettiği
+# için kullanıcı, dizinin TAM SAHİBİDİR: 'ln -sf /etc/shadow
+# ~/.ssh/authorized_keys' koyabilir. Operatörün tek bir 'srvctl user key add'
+# çağrısı → root symlink'i izleyip /etc/shadow'a yazar, 600'e çeker ve
+# dosyayı 'chown' ile SALDIRGANA DEVREDER (tam root yükseltmesi). 'key
+# remove' tek başına keyfi bir root dosyasını TRUNCATE eder. 2FA fallback
+# dalı da saldırgan tarafından tetiklenebilir ('su - <u> -c ...' kullanıcının
+# kendi ~/.profile'ı sıfırdan farklı dönerse başarısız olur).
+#
+# 'fs.protected_symlinks=1' (init.sh) burada KORUMAZ: o sysctl yalnız
+# world-writable + sticky dizinlerde (/tmp) devreye girer; ~/.ssh 700'dür.
+#
+# DÜZELTME: '_user_guard_home_path' — ev dizininden hedef dosyaya kadar HER
+# bileşen sembolik bağ değil mi diye bakar (ev dizininin KENDİSİ dahil:
+# kullanıcı '~/.ssh' dizinini de '/root/.ssh'e bağlayabilir). Yazımlar
+# 'secure_file' (core.sh — kendi ikinci TOCTOU kapısı var) üzerinden, tüm
+# chown'lar '-h' ile yapılır. Kalan pencere secure_file'ınkiyle aynıdır.
+#
+# Kullanım: _user_guard_home_path <username> <göreli-yol>   (predicate, exit YOK)
+_user_guard_home_path() {
+    local username="$1" rel="$2"
+    local home="${SRVCTL_HOME_BASE}/${username}"
+    local p="$home" comp
+    _reject_symlink "$home" "ev dizini" || return 1
+    local IFS='/'
+    for comp in $rel; do
+        [[ -n "$comp" ]] || continue
+        p="${p}/${comp}"
+        _reject_symlink "$p" "ev dizini altı yol" || return 1
+    done
+    return 0
+}
+
+# Kullanıcının ~/.ssh dizinini güvenle hazırla (symlink kapısı + 700 + -h chown).
+_user_ensure_ssh_dir() {
+    local username="$1"
+    local ssh_dir="${SRVCTL_HOME_BASE}/${username}/.ssh"
+    _user_guard_home_path "$username" ".ssh" || return 1
+    mkdir -p "$ssh_dir" || return 1
+    _reject_symlink "$ssh_dir" "dizin" || return 1
+    chmod 700 "$ssh_dir" || return 1
+    chown -h "${username}:${username}" "$ssh_dir" 2>/dev/null || true
+    return 0
+}
 
 cmd_user() {
     require_root
@@ -73,10 +124,9 @@ _user_add() {
         info "Linux kullanıcısı oluşturuldu: ${username}"
     fi
 
-    # SSH dizini
-    mkdir -p "/home/${username}/.ssh"
-    chmod 700 "/home/${username}/.ssh"
-    chown -R "${username}:${username}" "/home/${username}/.ssh"
+    # SSH dizini (K1: symlink kapısı + '-h' chown; eski 'chown -R' hedefi izlerdi)
+    _user_ensure_ssh_dir "$username" \
+        || error "GÜVENLİK: ${SRVCTL_HOME_BASE}/${username}/.ssh güvenli hazırlanamadı (sembolik bağ?) — kullanıcı eklenmedi."
 
     # Kullanıcı yapılandırma dosyası
     cat > "${SRVCTL_USERS_DIR}/${username}.conf" << USERCONF
@@ -191,9 +241,9 @@ _user_info() {
 
     # SSH key'ler
     echo -e "  ${CYAN}SSH Key'ler${NC}"
-    if [[ -f "/home/${username}/.ssh/authorized_keys" ]]; then
+    if [[ -f "${SRVCTL_HOME_BASE}/${username}/.ssh/authorized_keys" ]]; then
         local key_count
-        key_count=$(wc -l < "/home/${username}/.ssh/authorized_keys")
+        key_count=$(wc -l < "${SRVCTL_HOME_BASE}/${username}/.ssh/authorized_keys")
         echo "  ${key_count} key tanımlı"
     else
         echo "  Henüz key eklenmemiş"
@@ -283,26 +333,39 @@ _user_key() {
             [[ -z "$pubkey" ]] && error "Kullanım: srvctl user key add <username> <pubkey_dosyası_veya_string>"
             [[ ! -f "${SRVCTL_USERS_DIR}/${username}.conf" ]] && error "Kullanıcı bulunamadı."
 
-            local auth_keys="/home/${username}/.ssh/authorized_keys"
-            mkdir -p "/home/${username}/.ssh"
+            local auth_keys="${SRVCTL_HOME_BASE}/${username}/.ssh/authorized_keys"
+            # K1: dizin ve dosya sembolik bağ olamaz; dosya secure_file ile
+            # (0600, -h chown, ikinci TOCTOU kapısı) oluşturulur/korunur.
+            _user_ensure_ssh_dir "$username" \
+                || error "GÜVENLİK: ~/.ssh sembolik bağ ya da hazırlanamadı — key EKLENMEDİ (${username})."
+            _user_guard_home_path "$username" ".ssh/authorized_keys" \
+                || error "GÜVENLİK: authorized_keys sembolik bağ — key EKLENMEDİ (${username})."
+            secure_file "$auth_keys" 600 "${username}:${username}" \
+                || error "authorized_keys güvenli oluşturulamadı: ${auth_keys}"
 
             # Dosya mı string mi?
             if [[ -f "$pubkey" ]]; then
-                cat "$pubkey" >> "$auth_keys"
+                cat -- "$pubkey" >> "$auth_keys"
             else
-                echo "$pubkey" >> "$auth_keys"
+                printf '%s\n' "$pubkey" >> "$auth_keys"
             fi
 
             chmod 600 "$auth_keys"
-            chown "${username}:${username}" "$auth_keys"
+            chown -h "${username}:${username}" "$auth_keys"
 
             success "SSH key eklendi: ${username}"
             log_action "USER KEY ADD: ${username}"
             ;;
         remove)
             [[ ! -f "${SRVCTL_USERS_DIR}/${username}.conf" ]] && error "Kullanıcı bulunamadı."
-            # shellcheck disable=SC2188  # kasıtlı: dosyayı sıfırlamak için no-op komut
-            : > "/home/${username}/.ssh/authorized_keys" 2>/dev/null || true
+            local auth_keys_rm="${SRVCTL_HOME_BASE}/${username}/.ssh/authorized_keys"
+            # K1: ': >' symlink hedefini TRUNCATE ederdi — kapı fail-closed.
+            _user_guard_home_path "$username" ".ssh/authorized_keys" \
+                || error "GÜVENLİK: authorized_keys sembolik bağ — SIFIRLANMADI (${username})."
+            if [[ -e "$auth_keys_rm" ]]; then
+                # shellcheck disable=SC2188  # kasıtlı: dosyayı sıfırlamak için no-op komut
+                : > "$auth_keys_rm" || error "authorized_keys sıfırlanamadı: ${auth_keys_rm}"
+            fi
             success "Tüm SSH key'ler kaldırıldı: ${username}"
             log_action "USER KEY REMOVE: ${username}"
             ;;
@@ -339,14 +402,23 @@ _user_2fa() {
             _sed_inplace "${SRVCTL_USERS_DIR}/${username}.conf" "s|^TWOFA_SECRET=.*|TWOFA_SECRET=${secret}|"
 
             # google-authenticator dosyasını oluştur
-            su - "$username" -c "google-authenticator -t -d -f -r 3 -R 30 -W -s /home/${username}/.google_authenticator" 2>/dev/null || {
-                # Manuel oluştur
-                echo "${secret}" > "/home/${username}/.google_authenticator"
-                echo '"RATE_LIMIT 3 30' >> "/home/${username}/.google_authenticator"
-                echo '" DISALLOW_REUSE' >> "/home/${username}/.google_authenticator"
-                echo '" TOTP_AUTH' >> "/home/${username}/.google_authenticator"
-                chmod 400 "/home/${username}/.google_authenticator"
-                chown "${username}:${username}" "/home/${username}/.google_authenticator"
+            local ga_file="${SRVCTL_HOME_BASE}/${username}/.google_authenticator"
+            # K1: fallback dalı root olarak ev dizinine yazar; kapı ÖNCE gelir.
+            # (Kullanıcı 'su - ... -c' adımını kendi ~/.profile'ıyla bilerek
+            #  düşürüp bu dala yönlendirebilir — bu yüzden kapı fallback'e
+            #  özel değil, her iki dal için ortaktır.)
+            _user_guard_home_path "$username" ".google_authenticator" \
+                || error "GÜVENLİK: ${ga_file} sembolik bağ — 2FA kurulumu İPTAL (${username})."
+            su - "$username" -c "google-authenticator -t -d -f -r 3 -R 30 -W -s ${ga_file}" 2>/dev/null || {
+                # Manuel oluştur — secure_file: 0600 + symlink kapısı + -h chown
+                secure_file "$ga_file" 600 "${username}:${username}" \
+                    || error "2FA dosyası güvenli oluşturulamadı: ${ga_file}"
+                {
+                    printf '%s\n' "${secret}"
+                    printf '%s\n' '"RATE_LIMIT 3 30' '" DISALLOW_REUSE' '" TOTP_AUTH'
+                } > "$ga_file"
+                chmod 400 "$ga_file"
+                chown -h "${username}:${username}" "$ga_file"
             }
 
             # PAM yapılandır
@@ -374,7 +446,7 @@ _user_2fa() {
         disable)
             _user_read_conf "${SRVCTL_USERS_DIR}/${username}.conf"   # eski anahtarları göç ettir
             _sed_inplace "${SRVCTL_USERS_DIR}/${username}.conf" "s|^TWOFA_ENABLED=.*|TWOFA_ENABLED=false|"
-            rm -f "/home/${username}/.google_authenticator"
+            rm -f -- "${SRVCTL_HOME_BASE}/${username}/.google_authenticator"
             success "2FA devre dışı bırakıldı: ${username}"
             log_action "USER 2FA DISABLE: ${username}"
             ;;
