@@ -3588,6 +3588,10 @@ _domain_info() {
     done
     [[ -z "$domain" ]] && error "Domain belirtilmedi. Kullanım: srvctl domain info <domain> [--show-secrets]"
     domain_exists "$domain" || error "Domain bulunamadı: ${domain}"
+    # Y1 (denetim 2026-09): sudoers 'domain info *' bu bayrağı da geçirir —
+    # gerçek kapı burada. Sır yalnız admin'e (ya da doğrudan root'a).
+    require_domain_grant "$domain"
+    [[ "$show_secrets" == "1" ]] && require_role admin
 
     local sname
     sname=$(safe_name "$domain")

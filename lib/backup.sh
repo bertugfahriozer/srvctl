@@ -6,7 +6,8 @@
 cmd_backup() {
     require_root
     case "${1:-help}" in
-        run)     _backup_run "${@:2}" ;;
+        run)     require_domain_grant "${2:-(tüm domainler)}"   # Y1: kısıtlı kullanıcı 'hepsi'ni alamaz
+                 _backup_run "${@:2}" ;;
         list)    _backup_list ;;
         restore) _backup_restore "${@:2}" ;;
         *)

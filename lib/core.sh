@@ -818,6 +818,58 @@ require_root() {
     fi
 }
 
+# ─── Y1 DÜZELTMESİ (haftalık denetim 2026-09): CLI tarafında RBAC kapısı ───
+# sudoers argüman eşleşmesi fnmatch(FNM_PATHNAME) ile yapılır; '*' boşluk
+# dahil her şeyi eşleştirir. Bu yüzden 'srvctl domain info *' satırı
+# 'domain info x.com --show-secrets'i de GEÇİRİR — viewer rolü bile tüm DB
+# parolalarını okuyabiliyordu. Ayrıca 'user grant' ile yazılan DOMAINS=
+# alanı kod tabanında HİÇBİR yerde okunmuyordu (RBAC dekoratifti).
+# Gerçek karar artık burada, sudo'nun kim adına çalıştığına (SUDO_USER) göre
+# verilir. Doğrudan root (SUDO_USER boş) ve admin rolü her şeyi yapabilir.
+#
+# _rbac_caller_read <ROLE_var> <DOMAINS_var>  — çağıranın conf'unu okur (0/1)
+# Dönüş: 0=çağıran yazıldı, 1=doğrudan root (kapı yok), 2=geçersiz ad (fail-closed)
+_rbac_caller() {
+    local caller="${SUDO_USER:-}"
+    [[ -n "$caller" && "$caller" != "root" ]] || return 1   # doğrudan root
+    validate_username "$caller" || return 2
+    printf '%s' "$caller"
+}
+
+# _rbac_resolve <var> — çağıranı $var'a yazar; root ise 0 döner ve var boş kalır.
+_rbac_resolve() {
+    local __rc=0 __val
+    __val="$(_rbac_caller)" || __rc=$?
+    printf -v "$1" '%s' "$__val"
+    case "$__rc" in
+        0|1) return 0 ;;
+        *) security_error "Yetki yok: SUDO_USER geçersiz ('${SUDO_USER:-}') — istek reddedildi" ;;
+    esac
+}
+
+# require_role <rol>...  — çağıran root ya da listelenen rollerden biri değilse exit.
+require_role() {
+    local caller="" ROLE=""
+    _rbac_resolve caller; [[ -n "$caller" ]] || return 0
+    read_kv_file "${SRVCTL_USERS_DIR:-/etc/srvctl/users}/${caller}.conf" ROLE
+    local want
+    for want in "$@"; do [[ "$ROLE" == "$want" ]] && return 0; done
+    security_error "Yetki yok: '${caller}' (rol=${ROLE:-tanımsız}) — bu işlem için gereken rol: $*"
+}
+
+# require_domain_grant <domain> — çağıranın DOMAINS= listesinde değilse exit.
+# Boş DOMAINS = tüm domainler (mevcut 'user info' çıktısındaki "tümü" anlamı
+# korunur; geriye uyumlu). admin rolü her zaman geçer.
+require_domain_grant() {
+    local domain="$1" caller="" ROLE="" DOMAINS=""
+    _rbac_resolve caller; [[ -n "$caller" ]] || return 0
+    read_kv_file "${SRVCTL_USERS_DIR:-/etc/srvctl/users}/${caller}.conf" ROLE DOMAINS
+    [[ "$ROLE" == "admin" ]] && return 0
+    [[ -z "$DOMAINS" ]] && return 0
+    [[ ",${DOMAINS}," == *",${domain},"* ]] && return 0
+    security_error "Yetki yok: '${caller}' için '${domain}' domain'ine erişim tanımlı değil (srvctl user grant)"
+}
+
 # Domain adından güvenli kullanıcı adı üret
 # example.com → example_com
 safe_name() {
