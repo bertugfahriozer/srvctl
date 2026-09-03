@@ -818,6 +818,32 @@ require_root() {
     fi
 }
 
+# ─── O5 DÜZELTMESİ (haftalık denetim 2026-09): srvctl.conf'a güvenli yazım ───
+# ESKİ: notify.sh ve cloudflare.sh'ta KOPYA '_update_conf', değeri kaçışsız
+# olarak hem sed RHS'ine ("&" → eşleşmenin tamamı, "|" → ayırıcı bozulur;
+# Discord URL'lerindeki '?wait=true&thread_id=' sessizce bozuluyordu) hem de
+# 'source' edilen dosyaya yazıyordu: '$(...)'/backtick içeren bir değer
+# sonraki HER 'srvctl' çağrısında root olarak çalışırdı.
+# YENİ: tek kopya, karakter allowlist'i (URL/token/e-posta için yeterli;
+# tırnak, $, `, boşluk, ; YOK) ve tek-tırnaklı yazım.
+_conf_value_safe() {
+    [[ "$1" =~ ^[A-Za-z0-9._:/@+=?\&%~-]*$ ]]
+}
+_update_conf() {
+    local key="$1" value="$2" esc
+    assert_safe_ident "$key" || error "Config anahtarı geçersiz: '${key}'"
+    _conf_value_safe "$value" \
+        || error "Güvensiz yapılandırma değeri REDDEDİLDİ (${key}): yalnız A-Z a-z 0-9 . _ : / @ + = ? & % ~ - kabul edilir"
+    esc="${value//&/\\&}"; esc="${esc//|/\\|}"
+    if grep -q "^${key}=" "${SRVCTL_CONF}" 2>/dev/null; then
+        _sed_inplace "${SRVCTL_CONF}" -e "s|^${key}=.*|${key}='${esc}'|" \
+            || error "Config güncellenemedi: ${SRVCTL_CONF} (${key})"
+    else
+        printf "%s='%s'\n" "$key" "$value" >> "${SRVCTL_CONF}" \
+            || error "Config'e yazılamadı: ${SRVCTL_CONF} (${key})"
+    fi
+}
+
 # ─── Y1 DÜZELTMESİ (haftalık denetim 2026-09): CLI tarafında RBAC kapısı ───
 # sudoers argüman eşleşmesi fnmatch(FNM_PATHNAME) ile yapılır; '*' boşluk
 # dahil her şeyi eşleştirir. Bu yüzden 'srvctl domain info *' satırı

@@ -119,13 +119,28 @@ _send_telegram() {
     # NOT: 'curl -f' HTTP >=400'de başarısız SAYAR — geçersiz token/chat_id
     # gibi durumlar artık gerçekten yansıyor ('|| true' YOK, dönüş değeri
     # send_notification() tarafından kontrol ediliyor).
-    curl -sf -X POST \
-        "https://api.telegram.org/bot${NOTIFY_TELEGRAM_TOKEN}/sendMessage" \
-        -d "chat_id=${NOTIFY_TELEGRAM_CHAT_ID}" \
-        -d "text=${message}" \
-        -d "parse_mode=Markdown" \
-        -d "disable_web_page_preview=true" \
-        > /dev/null 2>&1
+    # O2 (denetim 2026-09): bot token URL'deydi → argv'de → '/proc/<pid>/cmdline'
+    # ile her yerel kullanıcı okuyabiliyordu (hidepid=2 remount sessizce
+    # başarısız olabiliyor). URL ve gövde artık 'curl --config -' ile stdin'den.
+    # (webhook.sh/backup.sh'taki "sır argv'ye yazılmaz" kuralıyla aynı hizada.)
+    _curl_cfg_lines_telegram "$message" | curl -sf -X POST --config - > /dev/null 2>&1
+}
+
+# curl config-dosyası tırnaklı dizgesi: '\', '"' ve satır sonları kaçışlanır
+# (curl 'url = "..."' formatında \n/\t/\"/\\ kaçışlarını tanır).
+_curl_cfg_quote() {
+    local v="$1"
+    v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//$'\n'/\\n}"; v="${v//$'\r'/}"
+    printf '%s' "$v"
+}
+# Test edilebilir: Telegram isteğinin curl config satırlarını üretir (stdout).
+_curl_cfg_lines_telegram() {
+    local message="$1"
+    printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$(_curl_cfg_quote "$NOTIFY_TELEGRAM_TOKEN")"
+    printf 'data-urlencode = "chat_id=%s"\n' "$(_curl_cfg_quote "$NOTIFY_TELEGRAM_CHAT_ID")"
+    printf 'data-urlencode = "text=%s"\n' "$(_curl_cfg_quote "$message")"
+    printf 'data-urlencode = "parse_mode=Markdown"\n'
+    printf 'data-urlencode = "disable_web_page_preview=true"\n'
 }
 
 _send_discord() {
@@ -243,14 +258,4 @@ _notify_test() {
     esac
 }
 
-# Config dosyasına key=value ekle/güncelle
-_update_conf() {
-    local key="$1"
-    local value="$2"
-    if grep -q "^${key}=" "${SRVCTL_CONF}" 2>/dev/null; then
-        _sed_inplace "${SRVCTL_CONF}" -e "s|^${key}=.*|${key}=${value}|" \
-            || error "Config güncellenemedi: ${SRVCTL_CONF} (${key})"
-    else
-        echo "${key}=${value}" >> "${SRVCTL_CONF}"
-    fi
-}
+# _update_conf → lib/core.sh (O5: tek kopya, doğrulamalı, tırnaklı yazım)
