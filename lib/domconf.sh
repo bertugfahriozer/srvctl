@@ -274,6 +274,10 @@ _domconf_edit_ini() {
 
     # ─── Aday içeriği elde et ───
     local cand; cand=$(mktemp)
+    # Düşük (denetim 2026-09): 'error' (exit) ya da Ctrl+C ile kesintide aday/
+    # yedek dosya /tmp'te kalmasın (M8 deseni: EXIT tek başına INT'i garanti etmez).
+    trap 'rm -f -- "${cand:-}" "${backup:-}"' EXIT
+    trap 'rm -f -- "${cand:-}" "${backup:-}"; exit 130' INT TERM
     if [[ -n "$src_file" ]]; then
         [[ -f "$src_file" ]] || { rm -f "$cand"; error "Dosya bulunamadı: ${src_file}"; }
         cp "$src_file" "$cand"
@@ -315,6 +319,8 @@ _domconf_edit_ini() {
 
     # ─── Uygula (yedekle → yerleştir → render → test) ───
     local backup; backup=$(mktemp)
+    trap 'rm -f -- "${cand:-}" "${backup:-}"' EXIT
+    trap 'rm -f -- "${cand:-}" "${backup:-}"; exit 130' INT TERM
     cp "$ini" "$backup"
     cat "$cand" > "$ini"
     chmod 644 "$ini"
@@ -400,6 +406,10 @@ _domconf_open_basedir_one() {
 
     # Mevcut .ini KORUNUR; yalnız open_basedir satırı çıkarılır/eklenir.
     local cand; cand=$(mktemp)
+    # Düşük (denetim 2026-09): 'error' (exit) ya da Ctrl+C ile kesintide aday/
+    # yedek dosya /tmp'te kalmasın (M8 deseni: EXIT tek başına INT'i garanti etmez).
+    trap 'rm -f -- "${cand:-}" "${backup:-}"' EXIT
+    trap 'rm -f -- "${cand:-}" "${backup:-}"; exit 130' INT TERM
     grep -vE '^[[:space:]]*open_basedir[[:space:]]*=' "$ini" > "$cand" || true
     [[ "$state" == "off" ]] && printf 'open_basedir = off\n' >> "$cand"
 
@@ -630,6 +640,10 @@ _domconf_edit_nginx() {
     fi
 
     local cand; cand=$(mktemp)
+    # Düşük (denetim 2026-09): 'error' (exit) ya da Ctrl+C ile kesintide aday/
+    # yedek dosya /tmp'te kalmasın (M8 deseni: EXIT tek başına INT'i garanti etmez).
+    trap 'rm -f -- "${cand:-}" "${backup:-}"' EXIT
+    trap 'rm -f -- "${cand:-}" "${backup:-}"; exit 130' INT TERM
     if [[ -n "$src_file" ]]; then
         [[ -f "$src_file" ]] || { rm -f "$cand"; error "Dosya bulunamadı: ${src_file}"; }
         cp "$src_file" "$cand"
@@ -661,6 +675,8 @@ _domconf_edit_nginx() {
     fi
 
     local backup; backup=$(mktemp)
+    trap 'rm -f -- "${cand:-}" "${backup:-}"' EXIT
+    trap 'rm -f -- "${cand:-}" "${backup:-}"; exit 130' INT TERM
     cp "$conf" "$backup"
     cat "$cand" > "$conf"
     chmod 644 "$conf"

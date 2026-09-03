@@ -39,6 +39,8 @@ _monitor_live() {
         load=$(cat /proc/loadavg 2>/dev/null | awk '{print $1}')
         local cpu_cores
         cpu_cores=$(grep -c processor /proc/cpuinfo 2>/dev/null)
+        # Düşük (denetim 2026-09): boş/0 → awk sıfıra bölme hatası
+        [[ "$cpu_cores" =~ ^[1-9][0-9]*$ ]] || cpu_cores=1
         local cpu_pct
         cpu_pct=$(awk "BEGIN {printf \"%.0f\", (${load} / ${cpu_cores}) * 100}")
         local cpu_bar
