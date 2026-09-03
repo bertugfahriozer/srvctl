@@ -4324,22 +4324,50 @@ _domain_migrate() {
         || warn "DB dökümü alınamadı"
 
     step "3/3" "Karşı sunucuya kopyalanıyor (${remote})..."
-    scp -r "${bundle}" "${remote}:/tmp/" || error "scp başarısız — SSH erişimini kontrol edin."
-    success "Paket kopyalandı: ${remote}:/tmp/$(basename "$bundle")"
+    # ─── Y3 DÜZELTMESİ (haftalık denetim 2026-09) ───
+    # ESKİ: 'scp -r "$bundle" "$remote:/tmp/"' — '-p' YOK. OpenSSH ≥ 9.0
+    # (Ubuntu 24.04 = 9.6) scp'yi SFTP ile çalıştırır ve '-p' yokken kaynak
+    # modunu TAŞIMAZ: 'credentials' (DB/Redis parolaları) ve tam 'db.sql.gz'
+    # dökümü karşı sunucunun DÜNYA-OKUNUR /tmp'sinde 0644 oluşuyor, üstelik
+    # hiçbir dal temizlemiyordu (yerel ${BACKUP_DIR}/migrate-* de kalıyordu).
+    # YENİ: hedefte /root altında 0700 özel dizin (umask 077), 'scp -p',
+    # sonrasında açık chmod; uzak komut argümanları printf %q ile tırnaklanır;
+    # yerel paket işin sonunda silinir; uzak dizin için temizlik talimatı.
+    local remote_dir="/root/.srvctl-migrate/$(basename "$bundle")"
+    local q_remote_dir q_domain q_php q_webroot q_db
+    printf -v q_remote_dir '%q' "$remote_dir"
+    printf -v q_domain '%q' "$domain"
+    printf -v q_php '%q' "$php"
+    printf -v q_webroot '%q' "$WEB_ROOT"
+    printf -v q_db '%q' "$db"
+
+    # shellcheck disable=SC2029  # uzak tarafta genişlemesi KASITLI; değerler %q ile tırnaklı
+    ssh "$remote" "umask 077 && mkdir -p -- ${q_remote_dir} && chmod 700 -- ${q_remote_dir}" \
+        || error "Uzak dizin oluşturulamadı (${remote}:${remote_dir}) — SSH erişimini kontrol edin."
+    scp -p -r "${bundle}/." "${remote}:${remote_dir}/" \
+        || error "scp başarısız — SSH erişimini kontrol edin."
+    # shellcheck disable=SC2029
+    ssh "$remote" "chmod 700 -- ${q_remote_dir} && chmod 600 -- ${q_remote_dir}/* 2>/dev/null; true" || true
+    success "Paket kopyalandı: ${remote}:${remote_dir} (0700, yalnız root)"
+
+    # Yerel paket artık gerekli değil (credentials + DB dökümü içeriyor).
+    rm -rf -- "$bundle"
 
     echo ""
     if [[ "$auto" == "1" ]]; then
         warn "--auto: karşı sunucuda içe aktarma deneniyor..."
-        ssh "$remote" "command -v srvctl >/dev/null && srvctl domain add ${domain} --php=${php} && tar xzf /tmp/$(basename "$bundle")/files.tar.gz -C ${WEB_ROOT} && zcat /tmp/$(basename "$bundle")/db.sql.gz | mysql ${db}" \
+        # shellcheck disable=SC2029
+        ssh "$remote" "command -v srvctl >/dev/null && srvctl domain add ${q_domain} --php=${q_php} && tar xzf ${q_remote_dir}/files.tar.gz -C ${q_webroot} && zcat ${q_remote_dir}/db.sql.gz | mysql ${q_db}" \
             && success "Karşı sunucuda içe aktarıldı." || warn "Otomatik aktarma başarısız — manuel adımları izleyin."
     else
         echo -e "  ${BOLD}Karşı sunucuda çalıştırın:${NC}"
-        echo "    cd /tmp/$(basename "$bundle")"
+        echo "    cd ${remote_dir}"
         echo "    srvctl domain add ${domain} --php=${php}"
         echo "    tar xzf files.tar.gz -C ${WEB_ROOT}"
         echo "    zcat db.sql.gz | mysql ${db}"
         echo ""
     fi
+    warn "Aktarım tamamlanınca karşı sunucuda paketi SİLİN (credentials + DB dökümü içerir): rm -rf ${remote_dir}"
     log_action "DOMAIN MIGRATE: ${domain} -> ${remote} (auto=${auto})"
 }
 
