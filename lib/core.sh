@@ -414,6 +414,22 @@ validate_ip_or_cidr() {
     return 0
 }
 
+# ─── Y2 DÜZELTMESİ (haftalık denetim 2026-09): genişlik tavanlı IP/CIDR ───
+# validate_ip_or_cidr yalnız SÖZDİZİMİ doğrular; '/0' dahil her prefix geçer.
+# Dışarıdan ÇEKİLEN listeler (trusted sync → fail2ban ignoreip + nginx
+# set_real_ip_from) için bu yetmez: tek bir '0.0.0.0/0' satırı fail2ban'i
+# tamamen susturur ve nginx'in HER istemciden gelen CF-Connecting-IP'ye
+# güvenmesine (serbest IP spoofing) yol açar; 'nginx -t' bunu geçerli sayar.
+# Bu doğrulayıcı en az $2 (v4) / $3 (v6) bitlik prefix ister.
+# Kullanım: validate_ip_or_cidr_narrow <ip/cidr> [min_v4=8] [min_v6=16]
+validate_ip_or_cidr_narrow() {
+    local v="$1" min4="${2:-8}" min6="${3:-16}" p
+    validate_ip_or_cidr "$v" || return 1
+    [[ "$v" == */* ]] || return 0
+    p="${v#*/}"
+    if [[ "${v%%/*}" == *:* ]]; then (( p >= min6 )); else (( p >= min4 )); fi
+}
+
 # Ülke kodu: 2 büyük harf
 validate_country() {
     [[ "$1" =~ ^[A-Z]{2}$ ]]

@@ -87,5 +87,43 @@ assert_ok cmd_trusted help
 # init.sh trusted cron + ilk senkronu içeriyor mu (yapısal)
 assert_contains "$(cat "${REPO_ROOT}/lib/init.sh")" "srvctl trusted sync" "init.sh trusted cron satırı içerir"
 
+# ── Y2 (denetim 2026-09): aşırı geniş aralık tavanı ──
+cat > "${WORK}/wide" <<'RAW'
+0.0.0.0/0
+::/0
+10.0.0.0/7
+2400::/8
+173.245.48.0/20
+8.0.0.0/8
+2400:cb00::/16
+RAW
+out="$(_trusted_parse_validate "${WORK}/wide" 2>/dev/null)"
+assert_not_contains "$out" "0.0.0.0/0"       "0.0.0.0/0 REDDEDİLİR (fail2ban susar + real_ip spoofing)"
+assert_not_contains "$out" "::/0"            "::/0 reddedilir"
+assert_not_contains "$out" "10.0.0.0/7"      "/8'den geniş v4 reddedilir"
+assert_not_contains "$out" "2400::/8"        "/16'dan geniş v6 reddedilir"
+assert_contains     "$out" "173.245.48.0/20" "normal CF aralığı geçer"
+assert_contains     "$out" "8.0.0.0/8"       "tam /8 sınırda geçer"
+assert_contains     "$out" "2400:cb00::/16"  "tam /16 v6 sınırda geçer"
+assert_ok   validate_ip_or_cidr_narrow "1.2.3.4"
+assert_ok   validate_ip_or_cidr_narrow "1.2.3.0/24"
+assert_fail validate_ip_or_cidr_narrow "0.0.0.0/0"
+assert_fail validate_ip_or_cidr_narrow "1.0.0.0/4"
+assert_ok   validate_ip_or_cidr        "0.0.0.0/0"   # eski doğrulayıcı sözdizimini kabul etmeye devam eder
+
+# ── Y2: üst sınır — binlerce satırlık yanıt sane DEĞİL ──
+seq 1 600 | sed 's|^|10.0.|; s|$|.0/24|' > "${WORK}/huge"
+assert_fail _trusted_sane 5 "${WORK}/huge"
+TRUSTED_MAX_LINES=1000 assert_ok _trusted_sane 5 "${WORK}/huge"
+
+# ── Düşük: ignoreip güncellemesi jail.local modunu korur ──
+FAIL2BAN_JAIL_LOCAL="${WORK}/jail2.local"
+TRUSTED_STATE_DIR="${WORK}/state2"; mkdir -p "$TRUSTED_STATE_DIR"
+printf '[DEFAULT]\nignoreip = 127.0.0.1/8\n' > "$FAIL2BAN_JAIL_LOCAL"; chmod 644 "$FAIL2BAN_JAIL_LOCAL"
+printf '173.245.48.0/20\n' > "${TRUSTED_STATE_DIR}/cloudflare.conf"
+_trusted_apply_ignoreip >/dev/null 2>&1
+assert_eq "$(stat -c %a "$FAIL2BAN_JAIL_LOCAL")" "644" "jail.local modu 644 KORUNDU (eski mktemp+mv → 600 yapıyordu)"
+assert_contains "$(cat "$FAIL2BAN_JAIL_LOCAL")" "ignoreip = 127.0.0.1/8 173.245.48.0/20" "ignoreip satırı güncellendi"
+
 rm -rf "$WORK"
 test_summary
