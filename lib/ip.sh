@@ -49,9 +49,13 @@ _ip_ban() {
     _ip_value_gate "$ip" || error "Geçersiz IP/CIDR: ${ip}"
     _ip_duration_gate "$duration" || error "Geçersiz süre: ${duration} (saniye sayısı veya 'permanent')"
 
-    # UFW ile engelle
-    ufw insert 1 deny from "$ip" to any comment "srvctl-ban-$(date +%s)" > /dev/null 2>&1
-    success "IP engellendi: ${ip} (${duration}s)"
+    # UFW ile engelle — O4 (denetim 2026-09): çıkış kodu HİÇ kontrol edilmiyor,
+    # ufw pasifken/kural limiti doluyken bile "engellendi" deniyordu.
+    if ufw insert 1 deny from "$ip" to any comment "srvctl-ban-$(date +%s)" > /dev/null 2>&1; then
+        success "IP engellendi: ${ip} (${duration}s)"
+    else
+        error "UFW kuralı EKLENEMEDİ: ${ip} — IP ENGELLENMEDİ ('ufw status' kontrol edin)."
+    fi
 
     # Süre sonunda otomatik kaldır
     if [[ "$duration" != "permanent" ]]; then
@@ -108,8 +112,9 @@ _ip_whitelist() {
                 fi
             fi
 
-            # Nginx'e güvenilir IP olarak ekle
-            _update_nginx_whitelist
+            # Nginx'e güvenilir IP olarak ekle (O4: başarısızlık artık görünür)
+            _update_nginx_whitelist \
+                || error "nginx beyaz listesi CANLIYA ALINAMADI (nginx -t başarısız) — ${ip} dosyada, nginx'te DEĞİL"
 
             success "Beyaz listeye eklendi: ${ip}"
             log_action "IP WHITELIST ADD: ${ip}"
@@ -120,7 +125,8 @@ _ip_whitelist() {
                 _sed_inplace "$whitelist_file" -e "/^${ip}$/d" \
                     || warn "Beyaz liste dosyası güncellenemedi: ${whitelist_file}"
             fi
-            _update_nginx_whitelist
+            _update_nginx_whitelist \
+                || error "nginx beyaz listesi CANLIYA ALINAMADI (nginx -t başarısız) — dosya güncellendi, nginx'te DEĞİL"
             success "Beyaz listeden çıkarıldı: ${ip}"
             log_action "IP WHITELIST REMOVE: ${ip}"
             ;;
@@ -142,11 +148,14 @@ _ip_blacklist() {
             echo "$ip" >> "$blacklist_file"
             sort -u -o "$blacklist_file" "$blacklist_file"
 
-            # UFW'ye kalıcı engel
-            ufw insert 1 deny from "$ip" to any comment "srvctl-blacklist" > /dev/null 2>&1
+            # UFW'ye kalıcı engel (O4: başarısızlık artık görünür; dosyaya
+            # yazıldığı için 'ip reapply' ile tekrar denenebilir)
+            ufw insert 1 deny from "$ip" to any comment "srvctl-blacklist" > /dev/null 2>&1 \
+                || warn "UFW kuralı eklenemedi: ${ip} — kara listeye yazıldı, 'srvctl ip reapply' ile tekrar deneyin"
 
             # Nginx deny listesini güncelle
-            _update_nginx_blacklist
+            _update_nginx_blacklist \
+                || error "nginx kara listesi CANLIYA ALINAMADI (nginx -t başarısız) — ${ip} dosyada, nginx'te DEĞİL"
 
             success "Kalıcı engellendi: ${ip}"
             log_action "IP BLACKLIST ADD: ${ip}"
@@ -159,7 +168,8 @@ _ip_blacklist() {
             fi
             ufw delete deny from "$ip" to any 2>/dev/null
 
-            _update_nginx_blacklist
+            _update_nginx_blacklist \
+                || error "nginx kara listesi CANLIYA ALINAMADI (nginx -t başarısız) — dosya güncellendi, nginx'te DEĞİL"
 
             success "Kalıcı engel kaldırıldı: ${ip}"
             log_action "IP BLACKLIST REMOVE: ${ip}"
@@ -325,34 +335,59 @@ _ip_reapply_all() {
 
     # Nginx snippet'lerini (whitelist/blacklist/geoblock) yeniden üret —
     # idempotent, mevcut conf dosyalarından yeniden yazar.
-    _update_nginx_whitelist
-    _update_nginx_blacklist
+    _update_nginx_whitelist || warn "nginx beyaz listesi canlıya alınamadı (yukarıdaki uyarıya bakın)"
+    _update_nginx_blacklist || warn "nginx kara listesi canlıya alınamadı (yukarıdaki uyarıya bakın)"
     _update_nginx_geoblock || warn "GeoIP haritası yeniden uygulanırken sorun oluştu (yukarıdaki uyarıya bakın)"
 
     success "IP kuralları yeniden uygulandı (kara liste: ${bl_count} IP, beyaz liste: ${wl_count} IP)"
     log_action "IP REAPPLY: blacklist=${bl_count} whitelist=${wl_count}"
 }
 
-_update_nginx_whitelist() {
-    local conf="/etc/nginx/conf.d/srvctl-whitelist.conf"
-    echo "# srvctl IP whitelist — otomatik oluşturuldu" > "$conf"
-    if [[ -f /etc/srvctl/ip-whitelist.conf ]]; then
-        while IFS= read -r ip; do
-            echo "allow ${ip};" >> "$conf"
-        done < /etc/srvctl/ip-whitelist.conf
+# ─── O4 DÜZELTMESİ (haftalık denetim 2026-09) ───
+# ESKİ: 'nginx -t && reload || true' — test başarısızsa sonuç YUTULUYOR, fonksiyon
+# 0 dönüyor, çağıran "Kalıcı engellendi" basıyordu (kural canlıda DEĞİL) ve bozuk
+# conf.d dosyası diskte kalıp sonraki ilgisiz reload'ları da düşürüyordu.
+# Dosyadan okunan IP'ler doğrulanmıyordu (oysa _ip_reapply_all doğruluyor).
+# YENİ: _update_nginx_geoblock ile aynı desen — geçersiz satır atlanır, nginx -t
+# başarısızsa dosya geri alınır ve 1 döner; reload başarısızlığı uyarıdır.
+# $1=allow|deny, $2=kaynak liste, $3=hedef conf, $4=başlık
+_ip_render_nginx_list() {
+    local directive="$1" src="$2" conf="$3" title="$4" ip tmp
+    tmp="$(mktemp "${conf}.srvctl.XXXXXX")" || { warn "geçici dosya oluşturulamadı: ${conf}"; return 1; }
+    {
+        echo "# srvctl ${title} — otomatik oluşturuldu"
+        if [[ -f "$src" ]]; then
+            while IFS= read -r ip; do
+                [[ -n "$ip" ]] || continue
+                validate_ip_or_cidr "$ip" || { warn "${src}: geçersiz IP atlandı: ${ip}"; continue; }
+                echo "${directive} ${ip};"
+            done < "$src"
+        fi
+    } > "$tmp"
+    local had_old=0 bak=""
+    if [[ -f "$conf" ]]; then
+        had_old=1; bak="$(mktemp "${conf}.bak.XXXXXX")" && cp -p -- "$conf" "$bak"
     fi
-    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+    mv -f -- "$tmp" "$conf"
+    if ! nginx -t 2>/dev/null; then
+        if (( had_old )) && [[ -n "$bak" ]]; then mv -f -- "$bak" "$conf"; else rm -f -- "$conf"; fi
+        warn "nginx -t başarısız — ${conf} geri alındı, kural CANLIYA ALINMADI"
+        return 1
+    fi
+    [[ -n "$bak" ]] && rm -f -- "$bak"
+    systemctl reload nginx 2>/dev/null \
+        || warn "nginx reload başarısız — ${conf} diskte, canlıda DEĞİL ('systemctl reload nginx' ile tekrar deneyin)"
+    return 0
+}
+
+_update_nginx_whitelist() {
+    _ip_render_nginx_list allow /etc/srvctl/ip-whitelist.conf \
+        "${SRVCTL_NGINX_WHITELIST_CONF:-/etc/nginx/conf.d/srvctl-whitelist.conf}" "IP whitelist"
 }
 
 _update_nginx_blacklist() {
-    local conf="/etc/nginx/conf.d/srvctl-blacklist.conf"
-    echo "# srvctl IP blacklist — otomatik oluşturuldu" > "$conf"
-    if [[ -f /etc/srvctl/ip-blacklist.conf ]]; then
-        while IFS= read -r ip; do
-            echo "deny ${ip};" >> "$conf"
-        done < /etc/srvctl/ip-blacklist.conf
-    fi
-    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+    _ip_render_nginx_list deny /etc/srvctl/ip-blacklist.conf \
+        "${SRVCTL_NGINX_BLACKLIST_CONF:-/etc/nginx/conf.d/srvctl-blacklist.conf}" "IP blacklist"
 }
 
 # ─── DALGA 6 O13/madde-4 düzeltmesi ───
