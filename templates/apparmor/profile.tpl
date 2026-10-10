@@ -170,6 +170,32 @@ profile srvctl-{{SAFE_NAME}} flags=(attach_disconnected) {
   {{WEB_ROOT}}/{{DOMAIN}}/shared/writable/** rwk,
   {{WEB_ROOT}}/{{DOMAIN}}/releases/**/writable/** rwk,
 
+  # shared/media — kalıcı kullanıcı yüklemeleri (elFinder/medya yöneticisi).
+  # Üretici: sitenin pre-deploy hook'u (shared/hooks/pre-deploy.sh, srvctl'in
+  # DEĞİL operatörün dosyası) her release'in public/media'sını
+  # '../../../shared/media'ya symlink'ler. AppArmor symlink'i ÇÖZÜP GERÇEK
+  # (shared) yolu denetlediğinden release-yolu kuralı ('public_html/** r'
+  # yalnız OKUMA) yazmaya yetmez: mkdir/touch/rename EACCES verir, DAC
+  # yazılabilir görünse bile (kanıt: 'is_writable' true iken mkdir(): Permission
+  # denied). Bu satır shared/writable ile AYNI sınıf kuraldır ve YALNIZ bu
+  # yolu açar — public_html/**, releases/** (writable hariç) ve private/**
+  # YAZMAYA KAPALI kalır; kapsam genişlemez.
+  # 'k' flock/LOCK_EX içindir (bkz. yukarıdaki 'Dosya kilidi' notu).
+  # Kök dizinin KENDİSİ ('shared/media/') için ayrı kural BİLEREK YOK:
+  # '**' en az bir karakter eşler, yani kök dizine 'w' vermez; ama gerek de
+  # yok — dosya/alt dizin oluşturma, silme ve yeniden adlandırma ÇOCUK yol
+  # üzerindeki 'w' ile denetlenir (bu kuralın kapsamı), kökün kendisine
+  # 'w' yalnız kök dizinin mtime/chmod/xattr değişimi içindir. Kökü
+  # oluşturmak (mkdir) FPM'in işi değil, pre-deploy/kurulum betiğinindir.
+  # UYARI: AppArmor yalnız ERİŞİMİ sınırlar, İÇERİĞİ değil — bu dizine
+  # yazılan bir .php dosyasını FPM yine OKUYABİLİR. 'media/' altında betik
+  # çalıştırmayı/servis etmeyi engelleyen kural nginx tarafındadır
+  # (custom.d/<site>/media.conf: '^~ /media/' + iç regex deny); uygulama
+  # ayrıca tehlikeli uzantılı ad oluşturmayı reddetmelidir.
+  # 'exec' (x) VERİLMEZ. profile-cli.tpl'e de EKLENMEDİ: worker/scheduler
+  # medya yazmaz (en az yetki).
+  {{WEB_ROOT}}/{{DOMAIN}}/shared/media/** rwk,
+
   # Laravel yazma yolları (storage/framework/views, bootstrap/cache vb.)
   # render_template değer'lerinde newline yasak olduğundan framework'e göre
   # koşullu blok ENJEKTE EDİLEMEZ — bu yüzden üç framework'ün yolları da
