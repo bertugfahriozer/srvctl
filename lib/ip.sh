@@ -14,6 +14,10 @@ cmd_ip() {
         geoblock)  _ip_geoblock "${@:2}" ;;
         reapply)   _ip_reapply_all ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen ip alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl ip <ban|unban|whitelist|blacklist|list|geoblock|reapply>"
             echo ""
@@ -31,6 +35,7 @@ cmd_ip() {
             echo "                              ufw+fail2ban+nginx'e yeniden uygula"
             echo "                              (ör. 'srvctl init --force' sonrası)"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }

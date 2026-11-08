@@ -25,7 +25,8 @@ WorkingDirectory={{WORKING_DIR}}
 #   Laravel: php artisan schedule:run
 #   Symfony: (yerleşik scheduler yok — messenger:consume worker'a devredilir
 #            ya da uygulamaya özgü bir komuta)
-#   CI4:     php spark tasks:run
+#   CI4:     php spark tasks:run  (genel CI4; ci4ms release'inde STATİK bulunursa
+#            php spark cronjobs:run — bkz. _domain_scheduler_cmd)
 ExecStart={{SCHEDULER_CMD}}
 
 Slice=srvctl-{{SAFE_NAME}}.slice

@@ -171,10 +171,15 @@ cmd_trusted() {
     case "${1:-help}" in
         sync)  require_root; _trusted_sync ;;
         list)  _trusted_list ;;
-        help|*)
+        *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen trusted alt komutu: ${1}"
             echo "  Kullanım: srvctl trusted <sync|list>"
             echo "    sync   Cloudflare + UptimeRobot IP'lerini çek, allowlist'e uygula"
             echo "    list   Yönetilen güvenilir IP'leri ve son senkronu göster"
+            return "$_usage_rc"
             ;;
     esac
 }

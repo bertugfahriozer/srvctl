@@ -10,7 +10,7 @@
 
 cmd_cloudflare() {
     require_root
-    _cf_check_token
+    _cf_check_token "${1:-}"
     case "${1:-help}" in
         setup)   _cf_setup ;;
         dns)     _cf_dns "${@:2}" ;;
@@ -19,6 +19,10 @@ cmd_cloudflare() {
         ddos)    _cf_ddos "${@:2}" ;;
         status)  _cf_status "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen cloudflare alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl cloudflare <setup|dns|purge|waf|ddos|status>"
             echo ""
@@ -33,13 +37,16 @@ cmd_cloudflare() {
             echo "    ddos off <domain>        Under Attack modu kapat"
             echo "    status <domain>          Domain durumu"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }
 
 _cf_check_token() {
     if [[ -z "${CF_API_TOKEN:-}" ]]; then
-        if [[ "${1:-}" != "setup" ]]; then
+        # Token yokken yalnız 'setup' ve kullanım metni (argümansız/help/-h/--help) API'siz çalışır;
+        # diğer her şey (bilinmeyen alt komut dahil) fail-closed kalır.
+        if [[ "${1:-}" != "setup" && "${1:-}" != "" && "${1:-}" != "help" && "${1:-}" != "-h" && "${1:-}" != "--help" ]]; then
             error "Cloudflare API token ayarlanmamış. Önce: srvctl cloudflare setup"
         fi
     fi

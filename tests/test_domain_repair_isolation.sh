@@ -52,6 +52,12 @@ redis-cli() { return 0; }
 id() { return 0; }
 source "${REPO_ROOT}/lib/domain.sh"
 
+# QL5-L1: _domain_repair domconf yüklenemezse artık REDDEDER (fail-closed). core.sh SRVCTL_ROOT'u sabit
+# '/usr/local/srvctl' tuttuğundan bu test domconf'u yükleyemez; test FM adımını değil repair izolasyon-farkındalığını kilitler.
+# FM adımı burada stub'lanır (yükleme-başarısızlığı kolu: test_domain_repair_conf_lib_failclosed.sh).
+_domain_load_conf_lib() { return 0; }
+_domain_repair_fm_step() { return 0; }
+
 if ! declare -F _domain_repair >/dev/null 2>&1; then
     echo "  SKIP: _domain_repair tanımlı değil"
     test_summary

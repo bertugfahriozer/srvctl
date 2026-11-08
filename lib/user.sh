@@ -70,6 +70,10 @@ cmd_user() {
         2fa)      _user_2fa "${@:2}" ;;
         audit)    _user_audit "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen user alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl user <add|remove|list|info|grant|revoke|key|2fa|audit>"
             echo ""
@@ -90,6 +94,7 @@ cmd_user() {
             echo "    developer   deploy, domain info, backup, status"
             echo "    viewer      status, domain list, domain info"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }
