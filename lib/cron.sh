@@ -1419,7 +1419,7 @@ _cron_profile_loaded() {
         # eşleşmede çıkar, aa-status hâlâ yazıyorsa (çok profilli sunucuda çıktı
         # stdio tamponunu aşar) SIGPIPE ile ölür → boru hattı 141 → YÜKLÜ profil
         # "yok" sanılırdı (yanlış-negatif). Çıktı önce değişkene alınır
-        # (lib/domain.sh _domain_aa_profile_loaded ile aynı yöntem, M6).
+        # (lib/domain.sh _domain_aa_profile_loaded ile aynı yöntem).
         local aa_out
         aa_out=$(aa-status 2>/dev/null) || true
         grep -q -- "$profile" <<< "$aa_out" && return 0

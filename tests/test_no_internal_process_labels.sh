@@ -9,10 +9,13 @@
 # Desen sınıfları (her biri aşağıda pozitif kontrolle sınanır):
 #   PAT_CS  büyük harfli tur/bulgu adları (harf duyarlı): F<sayı>[a-eA-E[<sayı>]][-HARF<sayı>|-<sayı>] (F0..F99, F1 / F9e / F9e11 / F9E5 / F9E-3 / F7-H1 / F8-M1),
 #           QL<rakam>, "§15" ve "§ 15" (boşluklu)
-#   PAT_CI  BÜYÜK/küçük harf FARKSIZ: (rev|dev|qa|inv|sec)-<harf><sayı> (SEC-H1, sec-h1, rev-L7, dev-L5), "fuzz bulgusu",
+#   PAT_CI  BÜYÜK/küçük harf FARKSIZ: (rev|dev|qa|inv|sec|sec<harf>)-<harf><sayı> (SEC-H1, sec-h1, seca-L1, rev-L7, dev-L5), "fuzz bulgusu",
 #           ql<çok haneli sayı> (ql5, Ql10, qL3-M2) ve küçük/karışık harfli tur adı f<çok haneli sayı>[a-e[<sayı>]] (f3/yol, f12, f10-h1, f9E, f9e11, f9e5);
 #           $f90, -f2, f20= gibi değişken/bayrak adlarını yakalamaz (önünde $ . / { = - ya da harf/rakam olmamalı, arkasında
 #           harf/rakam olmamalı)
+#   PAT_B   ÇIPLAK bulgu etiketleri (harf duyarlı): L/M + sayı, yalnız bulgu numarası konumlarında — parantez başı "(M2: …", "(L1)", "(M3, …"
+#           ya da cümle sonu eki ", M6)" / "— L1)" / "– L1)" / " - L1)". "L1 önbellek", "M2 SSD", "PHP 8.4", "(L1 önbellek)" gibi sıradan metin yakalanmaz
+#           (etiketten hemen sonra ':' ',' ')' gelmiyorsa, ya da önünde bu ayraçlar yoksa eşleşmez)
 #   PAT_X   alt çizgili/ek önekli tur adları (f9e_12, F9e_12) ve doğrulayıcı/tur-ajanı adları (verifier-A0-3, verifier-a0d, A0-3 biçimi)
 #   DEĞİŞKEN ADI MUAFİYETİ (lib/*.sh, dar): f20 / f21 / f90 = FM dosya numaralarını taşıyan kabuk değişken adlarıdır (20-, 21-, 90- önekli
 #           dosyalar); başka hiçbir f<n> adı muaf değildir.
@@ -27,7 +30,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/tests/lib.sh"
 
 PAT_CS='\bF[0-9]+([a-eA-E][0-9]*)?(-[A-Za-z]+[0-9]*|-[0-9]+)?\b|§[[:space:]]*15|\bQL[0-9]'
-PAT_CI='(rev|dev|qa|inv|sec)-[a-z]+[0-9]+|fuzz bulgusu|(^|[^[:alnum:]_])ql[0-9]+|(^|[^[:alnum:]_$./{=-])f[0-9]+([a-e][0-9]*)?([^[:alnum:]_]|$)'
+PAT_CI='(rev|dev|qa|inv|sec[a-z]?)-[a-z]+[0-9]+|fuzz bulgusu|(^|[^[:alnum:]_])ql[0-9]+|(^|[^[:alnum:]_$./{=-])f[0-9]+([a-e][0-9]*)?([^[:alnum:]_]|$)'
+PAT_B='\([LM][0-9]+[:,)]|(, |— |– | - )[LM][0-9]+\)'
 PAT_X='(^|[^[:alnum:]_$./{=-])[fF][0-9]+[a-eA-E]?[0-9]*_[0-9]+|\bverifier-[A-Za-z0-9]|\bA0-[0-9]'
 CAP_STRIP='s/(^|[^[:alnum:]_])f(5-supersede|6-emergency-off|7-sig|7-emergency-marker|8-stage-gate|8-closed-evidence|9e-on-rc4|9e-state-untrusted)([^[:alnum:]_]|$)/\1\3/g'
 FILE_STRIP='s/(^|[^[:alnum:]_])[fF](20|21|90)([^[:alnum:]_-]|$)/\1\3/g'
@@ -43,7 +47,8 @@ lbl_count() {
     esac
     { printf '%s\n' "$txt" | grep -naE -- "$PAT_CS" || true
       printf '%s\n' "$txt" | grep -naiE -- "$PAT_CI" || true
-      printf '%s\n' "$txt" | grep -naiE -- "$PAT_X" || true; } | cut -d: -f1 | sort -u | grep -c . || true
+      printf '%s\n' "$txt" | grep -naiE -- "$PAT_X" || true
+      printf '%s\n' "$txt" | grep -naE -- "$PAT_B" || true; } | cut -d: -f1 | sort -u | grep -c . || true
 }
 
 # Taranan küme: depodaki BÜTÜN test dışı dosyalar (tests/, docs/superpowers/, .git/ ve bayt-kod önbellekleri hariç). lib/*.sh ve
@@ -62,6 +67,15 @@ for f in "${files[@]}"; do
     assert_eq "$n" "0" "${rel}: iç süreç etiketi (QL<n>, F<n>, F7-H1, SEC-H1, rev-L7, fuzz bulgusu, §15 gibi) yok"
 done
 
+# PAT_B ve önekli (seca-L1) etiketler: pozitif kontrol (her biri bu depodaki gerçek biçimdir) ve yanlış pozitif kontrolü
+for s in '# Tarama süresi tavanları (seca-L1): ifade' '# (direktif başına fork YOK; seca-L1).' '# toplu çözüm (seca-L1) ──' '# Seca-l1 notu' '# SECB-M2 notu' \
+         '# yazılamaz (M2: root sembolik bağ izleyerek yazmaz)' '# (M2: x)' '# (L1)' '# (M3, bkz. x)' '# VAR (açık yazım: işaretsiz alan dahil — L1).' '# işaretsiz alan – L1)' \
+         '# aynı yöntem, M6).' '# (lib/domain.sh y ile aynı yöntem, M6).' '# x - L1)'; do
+    for rel in lib/x.sh README.md templates/x.tpl; do
+        assert_eq "$(printf '%s\n' "$s" | lbl_count "$rel")" "1" "pozitif kontrol PAT_B/seca (${rel}): '${s}' etiket sayılır"
+    done
+done
+assert_eq "$(printf '%s\n' 'L1 önbellek (L1 önbellek) L1 cache' 'M2 SSD takılı' 'PHP 8.4 ve M6 vida' 'sürüm 1.2, L1 önbelleği' '(L1 önbellek ayrı)' 'secure-x1 second-l1 secure-h1' 'HTTP/1.1, M2' 'Intel L1: 32K' 'AL1, M6x' 'sha-1)' 'node-L1' '(a) alan' '(b) şart' 'rl_strict, burst=5' | lbl_count lib/x.sh)" "0" "kontrol PAT_B/seca: L1 önbellek, M2 SSD, sürüm dizesi, (a)/(b) maddeleri, secure-/second- sözcükleri, sha-1) yakalanmaz"
 # PAT_X: alt çizgili tur adları ve doğrulayıcı adları (kilit önceki sürümde bunları kaçırıyordu)
 for s in '# f9e_12 sonrası' '# F9e_12 sonrası' '# f9_3' '# verifier-A0-3 bulgusu' '# Verifier-a0d' '# A0-3 turu' '# (lab: verifier-a0c/raw/x)'; do
     for rel in lib/x.sh README.md templates/x.tpl install.sh tools/x.sh bin/srvctl; do

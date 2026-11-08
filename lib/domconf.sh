@@ -1019,7 +1019,7 @@ _fmprov_emergency_marker() {
 }
 
 # İKİNCİ GÜVENİLİR KONUM. Kayıt dizini (SRVCTL_STATE_DIR/_fm-auth) güvenilmezse (sembolik bağ, sahip/mod/yol
-# yanlış) işaret oraya YAZILAMAZ (M2: root sembolik bağ izleyerek yazmaz) — oysa tam o durumda operatör dizini düzeltip
+# yanlış) işaret oraya YAZILAMAZ (root sembolik bağ izleyerek yazmaz) — oysa tam o durumda operatör dizini düzeltip
 # 'status'un önerdiği komutu koşunca kayıt 'on' diye okunurdu. Bu yüzden işaret, kayıt dizininden BAĞIMSIZ,
 # root:root 0700 bir dizine yazılır: ${SRVCTL_FM_EMERGENCY_DIR:-/var/lib/srvctl/fm-emergency} (srvctl durum ağacının
 # DIŞINDA; /usr/local/srvctl altındaki bir bozulma buraya taşmaz). _fmprov_emergency_present HER İKİ konuma bakar;
@@ -1927,7 +1927,7 @@ _domconf_fm_untrusted_loud() {
 }
 
 # Geri alma sonrası doğrulanacak alanlar (işlem tablosu DİSKE dokunmadan ÖNCE okunmalı). Koşul: (a) acil kapatma işareti var
-# YA DA (b) 'on' sahneleyen girdinin yedeğinde AUTH (90) yoktu ama diskte şimdi VAR (açık yazım: işaretsiz alan dahil — L1).
+# YA DA (b) 'on' sahneleyen girdinin yedeğinde AUTH (90) yoktu ama diskte şimdi VAR (açık yazım: işaretsiz alan dahil).
 # (a) alanlar KAPALI OLMAK ZORUNDADIR (kanıt yoksa alarm); (b) alanlar "YUMUŞAK"tır: önceki durum kapalı idiyse (geri alma
 # sonrası kapalı-disk kanıtı var) tam doğrulama yapılır; kanıt yoksa önceki durum zaten AÇIK/yarımdı (ör. açık alanın onarımı):
 # SESSİZ ATLANMAZ (bkz. _domconf_fm_reclose_verify: disk açıksa dürüst uyarı, değilse çalışan durum sondalanır). Sonuç: _FMRV_LIST (alan adları), _FMRV_SOFT (yumuşak alanlar, boşlukla ayrık).
