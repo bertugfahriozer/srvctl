@@ -53,6 +53,10 @@ cmd_plugin() {
         disable)  _plugin_disable "${@:2}" ;;
         create)   _plugin_create "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen plugin alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl plugin <install|remove|list|enable|disable|create>"
             echo ""
@@ -63,6 +67,7 @@ cmd_plugin() {
             echo "    disable <isim>          Plugin'i devre dışı bırak"
             echo "    create <isim>           Yeni plugin iskeleti oluştur"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }

@@ -65,6 +65,12 @@ _redis_version_pair() { echo "${FAKE_REDIS_MAJOR} ${FAKE_REDIS_MINOR}"; }
 
 source "${REPO_ROOT}/lib/domain.sh"
 
+# QL5-L1: _domain_repair domconf yüklenemezse artık REDDEDER (fail-closed). core.sh SRVCTL_ROOT'u sabit
+# '/usr/local/srvctl' tuttuğundan bu test domconf'u yükleyemez; test FM adımını değil Redis scripting kararının korunmasını kilitler.
+# FM adımı burada stub'lanır (yükleme-başarısızlığı kolu: test_domain_repair_conf_lib_failclosed.sh).
+_domain_load_conf_lib() { return 0; }
+_domain_repair_fm_step() { return 0; }
+
 if ! declare -F _domain_repair >/dev/null 2>&1 || ! declare -F _domain_redis_queue_gate >/dev/null 2>&1; then
     echo "  SKIP: _domain_repair/_domain_redis_queue_gate henüz yok (lib/domain.sh paralel değişiyor olabilir)"
     rm -rf "$WEB_ROOT" "$SRVCTL_STATE_DIR" "$SRVCTL_FPM_DIR" "$SRVCTL_SYSTEMD_DIR" "$SRVCTL_PHP_POOL_DIR"

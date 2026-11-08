@@ -46,6 +46,8 @@ export SRVCTL_STATE_DIR="$(mktemp -d)"
 export SRVCTL_RATE_PROFILES="${REPO_ROOT}/conf/rate-profiles.conf"
 export SRVCTL_RESOURCE_PROFILES="${REPO_ROOT}/conf/resource-profiles.conf"
 source "${REPO_ROOT}/tests/lib.sh"
+source "${REPO_ROOT}/tests/harness_safe.sh"
+trap 'hs_reap KILL' EXIT
 source "${REPO_ROOT}/lib/core.sh"
 SRVCTL_TEMPLATES="${REPO_ROOT}/templates"
 log_action() { :; }
@@ -246,7 +248,7 @@ if command -v flock >/dev/null 2>&1; then
         _deploy_lock "$domA"
         sleep 2
     ) &
-    holder_pid=$!
+    holder_pid=$!; hs_track "$holder_pid"   # F9b/b: arka plan çocuğu izlenir; EXIT tuzağı hs_reap ile kapatır
     sleep 1
 
     assert_fail _run_isolated _deploy_lock "$domA" \

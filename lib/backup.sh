@@ -11,6 +11,10 @@ cmd_backup() {
         list)    _backup_list ;;
         restore) _backup_restore "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen backup alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl backup <run|list|restore>"
             echo ""
@@ -19,6 +23,7 @@ cmd_backup() {
             echo "    restore <yedek_dizini> [domain] [--dry-run]"
             echo "                                       Geri yükleme (opsiyonel tek-domain filtresi)"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }
