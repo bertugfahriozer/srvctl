@@ -34,6 +34,10 @@ logs/
 *.tar.gz
 *.tgz
 
+# ─── Test araçlarının ürettiği önbellek (tests/fuzz Python): commit listesine GİRMEMELİ (tools/tree-parity.sh ARTEFAKT) ───
+__pycache__/
+*.pyc
+
 # ─── Sırlar — ASLA commit'lenmemeli ───
 .credentials
 **/.credentials
