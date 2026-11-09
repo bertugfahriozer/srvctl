@@ -402,7 +402,7 @@ run_cases <<'CASES'
 1 @@ kesin-ret @@ error_page 404 /e.html; @@ error_page
 1 @@ kesin-ret @@ location /x {¶ internal;¶} @@ internal
 1 @@ kesin-ret @@ charset utf-8; @@ charset
-1 @@ kesin-ret @@ default_type text/plain; @@ default_type
+1 @@ - @@ default_type $uri; @@ default_type değişkenli (MIME belirteci değil)
 1 @@ kesin-ret @@ gzip on; @@ gzip
 1 @@ kesin-ret @@ etag off; @@ etag
 1 @@ kesin-ret @@ autoindex on; @@ autoindex
@@ -433,7 +433,7 @@ run_cases <<'CASES'
 1 @@ kesin-ret @@ mirror /m; @@ mirror
 1 @@ kesin-ret @@ dav_methods PUT; @@ dav_methods
 1 @@ kesin-ret @@ resolver 8.8.8.8; @@ resolver
-1 @@ kesin-ret @@ types {¶} @@ types
+1 @@ - @@ types text/html; @@ types argümanlı (blok değil)
 1 @@ kesin-ret @@ limit_req_zone $binary_remote_addr zone=z:1m rate=1r/s; @@ limit_req_zone
 1 @@ kesin-ret @@ log_format x '$remote_addr'; @@ log_format
 1 @@ kesin-ret @@ set_real_ip_from 0.0.0.0/0; @@ set_real_ip_from

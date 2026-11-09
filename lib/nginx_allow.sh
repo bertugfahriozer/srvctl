@@ -24,12 +24,14 @@
 # set -e altında da güvenli (if / || true ile).
 
 _NGXALLOW_MAX_BYTES=32768
-# Tarama süresi tavanları (seca-L1): ifade (direktif/blok başlığı) sayısı, {n,m} nicelik sınırı
+# Tarama süresi tavanları: ifade (direktif/blok başlığı) sayısı, {n,m} nicelik sınırı
 # (POSIX RE_DUP_MAX; BSD grep zaten >255'i derlemez, GNU grep {0,m}'yi karesel açar: tek
 # `[0-9]{1,32767}` 26,8 s), FM yolu sondasının red yolundaki ayrıştırma grep bütçesi.
 _NGXALLOW_MAX_STMT=2048
 _NGXALLOW_RX_DUP_MAX=255
 _NGXALLOW_PROBE_ID_MAX=64
+# MIME belirteci: RFC 6838 kısıtlı ad karakterleri AMA '$' YOK (değişken başlatamaz), tür/alt-tür 127'şer karakter tavanı.
+_NGXALLOW_RE_MIME='^[A-Za-z0-9!#&^_.+-]{1,127}/[A-Za-z0-9!#&^_.+-]{1,127}$'
 _NGXALLOW_CAPPED=0
 _NGXALLOW_CUR_LINE=0
 _NGXALLOW_CUR_DIR=""
@@ -168,7 +170,7 @@ _ngxallow_build_probes
 #    reddedebilir, hiçbir eşleşmeyi kaçırmaz) ve GNU grep'in {0,m} açılımındaki karesel
 #    derleme maliyeti doğmaz.
 #  - _ngxallow_scan içinde (_NGXALLOW_DEFER=1) sonda ertelenir: ERE kuyruğa yazılır, tarama
-#    sonunda _ngxallow_probe_flush TEK grep ile çözer (direktif başına fork YOK; seca-L1).
+#    sonunda _ngxallow_probe_flush TEK grep ile çözer (direktif başına fork YOK).
 #    Doğrudan çağrıda (kuyruk yok) sonda burada, eskisi gibi yapılır.
 _ngxallow_regex_ok() {
     local p="$1" ci="${2-0}" n i c nx j
@@ -389,7 +391,7 @@ _ngxallow_regex_ok() {
     return 0
 }
 
-# ── FM yolu sondası: ertelenmiş kuyruk + toplu çözüm (seca-L1) ──
+# ── FM yolu sondası: ertelenmiş kuyruk + toplu çözüm ──
 # Kuyruk dizileri _NGXALLOW_PQ_{ERE,LINE,DIR} _ngxallow_scan'ın YERELLERİDİR (dinamik kapsam;
 # taramalar arasında sızmaz). Satır/direktif _ngxallow_cb'nin o anki ifadesidir.
 _ngxallow_probe_defer() {
@@ -532,15 +534,23 @@ _ngxallow_cb() {
 
     _ngxallow_lc "$dir"; dl="$_NGXALLOW_LC"
 
+    # types bloğunun İÇİ (yığının üstü tam 'types'): satırlar direktif değil MIME eşlemesidir; aşağıda ayrı denetlenir.
+    local intypes=0 krn="$dl"
+    nst="${#_NGX_STACK[@]}"
+    if (( nst > 0 )) && [[ "${_NGX_STACK[nst-1]}" == "types" ]]; then intypes=1; fi
+    # Dar muafiyet: kesin-ret listesinden YALNIZ tam küçük harfli types / default_type / autoindex adları çıkar ve tabloda
+    # ayrıca sınırlanır; büyük/küçük harf varyantları ve autoindex_* türevleri kesin-ret KALIR.
+    if (( intypes == 0 )) && [[ "$dir" == "types" || "$dir" == "default_type" || "$dir" == "autoindex" ]]; then krn=""; fi
+
     # ── KESİN RET (açık sınıflar; tanınmayan zaten varsayılan-ret) ──
-    case "$dl" in
+    case "$krn" in
         *_pass|proxy_*|fastcgi_*|uwsgi_*|scgi_*|grpc_*|memcached_*)
             _ngxallow_fail "$line" "$dir" "kesin-ret: arka uç/proxy sınıfı (*_pass, proxy_*, fastcgi_*, uwsgi_*, scgi_*, grpc_*) kullanıcı dosyasında yasak"; return 0 ;;
         auth_request*|auth_basic*|include|root|alias|server_name|listen|disable_symlinks|modsecurity*|ssl_*|upstream|map|geo|split_clients|stream|mail|events|http|server|types|types_hash_*|error_log|error_page|internal|resolver|mirror|ssi|ssi_*|add_before_body|add_after_body|dav_*|*_store|*_path|*_file|sub_filter*|more_*|add_trailer|load_module|lua_*|*_by_*|js_*|perl*|echo*|xslt*|secure_link*|image_filter*|userid*|satisfy|charset*|default_type|gzip*|etag|autoindex*|server_tokens|limit_rate*|client_body_*|client_header_*|keepalive_*|send_timeout|large_client_header_buffers|set_real_ip_from|real_ip_*|if_modified_since|open_file_cache*|sendfile*|tcp_*|worker_*|user|pid|daemon|env|rewrite_log|log_subrequest|log_format|open_log_file_cache|ancient_browser*|referer_hash_*|valid_referers|random_index|empty_gif|flv|mp4|slice|stub_status|status|hls|fancyindex*|geoip*|vhost_traffic_status*|limit_req_zone|limit_conn_zone|limit_req_status|limit_conn_status|limit_req_log_level|limit_conn_log_level|allow_*|clean_*)
             _ngxallow_fail "$line" "$dir" "kesin-ret: '$dir' kullanıcı dosyasında yasak"; return 0 ;;
     esac
 
-    if [[ "$dir" != "$dl" ]]; then
+    if [[ "$dir" != "$dl" ]] && (( intypes == 0 )); then
         _ngxallow_fail "$line" "$dir" "tanınmayan-direktif: direktif adı küçük harf olmalı"; return 0
     fi
 
@@ -571,8 +581,43 @@ _ngxallow_cb() {
             _ngxallow_fail "$line" "$dir" "yasak-dizgi: srvctl/FM/token ad uzayı ya da yasak değişken dizgisi"; return 0 ;;
     esac
 
+    # ── types bloğunun içi: yalnız "MIME_TÜRÜ uzantı [uzantı …];" ──
+    if (( intypes )); then
+        if [[ "$kind" != "stmt" ]]; then
+            _ngxallow_fail "$line" "$dir" "baglam: types bloğunda iç blok yasak (yalnız MIME_TÜRÜ uzantı… satırları)"; return 0
+        fi
+        if [[ ! "$dir" =~ $_NGXALLOW_RE_MIME ]]; then
+            _ngxallow_fail "$line" "$dir" "arguman: types bloğunda yalnız MIME_TÜRÜ uzantı… satırı olur (tür ^[A-Za-z0-9!#&^_.+-]+/[A-Za-z0-9!#&^_.+-]+\$; yönerge/değişken/tırnak/include yasak)"; return 0
+        fi
+        if (( nargs < 1 )); then
+            _ngxallow_fail "$line" "$dir" "arguman: types satırında en az bir uzantı gerekir"; return 0
+        fi
+        for t in "$@"; do
+            if [[ ! "$t" =~ ^[A-Za-z0-9]+$ ]]; then
+                _ngxallow_fail "$line" "$dir" "arguman: types uzantısı ^[A-Za-z0-9]+\$ olmalı"; return 0
+            fi
+        done
+        return 0
+    fi
+
     # ── direktif tablosu ──
     case "$dl" in
+    types)
+        if [[ "$kind" != "open" ]] || ! _ngxallow_ctx_ok SL; then _ngxallow_fail "$line" "$dir" "baglam: types yalnız server/location içinde blok olarak"; return 0; fi
+        if (( nargs != 0 )); then _ngxallow_fail "$line" "$dir" "arguman: types bloğu argümansız açılır"; return 0; fi
+        ;;
+    default_type)
+        if [[ "$kind" != "stmt" ]] || ! _ngxallow_ctx_ok SL; then _ngxallow_fail "$line" "$dir" "baglam: default_type yalnız server/location ifadesi"; return 0; fi
+        if (( nargs != 1 )) || [[ ! "$1" =~ $_NGXALLOW_RE_MIME ]]; then
+            _ngxallow_fail "$line" "$dir" "arguman: default_type tek MIME belirteci olmalı (değişkenli/tırnaklı/boşluklu yasak)"; return 0
+        fi
+        ;;
+    autoindex)
+        if [[ "$kind" != "stmt" ]] || ! _ngxallow_ctx_ok SL; then _ngxallow_fail "$line" "$dir" "baglam: autoindex yalnız server/location ifadesi"; return 0; fi
+        if (( nargs != 1 )) || [[ "$1" != "off" ]]; then
+            _ngxallow_fail "$line" "$dir" "kesin-ret: autoindex yalnız 'off' olabilir (dizin listeleme açmak yasak)"; return 0
+        fi
+        ;;
     client_max_body_size)
         if [[ "$kind" != "stmt" ]] || ! _ngxallow_ctx_ok SL; then _ngxallow_fail "$line" "$dir" "baglam: client_max_body_size yalnız server/location ifadesi"; return 0; fi
         if (( nargs != 1 )) || [[ ! "$1" =~ ^[1-9][0-9]{0,5}[kKmMgG]?$ ]]; then

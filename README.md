@@ -299,6 +299,9 @@ eşitliğini `tests/test_readme_allowlist.sh` kilitler).
 | İzinli direktif | Bağlam | Kısıt |
 |---|---|---|
 | `client_max_body_size` | S L | tek argüman `^[1-9][0-9]{0,5}[kKmMgG]?$` (`0` yasak) |
+| `types` (blok) | S L | argümansız blok; içinde YALNIZ `<tür>/<alt-tür> <uzantı> [<uzantı> …];` satırları (tür RFC 6838 karakterleri, `$` yok; uzantı `[A-Za-z0-9]+`; yönerge/değişken/tırnak/`include`/iç blok yasak); boş `types {}` kabul |
+| `default_type` | S L | tek MIME belirteci (`<tür>/<alt-tür>`; değişkenli/tırnaklı yasak) |
+| `autoindex` | S L | YALNIZ `off` (`on` ve her varyantı, `autoindex_*` kesin ret) |
 | `location` (blok) | S L | önek / `=` / `^~`: `^/[A-Za-z0-9._~/-]*$` (`..` yasak) ya da adlı `@[a-z][a-z0-9_]{0,31}`; `~` / `~*` regex (aşağıdaki regex kuralları) |
 | `if` (blok) | S L | `($değişken)` ya da `($değişken OP değer)`; OP: `=` `!=` `~` `~*` `!~` `!~*`; sol işlenen tek değişken (dosya testi `-f`/`-d`… ve bileşik yasak); `=`/`!=` sağ işleneni değişkensiz sabit (≤200); blok içinde blok yasak |
 | `set` | S L I J | `set $u_[a-z0-9_]{1,30} DEĞER`; değer çıkış kanalı sayılır (`$uri`, `$1..$9` ve yakalama kaynaklı `$u_*` yasak); okunan `$u_*` önce `set` ile tanımlanmış olmalı |
