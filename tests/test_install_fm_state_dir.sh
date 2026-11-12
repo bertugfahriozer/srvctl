@@ -72,6 +72,7 @@ _selfupdate_fetch_pinned() { return 0; }
 _selfupdate_verify_tag_signature() { :; }
 _selfupdate_install_from_staging() { echo kurulum >> "$SEQ"; }
 _selfupdate_prune_backups() { :; }
+_selfupdate_harden_tree() { return 0; }   # sahiplik kilidi burada konu değil (tests/test_selfupdate_ownership.sh)
 _selfupdate_offer_fm_root() { :; }
 _selfupdate_restore_from_backup() { echo geri-al >> "$SEQ"; return 0; }
 _selfupdate_prepare_fm_state_dir() { echo hazirlik >> "$SEQ"; return "${PREP_RC:-0}"; }

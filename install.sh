@@ -249,7 +249,17 @@ echo -e "  ${CYAN}[4/5]${NC} İzinler ayarlanıyor..."
 chmod 700 "${INSTALL_DIR}"
 chmod 600 "${INSTALL_DIR}/conf/srvctl.conf"
 chmod 750 "${INSTALL_DIR}/bin" "${INSTALL_DIR}/lib"
-chown -R root:root "${INSTALL_DIR}"
+# -h: ağaçtaki sembolik bağların KENDİSİ düzenlenir, hedefi değil (GNU -R varsayılanı -P'dir; açıkça yazıldı).
+chown -hR root:root "${INSTALL_DIR}"
+# Kod ağacı sahiplik kilidi (lib/core.sh :: srvctl_harden_code_tree): bin/lib/templates/completions/.backups + conf veri
+# tabloları root:root ve grup/diğer-yazılabilir DEĞİL olmalı. Kaynak ağaçtan (macOS'ta tar/rsync -a ile) gelen uid/modlar
+# 'cp' ile var olan dosyaya sızabilir; root olarak yürütülen kod başka bir uid'e yazılabilir kalırsa o hesap root'a yükselir.
+# Doğrulanamazsa kurulum BAŞARISIZ sayılır (taze kabuk: yeni kopyalanan core.sh kullanılır).
+if ! bash -c 'source "$1/lib/core.sh" && srvctl_harden_code_tree "$1" conf/rate-profiles.conf conf/resource-profiles.conf' _ "${INSTALL_DIR}"; then
+    echo -e "${RED}✗${NC}  GÜVENLİK: ${INSTALL_DIR} kod ağacı root:root'a çekilemedi — kurulum başarısız."
+    echo "   Elle: sudo find ${INSTALL_DIR} -xdev ! -user root -exec chown -h root:root {} +"
+    exit 1
+fi
 
 # ─── 5. Log dizini ───
 echo -e "  ${CYAN}[5/5]${NC} Log dizini hazırlanıyor..."

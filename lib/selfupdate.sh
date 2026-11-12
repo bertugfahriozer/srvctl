@@ -419,6 +419,21 @@ _selfupdate_prune_backups() {
     done < <(find "$SRVCTL_SELFUPDATE_BACKUPS" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort -r)
 }
 
+# Kurulu kod ağacının (bin/lib/templates/completions + .backups + .current-commit + conf veri tabloları) sahipliğini
+# root:root + grup/diğer-yazma-yok olarak YENİDEN KURAR ve doğrular (işlev lib/core.sh :: srvctl_harden_code_tree).
+# KÖK NEDEN: yukarıdaki 'cp -f' var olan dosyanın sahipliğini KORUR; yedek/geri yükleme 'cp -a' kaynağın uid'ini TAŞIR.
+# İlk kurulum sahipliği koruyan bir kopyayla (macOS'tan tar/rsync -a/cp -a) yapıldıysa uid 501 dosyalar güncellemelerden
+# sağ çıkar ve o uid'i sonradan alan hesap root olarak yürütülen kodu değiştirebilir (canlıda 45 yol, CVSS 7.8).
+# state/, logs/, plugins/ ve conf/srvctl.conf KAPSAM DIŞIDIR (dokunulmaz). rc 1: onarılamayan yol var.
+_selfupdate_harden_tree() {
+    local -a extra=()
+    local dataconf
+    for dataconf in "${_SELFUPDATE_DATA_CONFS[@]}"; do
+        extra+=("conf/${dataconf}")
+    done
+    srvctl_harden_code_tree "$SRVCTL_ROOT" "${extra[@]}"
+}
+
 # Bir yedek dizininden bin/lib/templates/completions/conf/rate-profiles.conf/
 # .current-commit'i canlı kuruluma geri yazar. Hem otomatik (sağlık kontrolü
 # başarısız → _selfupdate_run) hem manuel ('self-update rollback') yoldan
@@ -449,6 +464,8 @@ _selfupdate_restore_from_backup() {
     if [[ -f "${dir}/.current-commit" ]]; then
         cp -a "${dir}/.current-commit" "$SRVCTL_CURRENT_COMMIT"
     fi
+    # 'cp -a' yedeğin uid'lerini geri taşır (eski bir yedek root dışı sahipli olabilir) — sahipliği yeniden kur.
+    _selfupdate_harden_tree || { warn "Geri yükleme sonrası kod ağacı sahipliği doğrulanamadı."; return 1; }
     return 0
 }
 
@@ -506,6 +523,11 @@ _selfupdate_run() {
     #    ver, kararı operatöre bırak (bkz. dosya başı GÜVENLİK MODELİ).
     _selfupdate_warn_if_pin_stale "$PINNED_REPO" "$PINNED_COMMIT"
 
+    # ── 1b. Ön sertleştirme: var olan kurulumda root dışı sahipli yol varsa (eski kurulumdan kalma) yedek alınmadan ve
+    #      yeni kod çalıştırılmadan ÖNCE onar; onarılamazsa hiçbir şey başlamadan dur (fail-closed). ──
+    _selfupdate_harden_tree \
+        || error "GÜVENLİK: kurulu kod ağacının sahipliği root:root'a çekilemedi — güncelleme başlatılmadı."
+
     # ── 2. Mevcut kurulumun YEDEĞİ (staging oluşturulmadan ÖNCE — bkz. aşağıdaki
     #      not: staging '.selfupdate-clone.*' adı hiçbir kopyalama globuna
     #      uymadığından zaten yedeğe karışmazdı, ama önce almak daha temiz:
@@ -534,10 +556,15 @@ _selfupdate_run() {
     # ── 5. Dosyaları kopyala ──
     step "2/5" "Dosyalar güncelleniyor..."
     _selfupdate_install_from_staging "$staging"
+    # Sahiplik kilidi: sağlık kontrolü yeni kodu ROOT olarak çalıştırır; ondan ÖNCE sahiplik doğrulanır. Başarısızsa kod
+    # çalıştırılmaz (kısa devre) ve aynı otomatik rollback yoluna girilir.
+    local tree_ok=0
+    if _selfupdate_harden_tree; then tree_ok=1; fi
 
     # ── 6. Sağlık kontrolü — başarısızsa OTOMATİK rollback (fail-closed) ──
-    step "3/5" "Sağlık kontrolü çalıştırılıyor (bash -n, nginx -t, srvctl version)..."
-    if ! _selfupdate_health_check; then
+    step "3/5" "Sağlık kontrolü çalıştırılıyor (sahiplik, bash -n, nginx -t, srvctl version)..."
+    if (( tree_ok == 0 )) || ! _selfupdate_health_check; then
+        (( tree_ok )) || warn "Kod ağacı sahipliği doğrulanamadı (root:root değil / grup-diğer yazılabilir)."
         warn "Sağlık kontrolü BAŞARISIZ — otomatik geri alınıyor (rollback)..."
         if _selfupdate_restore_from_backup "$backup_dir"; then
             log_action "SECURITY: self-update health check failed, auto-rolled-back (pinned=${PINNED_COMMIT})"

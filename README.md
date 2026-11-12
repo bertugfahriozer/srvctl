@@ -1022,6 +1022,15 @@ sudo srvctl self-update rollback [ad]  # Son (veya belirtilen) yedeğe geri dön
 > yollarının üçü de o listeyi kullanır, böylece biri diğerlerinden geride
 > kalamaz.
 >
+> **Sahiplik kilidi:** srvctl root olarak çalışır; kod ağacından biri root dışında bir uid'e ya da
+> grup/diğer-yazılabilir kalırsa o hesap root'a yükselir (`cp -f` var olan dosyanın sahibini korur, yedek/geri yükleme
+> `cp -a` uid'i taşır). Bu yüzden `install.sh` ve `self-update` (ön kapı + kurulum sonrası + geri yükleme sonrası) kod
+> ağacını (`bin/ lib/ templates/ completions/ .backups/ .current-commit` + `conf/` veri tabloları) `root:root` yapar,
+> grup/diğer yazma bitini kaldırır ve doğrular (`lib/core.sh :: srvctl_harden_code_tree`; bağlar izlenmez, `-xdev`).
+> Doğrulanamazsa kurulum başarısız olur; `self-update` kodu ÇALIŞTIRMADAN geri alır. `state/`, `logs/`, `plugins/` ve
+> `conf/srvctl.conf` kapsam dışıdır (dokunulmaz). Bu kilidi taşımayan ESKİ bir sürümden ilk güncellemede çalışan kod
+> eskidir: ilk geçişte `sudo bash install.sh` çalıştırın (ya da `self-update`'i iki kez).
+>
 > `run`, pin dosyası yoksa (yani `check` hiç çalıştırılmamışsa) hiçbir dosyayı
 > değiştirmeden durur ve size `sudo srvctl self-update check` çalıştırmanızı
 > açıkça söyler — neden iki aşamalı olduğunu da (check ile run arasında içeriğin
