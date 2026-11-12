@@ -302,6 +302,75 @@ _stat_group() {
     stat -c '%G' "$1" 2>/dev/null || stat -f '%Sg' "$1"
 }
 
+# Bir yolun "uid gid octal-izin" üçlüsünü TEK stat çağrısıyla yaz (sembolik bağın KENDİSİ; hedefi izlenmez).
+# Kod ağacı denetimi yüzlerce yolu gezdiğinden yol başına üç ayrı stat yerine tek çağrı.
+_stat_ugm() {
+    stat -c '%u %g %a' "$1" 2>/dev/null || stat -f '%u %g %Lp' "$1"
+}
+
+# ─── KURULU KOD AĞACI SAHİPLİK KİLİDİ ───
+# srvctl ROOT olarak çalışır ve /usr/local/srvctl altındaki bin/lib/templates/completions'ı source/exec eder. Bu yollardan
+# biri root dışında bir uid'e (ya da grup/diğer-yazılabilir) aitse o hesap root olarak yürütülen kodu değiştirip root'a
+# yükselir. Canlıda ölçüldü (2026-11-09): 45 yol uid 501'e (geliştiricinin macOS kimliği; sunucuda böyle kullanıcı yok)
+# aitti — `adduser --system` 100-999 aralığından uid verdiğinden 501 sonradan herhangi bir hesaba düşebilir.
+# KÖK NEDEN: `cp -f` var olan dosyanın sahipliğini korur, `cp -a` (yedek/geri yükleme) kaynağın uid'ini taşır; ikisi de
+# sahipliği ASLA yeniden kurmuyordu. Bu işlev sahipliği TEK yerde yeniden kurar ve doğrular.
+#
+# KAPSAM (bilinçli dar): yalnız kod/şablon/completion/yedek yolları + çağıranın verdiği ek göreli yollar (conf veri
+# tabloları). state/, logs/, plugins/ ve conf/srvctl.conf'a DOKUNULMAZ (doğru sahipliklerini kendi yazanlar kurar).
+# Sembolik bağlar İZLENMEZ: find varsayılanı -P, chown -h, ve bağ üzerinde chmod hiç çağrılmaz (GNU chmod bağı izler).
+# -xdev: başka dosya sistemine (bağlama noktası) inilmez.
+#
+# _srvctl_code_tree_pass <fix|check> <yol...> — fix: ihlalli yolu onarır; check: ihlalli yolları stdout'a yazar.
+# İhlal: uid≠0 ya da gid≠0; sembolik bağ DEĞİLSE ayrıca grup/diğer yazma biti (022). stat başarısızsa ihlaldir.
+_srvctl_code_tree_pass() {
+    local pass="$1"; shift
+    local p ugm uid gid perm bad=0 viol
+    local -a roots=()
+    for p in "$@"; do
+        [[ -e "$p" || -L "$p" ]] && roots+=("$p")
+    done
+    (( ${#roots[@]} )) || return 0
+    while IFS= read -r -d '' p; do
+        viol=0
+        if ! ugm="$(_stat_ugm "$p")"; then
+            viol=2
+        else
+            read -r uid gid perm <<<"$ugm"
+            [[ "$uid" == 0 && "$gid" == 0 ]] || viol=1
+            if [[ ! -L "$p" ]] && (( 8#${perm:-0} & 8#022 )); then viol=1; fi
+        fi
+        (( viol )) || continue
+        if [[ "$pass" == check ]]; then
+            printf '%s\n' "$p"; bad=1
+            continue
+        fi
+        (( viol == 2 )) && continue
+        [[ "$uid" == 0 && "$gid" == 0 ]] || chown -h root:root -- "$p" 2>/dev/null || true
+        if [[ ! -L "$p" ]] && (( 8#${perm:-0} & 8#022 )); then chmod go-w -- "$p" 2>/dev/null || true; fi
+    done < <(find "${roots[@]}" -xdev -print0 2>/dev/null)
+    return "$bad"
+}
+
+# srvctl_harden_code_tree <kök> [ek-göreli-yol...] — kod ağacını root:root + go-w yapar, SONRA doğrular.
+# rc 0: ihlal kalmadı. rc 1: onarılamayan yol var (liste stderr'e uyarı olarak basılır) — çağıran GÜNCELLEMEYİ/KURULUMU
+# başarısız saymalıdır.
+srvctl_harden_code_tree() {
+    local root="$1"; shift
+    [[ -n "$root" && "$root" != "/" ]] || return 1
+    local -a paths=("${root}/bin" "${root}/lib" "${root}/templates" "${root}/completions" "${root}/.backups" "${root}/.current-commit")
+    local extra
+    for extra in "$@"; do
+        paths+=("${root}/${extra}")
+    done
+    _srvctl_code_tree_pass fix "${paths[@]}" || true
+    local left
+    left="$(_srvctl_code_tree_pass check "${paths[@]}")" && return 0
+    warn "GÜVENLİK: kod ağacında root:root olmayan ya da grup/diğer-yazılabilir yol(lar) kaldı (root olarak yürütülen kod bu hesapla değiştirilebilir):"
+    printf '%s\n' "$left" | head -20 | while IFS= read -r extra; do warn "  ${extra}"; done
+    return 1
+}
+
 # ─── KARAR 2 (denetim DALGA 4): atomik/portable 'sed -i' sarmalayıcısı ───
 # GEREKÇE: repoda 26+ çıplak 'sed -i' (GNU-only, macOS BSD sed'de '-i' AYRI
 # bir argüman ister — burada çalıştırılmıyor olsa da portable helper istendi)

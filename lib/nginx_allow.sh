@@ -587,14 +587,16 @@ _ngxallow_cb() {
             _ngxallow_fail "$line" "$dir" "baglam: types bloğunda iç blok yasak (yalnız MIME_TÜRÜ uzantı… satırları)"; return 0
         fi
         if [[ ! "$dir" =~ $_NGXALLOW_RE_MIME ]]; then
-            _ngxallow_fail "$line" "$dir" "arguman: types bloğunda yalnız MIME_TÜRÜ uzantı… satırı olur (tür ^[A-Za-z0-9!#&^_.+-]+/[A-Za-z0-9!#&^_.+-]+\$; yönerge/değişken/tırnak/include yasak)"; return 0
+            _ngxallow_fail "$line" "$dir" "arguman: types bloğunda yalnız MIME_TÜRÜ uzantı… satırı olur (tür ^[A-Za-z0-9!#&^_.+-]+/[A-Za-z0-9!#&^_.+-]+\$; yönerge/değişken/include yasak; tırnak açılır, içeriği aynı kurala tabidir)"; return 0
         fi
         if (( nargs < 1 )); then
             _ngxallow_fail "$line" "$dir" "arguman: types satırında en az bir uzantı gerekir"; return 0
         fi
         for t in "$@"; do
-            if [[ ! "$t" =~ ^[A-Za-z0-9]+$ ]]; then
-                _ngxallow_fail "$line" "$dir" "arguman: types uzantısı ^[A-Za-z0-9]+\$ olmalı"; return 0
+            # Üst sınır 32: nginx 'types_hash_bucket_size' (önbellek satırı: x86_64'te 64) aşan uzantı kapıdan geçip
+            # 'nginx -t'de "could not build types_hash" ile düşerdi (srvctl-sec N1); 32, 64'lük kova için de güvenli paydır.
+            if [[ ! "$t" =~ ^[A-Za-z0-9]{1,32}$ ]]; then
+                _ngxallow_fail "$line" "$dir" "arguman: types uzantısı ^[A-Za-z0-9]{1,32}\$ olmalı"; return 0
             fi
         done
         return 0
@@ -609,7 +611,7 @@ _ngxallow_cb() {
     default_type)
         if [[ "$kind" != "stmt" ]] || ! _ngxallow_ctx_ok SL; then _ngxallow_fail "$line" "$dir" "baglam: default_type yalnız server/location ifadesi"; return 0; fi
         if (( nargs != 1 )) || [[ ! "$1" =~ $_NGXALLOW_RE_MIME ]]; then
-            _ngxallow_fail "$line" "$dir" "arguman: default_type tek MIME belirteci olmalı (değişkenli/tırnaklı/boşluklu yasak)"; return 0
+            _ngxallow_fail "$line" "$dir" "arguman: default_type tek MIME belirteci olmalı (değişkenli/boşluklu yasak; tırnak açılır, içeriği aynı kurala tabidir)"; return 0
         fi
         ;;
     autoindex)

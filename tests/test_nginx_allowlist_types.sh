@@ -2,7 +2,7 @@
 # lib/nginx_allow.sh — custom.d kullanıcı dosyasında DAR genişleme: types bloğu, default_type, autoindex off.
 #
 # İzin verilen YALNIZ şunlardır (bağlam: server/location; her şey tablo dışında varsayılan-ret):
-#   types { <tür>/<alt-tür> <uzantı> [<uzantı> …]; … }   tür: RFC 6838 karakterleri AMA '$' yok; uzantı: [A-Za-z0-9]+
+#   types { <tür>/<alt-tür> <uzantı> [<uzantı> …]; … }   tür: RFC 6838 karakterleri AMA '$' yok; uzantı: [A-Za-z0-9]{1,32}
 #   default_type <tür>/<alt-tür>;
 #   autoindex off;                                       (autoindex on ve her varyantı kesin-ret KALIR)
 # Boş `types {}` KABUL: nginx -t geçerli sayar, hiçbir eşleme eklemez (her uzantı default_type'a düşer) —
@@ -11,6 +11,7 @@
 #   E kesin-ret ve izinli direktiflerin types içine gizlenmesi · F bağlam/yapı · G canlı media.conf kopyası (fikstür).
 # Vaka biçimi:  BEKLENEN_RC @@ GEREKÇE_SINIFI|- @@ NGINX_METNİ(¶=satır sonu) @@ AÇIKLAMA
 # MUTASYON KANCASI: SRVCTL_NGXALLOW_LIB ile mutant kopya yüklenebilir (yalnız test).
+# shellcheck disable=SC2016  # vakalar bilinçli tek tırnaklı ($x literal)
 set -uo pipefail
 umask 077
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -197,6 +198,29 @@ _scan "types { ${L128}/b x; }"; assert_eq "$_RC" "1" "tür 128 karakter: ret"
 _scan "types { a/${L128} x; }"; assert_eq "$_RC" "1" "alt tür 128 karakter: ret"
 _scan "default_type ${L127}/${L127};"; assert_eq "$_RC" "0" "default_type 127+127: kabul"
 _scan "default_type ${L128}/b;"; assert_eq "$_RC" "1" "default_type tür 128: ret"
+
+# N1: uzantı uzunluk tavanı 32 (sınır: 32 kabul, 33 ret) — nginx types_hash kovasını aşan uzantı kapıdan geçmemeli
+E32=$(printf 'e%.0s' $(seq 1 32)); E33="${E32}e"; E110=$(printf 'e%.0s' $(seq 1 110))
+_scan "types { a/b ${E32}; }"; assert_eq "$_RC" "0" "N1: uzantı 32 karakter: kabul (tavan)"
+_scan "types { a/b ${E33}; }"; assert_eq "$_RC" "1" "N1: uzantı 33 karakter: ret"
+_scan "types { a/b ${E110}; }"; assert_eq "$_RC" "1" "N1: uzantı 110 karakter: ret (arm64 kova sınırı; kapı artık önce düşer)"
+_scan "types { a/b ok ${E33}; }"; assert_eq "$_RC" "1" "N1: ikinci uzantı 33 karakter: ret"
+_scan "types { a/b \"${E33}\"; }"; assert_eq "$_RC" "1" "N1: tırnaklı uzantı da aynı tavana tabi (33: ret)"
+_scan "types { a/b \"${E32}\"; }"; assert_eq "$_RC" "0" "N1: tırnaklı uzantı 32: kabul"
+
+# N2: tırnak açılır, içeriği aynı kurala tabidir (belge/ileti davranışla eşit)
+_scan 'default_type "text/html";'; assert_eq "$_RC" "0" "N2: tırnaklı default_type değeri açılır ve kabul edilir"
+_scan 'default_type "te xt/html";'; assert_eq "$_RC" "1" "N2: tırnak içinde boşluklu değer: ret"
+_scan 'types { "text/html" '"'x'"'; }'; assert_eq "$_RC" "0" "N2: tırnaklı tür ve uzantı açılır, kabul"
+_scan 'types { "text/html" "$x"; }'; assert_eq "$_RC" "1" "N2: tırnak içi değişken: ret (içerik aynı kurala tabi)"
+_scan 'default_type $x;'; assert_contains "$_OUT" "tırnak açılır, içeriği aynı kurala tabidir" "N2: default_type ret iletisi davranışla eşit"
+_scan 'types { a/b/c x; }'; assert_contains "$_OUT" "tırnak açılır, içeriği aynı kurala tabidir" "N2: types ret iletisi davranışla eşit"
+_scan 'types { a/b "c-d"; }'; assert_contains "$_OUT" "{1,32}" "N2: uzantı ret iletisi yeni kuralı söyler"
+README_TXT=$(cat "${REPO_ROOT}/README.md")
+assert_contains "$README_TXT" 'uzantı `[A-Za-z0-9]{1,32}`' "N1: README uzantı kuralı {1,32}"
+assert_contains "$README_TXT" "tırnak açılır, içeriği aynı kurala tabidir" "N2: README tırnak metni davranışla eşit"
+assert_not_contains "$README_TXT" "değişkenli/tırnaklı yasak" "N2: README eski 'tırnaklı yasak' metni yok"
+assert_not_contains "$README_TXT" "yönerge/değişken/tırnak/\`include\`" "N2: README types satırında eski 'tırnak yasak' yok"
 
 echo "── E: kesin-ret ve izinli direktifler types içine gizlenince de RET ──"
 # direktif|argüman — kesin-ret listesindeki her yönerge (glob'lardan örnekler) + izinli direktifler + büyük harfli varyantlar
