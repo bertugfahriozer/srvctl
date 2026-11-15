@@ -83,7 +83,13 @@ location = /_fm { return 403; }
 location ^~ /_fm/ { return 403; }
 
 # auth_request hata eşlemesinin (error_page 500 =403) hedefi; imzasız 403, başka yoldan erişilemez (adlı location).
-location @fm_deny { return 403; }
+# K11/W4: ModSecurity BURADA da kapanmalı. Named location, error_page ile iç yönlendirmeyle girilir ve http düzeyindeki 'modsecurity on'u
+# DEVRALIR; log fazı bu location'ın yapılandırmasıyla koşar ve SecAuditLogParts'in B bölümü (istek başlıkları) 4xx'te X-Fm-Ticket'ı
+# denetim günlüğüne yazardı. 'modsecurity off' asıl location'larda zaten var; @fm_deny onların kapısıdır.
+location @fm_deny {
+    {{MODSEC_LINE}}
+    return 403;
+}
 
 # '/__fm_' ad alanı yakalayıcısı: srvctl'in iç location'ları (= /__fm_auth: 90, = /__fm_dl: 21) tam eşleşmedir ve bu önekten
 # ÖNCE kazanır. İlgili dosya yokken (90 silinmiş/üretilmemiş, 21 yok) bu yol uygulamaya (CI4) düşmez: iç istek (auth alt isteği,
@@ -154,7 +160,10 @@ location @fm_up {
     proxy_connect_timeout 10s;
     proxy_send_timeout 120s;
     proxy_read_timeout 120s;
-    client_body_timeout 120s;
+    # İki OKUMA arası (toplam süre değil). Ana alan (CF) ve up bloğu AYNI şablonu paylaşır → TEK değer. 30s: ölü/terk edilmiş
+    # bağlantı limit_conn yerini 120 yerine 30 sn'de bırakır; istemci (upload-core.js) 408/ağ hatasını backoff + /resume ile
+    # sunucunun gerçek ofsetinden sürdürür. Canlı 256 MiB e2e'de meşru 408 görülürse 60s'e çıkarın (RUNBOOK-up.md).
+    client_body_timeout 30s;
 
     # Değişkenli proxy_pass: çalışma anında ad çözümü → global 'resolver' ŞART
     # (srvctl lib/init.sh: resolver 1.1.1.1 8.8.8.8). Yoksa her parça 502.

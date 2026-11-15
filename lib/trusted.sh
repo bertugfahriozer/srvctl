@@ -50,6 +50,128 @@ _trusted_render_realip() {
     echo "real_ip_header CF-Connecting-IP;"
 }
 
+# Sunucunun KENDİ genel IP'leri (köken kilidinde yerel/aynı-makine çağrıları geçsin: sunucu kendi genel IP'sine
+# bağlanırsa eş adresi o IP olur). SRVCTL_SELF_IPS tanımlıysa (boş dahil) AYNEN o kullanılır (test/NAT düzeltmesi);
+# yoksa `ip -o addr show scope global`, yoksa `hostname -I`. Yalnız TEK IP kabul edilir (CIDR/çöp atılır). stdout: boşlukla ayrık.
+_trusted_self_ips() {
+    local raw="" a out="" seen=" "
+    if [[ -n "${SRVCTL_SELF_IPS+x}" ]]; then
+        raw="$SRVCTL_SELF_IPS"
+    elif command -v ip >/dev/null 2>&1; then
+        raw=$(ip -o addr show scope global 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "inet" || $i == "inet6") { sub(/\/.*/, "", $(i + 1)); print $(i + 1) } }')
+    elif command -v hostname >/dev/null 2>&1; then
+        raw=$(hostname -I 2>/dev/null || true)
+    fi
+    for a in $raw; do
+        [[ "$a" == */* ]] && continue
+        validate_ip_or_cidr "$a" || continue
+        case "$seen" in *" ${a} "*) continue ;; esac
+        seen+="${a} "
+        out+="${out:+ }${a}"
+    done
+    printf '%s' "$out"
+}
+
+# Köken kilidinin geo bloğu (stdout). $1 = CF listesi dosyası, $2 = kendi IP'ler (boşlukla ayrık).
+# `geo $realip_remote_addr`: realip, POST_READ aşamasında $remote_addr'ı istemci IP'siyle DEĞİŞTİRİR; allow/deny bu yüzden
+# CF kenarını değil istemciyi görür. $realip_remote_addr ORİJİNAL TCP eşidir (realip bağlamı yoksa $remote_addr).
+# Yinelenen ağlar tekilleştirilir (nginx geo aynı ağı iki kez görünce hata verir).
+_trusted_render_geo() {
+    local file="$1" selfips="${2:-}" ip
+    {
+        echo "# srvctl — köken kilidi geo kaynağı (otomatik oluşturuldu; srvctl trusted sync üretir, elle düzenlemeyin)"
+        echo "# \$srvctl_via_cf = 1: bağlantı Cloudflare kenarından / yerel makineden; 0: köken IP'sine doğrudan."
+        echo "# Kullanan: srvctl domain origin-lock <alan> on  (edge.d/<alan>/05-srvctl-origin-lock.conf)"
+        echo 'geo $realip_remote_addr $srvctl_via_cf {'
+        echo "    default 0;"
+        {
+            echo "127.0.0.1"
+            echo "::1"
+            for ip in $selfips; do echo "$ip"; done
+            if [[ -f "$file" ]]; then
+                while IFS= read -r ip; do [[ -n "$ip" ]] && echo "$ip"; done < "$file"
+            fi
+        } | awk 'NF && !seen[$1]++ { printf "    %s 1;\n", $1 }'
+        echo "}"
+    }
+}
+
+# Cloudflare listesinin adres AİLESİ başına sayısı: stdout "<v4> <v6>". Toplam satır sayısı tek başına yetmez: IPv4 girdisi 0 iken
+# (yukarı akış kısmi ama geçerli bir liste verdi) IPv6 satırları toplamı eşiğe taşırdı ve köken yalnız IPv4 dinlediği için TÜM
+# Cloudflare trafiği 444 alırdı.
+_trusted_family_counts() {
+    awk '/:/ { v6++; next } NF { v4++ } END { printf "%d %d\n", v4 + 0, v6 + 0 }' "$1" 2>/dev/null || echo "0 0"
+}
+
+# geo dosyasını yazan çekirdek: fm-auth kilidi (_fmprov_with_lock) ALTINDA çalışır (edge.sh yazımlarıyla aynı kilit; yarış yok).
+# Liste yoksa/boşsa/çok kısaysa YAZILMAZ: default 0 + boş liste TÜM Cloudflare trafiğini 444'e çevirirdi; yazılmayan dosya mevcut
+# kilitleri eski listeyle çalışır halde bırakır ve yeni kilit açılmasını engeller (origin-lock on dosya yoksa reddeder). Eşik
+# AİLE BAŞINA: IPv4 >= TRUSTED_GEO_MIN_V4 (varsayılan 10; Cloudflare ~15) VE IPv6 >= TRUSTED_GEO_MIN_V6 (varsayılan 5; ~7).
+# `nginx -t` düşerse önceki hâl geri yüklenir; ÖNCEKİ HÂL YOKSA (ilk yazım) geo silinir VE $srvctl_via_cf'ye başvuran açık köken
+# kilitleri de geri alınır (tanımsız değişkene başvuran kilit dosyası kalmasın; nginx yeniden yüklenebilsin).
+# rc 0 yazıldı | 1 yazılmadı (neden uyarıda).
+_trusted_apply_geo_locked() {
+    local conf="${NGINX_CF_GEO_CONF:-/etc/nginx/conf.d/srvctl-cf-origin-geo.conf}"
+    local list="${TRUSTED_STATE_DIR}/cloudflare.conf" content bk="" selfips tmp v4 v6 min4 min6
+    if ! _trusted_sane 8 "$list"; then
+        warn "köken kilidi geo dosyası yazılmadı: Cloudflare listesi yok/boş/eksik (${list}) — mevcut kilitler eski listeyle sürer, yeni kilit açılamaz"
+        return 1
+    fi
+    min4="${TRUSTED_GEO_MIN_V4:-10}"; min6="${TRUSTED_GEO_MIN_V6:-5}"
+    [[ "$min4" =~ ^[1-9][0-9]{0,3}$ ]] || min4=10
+    [[ "$min6" =~ ^[1-9][0-9]{0,3}$ ]] || min6=5
+    read -r v4 v6 <<< "$(_trusted_family_counts "$list")"
+    if (( v4 < min4 || v6 < min6 )); then
+        warn "köken kilidi geo dosyası yazılmadı: Cloudflare listesinde IPv4=${v4} (en az ${min4}), IPv6=${v6} (en az ${min6}) aralık var — aile başına eşik geçilmedi (IPv4 0 iken yazılsaydı TÜM Cloudflare trafiği 444 olurdu); mevcut kilitler eski listeyle sürer"
+        return 1
+    fi
+    selfips=$(_trusted_self_ips)
+    content=$(_trusted_render_geo "$list" "$selfips")
+    [[ -d "$(dirname "$conf")" ]] || { warn "köken kilidi geo dosyası yazılamadı: dizin yok: $(dirname "$conf")"; return 1; }
+    if [[ -e "$conf" || -L "$conf" ]]; then
+        [[ -L "$conf" ]] && { warn "geo dosyası sembolik bağ — yazılmadı: ${conf}"; return 1; }
+        bk=$(mktemp "${conf}.srvctl-bk.XXXXXX") || return 1
+        cp -p "$conf" "$bk" || { rm -f -- "$bk"; return 1; }
+    fi
+    tmp=$(mktemp "${conf}.srvctl.XXXXXX") || { [[ -n "$bk" ]] && rm -f -- "$bk"; return 1; }
+    if ! { printf '%s\n' "$content" > "$tmp" && chmod 644 "$tmp" && mv -f -- "$tmp" "$conf"; }; then
+        rm -f -- "$tmp"; [[ -n "$bk" ]] && rm -f -- "$bk"
+        warn "geo dosyası yazılamadı: ${conf}"; return 1
+    fi
+    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+        if [[ -n "$bk" ]]; then
+            mv -f -- "$bk" "$conf"
+        else
+            rm -f -- "$conf"
+            # İlk yazım geri alındı: $srvctl_via_cf artık TANIMSIZ. Ona başvuran açık kilitler nginx'in yüklenmesini engellerdi.
+            if declare -F _edge_origin_locks_drop_all >/dev/null 2>&1 || { [[ -f "${SRVCTL_ROOT:-}/lib/edge.sh" ]] && source "${SRVCTL_ROOT}/lib/edge.sh" 2>/dev/null; }; then
+                _edge_origin_locks_drop_all || true
+            fi
+        fi
+        warn "nginx -t geo dosyasıyla BAŞARISIZ — önceki hâl geri yüklendi: ${conf}"
+        return 1
+    fi
+    [[ -n "$bk" ]] && rm -f -- "$bk"
+    return 0
+}
+
+# geo dosyasını yaz (nginx reload YOK; sync sonunda apply_realip tek reload yapar). fm-auth kilidi altında.
+_trusted_apply_geo() {
+    local rc=0
+    if ! declare -F _fmprov_with_lock >/dev/null 2>&1; then
+        if [[ -f "${SRVCTL_ROOT:-}/lib/domconf.sh" ]]; then
+            # shellcheck disable=SC1091
+            source "${SRVCTL_ROOT}/lib/domconf.sh" 2>/dev/null || true
+        fi
+    fi
+    if ! declare -F _fmprov_with_lock >/dev/null 2>&1; then
+        warn "köken kilidi geo dosyası yazılmadı: fm-auth kilidi yüklenemedi (lib/domconf.sh) — kilitsiz yazım YAPILMAZ"
+        return 1
+    fi
+    _fmprov_with_lock _trusted_apply_geo_locked || rc=$?
+    return "$rc"
+}
+
 # ignoreip satırını türet: base + verilen dosyalardaki IP'ler, sıra-koruyan dedup,
 # tek satır (stdout). Eksik dosyalar atlanır.
 _trusted_compute_ignoreip() {
@@ -148,6 +270,8 @@ _trusted_sync() {
         esac
     done
     _trusted_apply_ignoreip
+    # geo (köken kilidi) realip ile AYNI eşitleme adımında ve AYNI cloudflare.conf'tan; reload'u apply_realip tek yapar.
+    _trusted_apply_geo || true
     _trusted_apply_realip
     log_action "TRUSTED SYNC" 2>/dev/null || true
     success "Güvenilir IP senkronu tamamlandı"
@@ -165,6 +289,13 @@ _trusted_list() {
             echo "    ${src}: (henüz senkron edilmedi)"
         fi
     done
+    # köken kilidi geo dosyası (srvctl domain origin-lock bunu ister)
+    local g="${NGINX_CF_GEO_CONF:-/etc/nginx/conf.d/srvctl-cf-origin-geo.conf}"
+    if [[ -f "$g" ]]; then
+        echo "    köken-kilidi geo: var  (son: $(date -r "$g" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?'))"
+    else
+        echo "    köken-kilidi geo: YOK  (srvctl trusted sync üretir; origin-lock on için gerekli)"
+    fi
 }
 
 cmd_trusted() {

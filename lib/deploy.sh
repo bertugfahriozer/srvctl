@@ -136,11 +136,23 @@ _deploy_notify() {
 _deploy_http_code() {
     local domain="$1"
     local code
-    code=$(curl -sk -o /dev/null -w "%{http_code}" \
-        --max-time 10 -H "Host: ${domain}" "https://127.0.0.1/" 2>/dev/null) || code="000"
+    # up-guvenlik K3 (BLOKER): sonda ALAN ADIYLA gider ve '--resolve <alan>:<port>:127.0.0.1' ile 127.0.0.1'e bağlanır.
+    # Eski biçim 'https://127.0.0.1/ + -H Host:' SNI GÖNDERMEZDİ; 'srvctl tls-default on' (ssl_reject_handshake) açıkken
+    # el sıkışma reddedilir (000) ve düşüş http 301'ine inip sağlık sonucunu anlamsızlaştırırdı. --resolve ile SNI gider,
+    # sertifika doğrulanmaz (-k: yerel sonda). Güvensiz alan adı (boşluk, ';', '/' …) sondaya HİÇ ulaşmaz.
+    validate_domain "$domain" || { echo "000"; return 0; }
+    # Portlar yalnız laboratuvar/test içindir (SRVCTL_PROBE_HTTPS_PORT / SRVCTL_PROBE_HTTP_PORT); üretimde 443/80.
+    local sp="${SRVCTL_PROBE_HTTPS_PORT:-443}" hp="${SRVCTL_PROBE_HTTP_PORT:-80}"
+    [[ "$sp" =~ ^[1-9][0-9]{0,4}$ ]] || sp=443
+    [[ "$hp" =~ ^[1-9][0-9]{0,4}$ ]] || hp=80
+    local su="" hu=""
+    [[ "$sp" == "443" ]] || su=":${sp}"
+    [[ "$hp" == "80" ]] || hu=":${hp}"
+    code=$(curl -sk -o /dev/null -w "%{http_code}" --noproxy '*' \
+        --max-time 10 --resolve "${domain}:${sp}:127.0.0.1" "https://${domain}${su}/" 2>/dev/null) || code="000"
     if [[ -z "$code" || "$code" == "000" ]]; then
-        code=$(curl -s -o /dev/null -w "%{http_code}" \
-            --max-time 10 -H "Host: ${domain}" "http://127.0.0.1/" 2>/dev/null) || code="000"
+        code=$(curl -s -o /dev/null -w "%{http_code}" --noproxy '*' \
+            --max-time 10 --resolve "${domain}:${hp}:127.0.0.1" "http://${domain}${hu}/" 2>/dev/null) || code="000"
     fi
     echo "${code:-000}"
 }

@@ -56,6 +56,7 @@ export TRUSTED_STATE_DIR="${WORK}/state"; mkdir -p "$TRUSTED_STATE_DIR"
 export SRVCTL_TRUSTED_FIXTURE_DIR="${WORK}/fix"; mkdir -p "$SRVCTL_TRUSTED_FIXTURE_DIR"
 export FAIL2BAN_JAIL_LOCAL="${WORK}/jail.local"
 export NGINX_CF_REALIP_CONF="${WORK}/cf-realip.conf"
+export NGINX_CF_GEO_CONF="${WORK}/cf-geo.conf"   # köken kilidi geo dosyası (sync artık bunu da yazar) — gerçek /etc/nginx'e DOKUNMA
 export TRUSTED_SOURCES="cloudflare uptimerobot"
 
 # CF v4 (8) + v6 (3) → sane(8) geçer; UR (6) → sane(5) geçer

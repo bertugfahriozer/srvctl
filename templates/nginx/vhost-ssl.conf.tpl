@@ -17,6 +17,13 @@ server {
     listen 443 ssl http2;
     server_name {{DOMAIN}} www.{{DOMAIN}};
 
+    # ─── srvctl KENAR (köken kilidi): kiracı dosyalarından ÖNCE ───
+    # 'srvctl domain origin-lock <alan> on' kilidi (if ($srvctl_via_cf = 0) { return 444; }) buraya, root'a ait
+    # /etc/nginx/edge.d/{{SAFE_NAME}}/ dizinine yazar. nginx sunucu-düzeyi 'rewrite/if/return/set' direktiflerini
+    # YAZILIŞ SIRASIYLA çalıştırır; custom.d'deki bir 'rewrite … last' kilitten ÖNCE koşar ve onu delerdi. Bu satır bu yüzden
+    # custom.d include'undan ÖNCE durur (sırayı 'origin-lock on' denetler). Glob include sıfır eşleşmeyi hatasız kabul eder.
+    include /etc/nginx/edge.d/{{SAFE_NAME}}/*.conf;
+
     # ─── SSL ───
     ssl_certificate     /etc/letsencrypt/live/{{DOMAIN}}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{{DOMAIN}}/privkey.pem;

@@ -15,7 +15,7 @@ _srvctl_completions() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     # Ana komutlar
-    commands="init domain cron deploy backup ssl security status monitor notify cloudflare ip trusted user plugin webhook changelog version help"
+    commands="init domain cron deploy backup ssl security status monitor notify cloudflare ip trusted tls-default user plugin webhook changelog version help"
 
     # 1. seviye
     if [[ ${COMP_CWORD} -eq 1 ]]; then
@@ -26,7 +26,7 @@ _srvctl_completions() {
     # 2. seviye — alt komutlar
     case "${COMP_WORDS[1]}" in
         domain)
-            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources reload ini nginx nginx-audit fm-auth fm-root open-basedir staging migrate rate-limit framework repair worker scheduler"
+            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources reload ini nginx nginx-audit fm-auth fm-up origin-lock fm-root open-basedir staging migrate rate-limit framework repair worker scheduler"
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$domain_cmds" -- "$cur"))
             elif [[ ${COMP_CWORD} -eq 3 ]]; then
@@ -42,6 +42,12 @@ _srvctl_completions() {
                 COMPREPLY=($(compgen -W "on off status" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 5 && "${COMP_WORDS[2]}" == "fm-auth" ]]; then
                 COMPREPLY=($(compgen -W "--script= --region= --force --dry --emergency" -- "$cur"))
+            elif [[ ${COMP_CWORD} -eq 4 && ( "${COMP_WORDS[2]}" == "fm-up" || "${COMP_WORDS[2]}" == "origin-lock" ) ]]; then
+                COMPREPLY=($(compgen -W "on off status" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 5 && "${COMP_WORDS[2]}" == "fm-up" ]]; then
+                COMPREPLY=($(compgen -W "--host= --origin= --adopt-cert --dry --purge-cert" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 5 && "${COMP_WORDS[2]}" == "origin-lock" ]]; then
+                COMPREPLY=($(compgen -W "--dry" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "nginx-audit" ]]; then
                 COMPREPLY=($(compgen -W "--quarantine" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "fm-root" ]]; then
@@ -146,6 +152,13 @@ _srvctl_completions() {
             local trusted_cmds="sync list"
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$trusted_cmds" -- "$cur"))
+            fi
+            ;;
+        tls-default)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "on off status" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--dry" -- "$cur"))
             fi
             ;;
         user)
