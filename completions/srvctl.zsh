@@ -52,13 +52,16 @@ _srvctl() {
                         'resources:Kaynak limitleri (cgroups) — --reset ile profile döner'
                         'reload:PHP-FPM + nginx reload (doğru unit otomatik bulunur)'
                         'ini:Domaine özel PHP ayarları (sudo -E)'
-                        'nginx:Domaine özel nginx ayarları (sudo -E)'
+                        'nginx:Domaine özel nginx ayarları (izin listesi; sudo -E)'
+                        'nginx-audit:custom.d izin listesi denetimi (salt-okur; --all, --quarantine)'
                         'open-basedir:open_basedir aç/kapat (kapalı = sınır chroot)'
+                        'fm-auth:FileManager nginx dosyaları + köken kaydı (opt-in)'
+                        'fm-root:YALNIZ /_fm 403 kökü (kuru varsayılan; --apply: yazım gerekirse tek nginx -t + tek reload)'
                         'staging:Staging ortamı oluştur'
                         'migrate:Sunucular arası taşı'
                         'rate-limit:Rate-limit profili değiştir'
                         'framework:Framework beyanını değiştir/temizle'
-                        'repair:Chroot kütüphaneleri tamir et'
+                        'repair:GENİŞ onarım (chroot, FPM/AppArmor, DB/Redis yetkisi, slice, FM)'
                         'worker:Kuyruk worker yönetimi'
                         'scheduler:Zamanlanmış görev yönetimi'
                     )
@@ -80,6 +83,19 @@ _srvctl() {
                             '--show:Yürürlükteki limitleri göster'
                         )
                         _describe 'domain resources seçeneği' res_flags
+                    elif [[ "${words[2]:-}" == "fm-auth" && ${#words} -ge 4 ]]; then
+                        local -a fm_flags
+                        fm_flags=(
+                            'on:Auth alt isteği + yükleme kapısını aç (--script= zorunlu)'
+                            'off:Kapat (custom.d referansı varsa --force ister)'
+                            'status:Durumu göster (bayat soket / tutarsızlık dahil)'
+                            '--script=:/current/modules/<Modül>/Auth/<ad>.php (chroot-göreli)'
+                            '--region=:pCloud bölgesi eu|us (varsayılan eu)'
+                            '--force:custom.d referansı varken kapat'
+                            '--dry:Doğrula, HİÇBİR dosya yazma (DRY-OK satırı)'
+                            '--emergency:ACİL kapat (yalnız off): kayıt/kilit/nginx -t geri almasından bağımsız, FM HÂLÂ AÇIK ise rc 3'
+                        )
+                        _describe 'domain fm-auth seçeneği' fm_flags
                     elif [[ "${words[2]:-}" == "open-basedir" && ${#words} -ge 4 ]]; then
                         local -a ob_flags
                         ob_flags=(
@@ -89,7 +105,36 @@ _srvctl() {
                             '--show:Durumu listele, değişiklik yapma'
                         )
                         _describe 'domain open-basedir seçeneği' ob_flags
-                    elif [[ ( "${words[2]:-}" == "ini" || "${words[2]:-}" == "nginx" ) && ${#words} -ge 4 ]]; then
+                    elif [[ "${words[2]:-}" == "nginx-audit" && ${#words} -ge 4 ]]; then
+                        local -a audit_flags
+                        audit_flags=(
+                            '--all:Tüm domainler'
+                            '--quarantine:İhlalli KULLANICI dosyasını <ad>.srvctl-rejected e taşı (FM adları/403 kökü asla; açık bayrak)'
+                        )
+                        _describe 'domain nginx-audit seçeneği' audit_flags
+                    elif [[ "${words[2]:-}" == "fm-root" && ${#words} -ge 4 ]]; then
+                        local -a fmroot_flags
+                        fmroot_flags=(
+                            '--all:Tüm domainler (tek işlem)'
+                            '--apply:Uygula (tek kilit, tek nginx -t → hata: hepsi geri, tek reload)'
+                        )
+                        _describe 'domain fm-root seçeneği' fmroot_flags
+                    elif [[ "${words[2]:-}" == "clone" && ${#words} -ge 5 ]]; then
+                        local -a clone_flags
+                        clone_flags=('--skip-custom-d:custom.d AÇIKÇA atlanır (taranmaz, kopyalanmaz)')
+                        _describe 'domain clone seçeneği' clone_flags
+                    elif [[ "${words[2]:-}" == "staging" && ${#words} -ge 4 ]]; then
+                        local -a staging_flags
+                        staging_flags=('--skip-custom-d:custom.d AÇIKÇA atlanır (clone ile aynı kapı)')
+                        _describe 'domain staging seçeneği' staging_flags
+                    elif [[ "${words[2]:-}" == "nginx" && ${#words} -ge 4 ]]; then
+                        local -a ngx_flags
+                        ngx_flags=(
+                            '--show:İçeriği göster, düzenleme'
+                            '--file=:İçeriği bu dosyadan al (editör açma)'
+                        )
+                        _describe 'domain nginx seçeneği' ngx_flags
+                    elif [[ "${words[2]:-}" == "ini" && ${#words} -ge 4 ]]; then
                         local -a conf_flags
                         conf_flags=(
                             '--show:İçeriği göster, düzenleme'

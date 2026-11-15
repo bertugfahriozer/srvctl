@@ -4,6 +4,17 @@
 #  Her domain için 12 güvenlik katmanı otomatik
 # ═══════════════════════════════════════════════
 
+# AppArmor profili yüklü mü? ('aa-status | grep -q' pipefail altında SIGPIPE
+# yarışı verirdi: grep ilk eşleşmede çıkar, aa-status yazarken öldürülür →
+# boru hattı 141 → yüklü profil "yok" sanılırdı.) Çıktı önce değişkene alınır.
+# PREDİKAT: 0=yüklü, 1=yüklü değil/aa-status yok.
+_domain_aa_profile_loaded() {
+    command -v aa-status >/dev/null 2>&1 || return 1
+    local out
+    out=$(aa-status 2>/dev/null) || true
+    grep -q -- "$1" <<< "$out"
+}
+
 # domconf.sh'ı talep üzerine yükler (CLAUDE.md cross-module deseni).
 # _load_and_run yalnız TEK modül source ettiği için, guard'sız bir çağrı
 # çalışma zamanında 'command not found' (exit 127) verirdi.
@@ -11,6 +22,36 @@ _domain_load_conf_lib() {
     declare -F _domconf_reload >/dev/null 2>&1 && return 0
     # shellcheck disable=SC1091
     source "${SRVCTL_ROOT}/lib/domconf.sh" || return 1
+}
+
+# FM destekli sürüme İLK self-update geçişi. Çalışan süreç FM ÖNCESİ selfupdate.sh'in BELLEKTEKİ gövdesini
+# (_selfupdate_run) yürütür; dosyalar kopyalandıktan sonra o gövde "Şimdi 'srvctl domain repair --all'
+# çalıştırılsın mı?" diye sorar ve yeni bu dosyayı source edip 'cmd_domain repair --all' çağırır. Bellekteki
+# eski gövde DEĞİŞTİRİLEMEZ — bu yüzden geniş eylemi YENİ KOD üstlenir: _selfupdate_run çağrı zincirindeyken
+# gelen 'repair' isteği GENİŞ repair'e DÖNÜŞMEZ; yalnız /_fm 403 kökü yolu (fm-root: kuru plan + ikinci onay)
+# işletilir. Yeni selfupdate.sh hiçbir zaman 'repair' çağırmaz (yalnız fm-root), yani bu kol YALNIZ eski gövde
+# için tetiklenir; operatörün elle yazdığı 'srvctl domain repair' zincirinde _selfupdate_run yoktur, etkilenmez.
+# rc 0 = yönlendirildi (çağıran repair'e geçmesin), rc 1 = normal akış.
+_domain_selfupdate_transition_redirect() {
+    local _f _hit=false
+    for _f in "${FUNCNAME[@]}"; do
+        [[ "$_f" == "_selfupdate_run" ]] && _hit=true
+    done
+    $_hit || return 1
+    warn "GEÇİŞ KORUMASI: self-update'in ESKİ (FM desteği öncesi) gövdesi geniş 'domain repair' istedi — ÇALIŞTIRILMADI."
+    warn "Geniş repair (FPM/AppArmor, DB yetkisi+parola, Redis ACL) bu güncellemede otomatik YAPILMAZ."
+    warn "Yalnız /_fm 403 kökü yolu sunulur; geniş onarım gerekirse bakım penceresinde elle: sudo srvctl domain repair <alan>|--all"
+    # Bu onay/uyarı bloğu lib/selfupdate.sh'deki _selfupdate_offer_fm_root ile KASITLI kopyadır: bu işlev ESKİ, bellekte çalışan bir
+    # self-update sürecinde koşar (eski core.sh yüklü) ve yalnız bu dosyaya güvenebilir; ortak bir yardımcı oraya ulaşamaz.
+    # İki yüzün metni tests/test_domain_single_reload_wording.sh ve tests/test_fm_f9b_text.sh ile birlikte kilitlidir.
+    info "/_fm 403 kökü durumu (KURU — hiçbir şey yazılmaz):"
+    cmd_domain fm-root --all || true
+    if confirm "Eksik /_fm 403 kökleri şimdi kurulsun mu ('srvctl domain fm-root --all --apply'; yalnız FM dosyaları; yazılacak iş varsa tek nginx -t + tek reload, yoksa ikisi de çalışmaz)?"; then
+        cmd_domain fm-root --all --apply || warn "fm-root --apply tamamlanamadı — önce: sudo srvctl domain fm-auth <alan> status; kayıt dizini güvensizse ÖNCE root:root 0700 yapıp 'sudo srvctl domain fm-auth <alan> off' koşun (repair/fm-root alanı hiçbir koşulda açmaz — yalnız açık 'fm-auth <alan> on' açar); sonra tekrar: sudo srvctl domain fm-root --all --apply"
+    else
+        info "Atlandı. Unutmayın: sudo srvctl domain fm-root --all --apply"
+    fi
+    return 0
 }
 
 cmd_domain() {
@@ -28,15 +69,24 @@ cmd_domain() {
         reload)    _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_reload "${@:2}" ;;
         ini)       _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_edit_ini "${@:2}" ;;
         nginx)     _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_edit_nginx "${@:2}" ;;
+        fm-auth)   _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_fm_auth "${@:2}" ;;
+        fm-root)   _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_fm_root_cmd "${@:2}" ;;
+        nginx-audit) _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_nginx_audit "${@:2}" ;;
         open-basedir) _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_open_basedir "${@:2}" ;;
         staging)   _domain_staging "${@:2}" ;;
         migrate)    _domain_migrate "${@:2}" ;;
         rate-limit) _domain_rate_limit "${@:2}" ;;
         framework) _domain_framework "${@:2}" ;;
-        repair)    _domain_repair "${@:2}" ;;
+        repair)    _domain_selfupdate_transition_redirect && return 0; _domain_repair "${@:2}" ;;
         worker)    _domain_worker "${@:2}" ;;
         scheduler) _domain_scheduler "${@:2}" ;;
         *)
+            # BİLİNMEYEN alt komut kullanımı basar AMA rc≠0 döner (eskiden 0: eski kurulu srvctl'de
+            # olmayan bir komutu — ör. 'fm-root' — çağıran betik sahte başarı görüyordu). Yalnız açık yardım
+            # istekleri (hiç alt komut / help / -h / --help) rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen domain alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl domain <komut>"
             echo ""
@@ -55,7 +105,10 @@ cmd_domain() {
             echo "    info <domain> [--show-secrets]  Domain bilgisi (parolalar varsayılan gizli)"
             echo ""
             echo "  Operasyonel:"
-            echo "    clone <kaynak> <hedef>          Domain klonla (DB + dosya)"
+            echo "    clone <kaynak> <hedef> [--skip-custom-d]"
+            echo "                                     Domain klonla (DB + dosya). Kaynağın 00-custom.conf'u"
+            echo "                                     izin listesine uymuyorsa klon DURUR; --skip-custom-d"
+            echo "                                     custom.d'yi AÇIKÇA atlar (FM dosyaları hiç kopyalanmaz)"
             echo "    suspend <domain>                Bakım moduna al"
             echo "    unsuspend <domain>              Bakım modundan çıkar"
             echo "    php-switch <domain> <versiyon>  PHP versiyonu değiştir"
@@ -82,12 +135,58 @@ cmd_domain() {
             echo "                                     kapatır (ölçüm: CI4 bootstrap 1.28s → 0.032s)."
             echo "                                     Varsayılan DEĞİŞMEZ; .ini'de saklanır, 'repair'"
             echo "                                     ve 'php-switch' EZMEZ. --show durumu listeler."
-            echo "    nginx <domain> [--show] [--file <yol>] [--force]"
+            echo "    nginx <domain> [--show] [--file <yol>]"
             echo "                                     Domaine özel nginx ayarları"
             echo "                                     (/etc/nginx/custom.d/<safe_name>/). vhost'a en"
-            echo "                                     sonda include edilir; 'repair' EZMEZ. İzolasyonu"
-            echo "                                     delen direktifler --force ister. 'sudo -E'."
-            echo "    staging <domain>                Staging ortamı oluştur"
+            echo "                                     sonda include edilir; 'repair' EZMEZ. Dosya"
+            echo "                                     İZİN LİSTESİNE (varsayılan ret) uymalıdır; --force"
+            echo "                                     YOKTUR. 'sudo -E'. Vhost custom.d'yi include ETMİYORSA"
+            echo "                                     (eski kurulum) komut durur: 'repair' vhost YAZMAZ, çare"
+            echo "                                     DEĞİLDİR; vhost'un server bloğuna elle 'include"
+            echo "                                     /etc/nginx/custom.d/<safe_name>/*.conf;' ekleyip nginx -t."
+            echo "    nginx-audit [<domain>|--all] [--quarantine]"
+            echo "                                     custom.d kullanıcı dosyalarını izin listesine karşı"
+            echo "                                     SALT-OKUR denetler (çıkış 0 temiz/1 ihlal/2 doğrulanamadı)."
+            echo "                                     --quarantine yalnız AÇIK bayrakla ihlalli dosyayı"
+            echo "                                     '<ad>.srvctl-rejected'e taşır (nginx -t, reload; hata→geri)."
+            echo "                                     srvctl/FM rezerve adları (20/21/90, 403 kökü) ASLA taşınmaz;"
+            echo "                                     STATE-UNTRUSTED ya da 403 kökü sağlam olmayan alanda karantina"
+            echo "                                     YAPILMAZ. 403 kökü yok/bozuk alanlar KÖK-* satırıyla raporlanır (çıkış 1)"
+            echo "    fm-auth <domain> <on|off|status> [--script=/current/modules/<Modül>/Auth/<ad>.php]"
+            echo "            [--region=eu|us]         FileManager (OPT-IN, varsayılan KAPALI): şablondan"
+            echo "                                     üç dosya (90 auth, 21 indirme, 20 yükleme) + köken kaydı."
+            echo "                                     'off': 90/21'i kaldırır, 20'yi (yükleme) 403 köküne çevirir;"
+            echo "                                     ACİL yolda 90/21 SİLİNMEZ, '<ad>.srvctl-emergency.*' adıyla"
+            echo "                                     kenara alınır; bayat yarım-işlem yedekleri geri yüklenmeden"
+            echo "                                     '.superseded.bk.*'a ayrılır; kayıtsız FM adlı dosya"
+            echo "                                     '<ad>.srvctl-tampered'a alınır (hiçbiri nginx'e yüklenmez)."
+            echo "                                     'status' diski VE çalışan nginx'i sınar (yerel sonda)."
+            echo "                                     [--force] [--dry]  (--force: off, custom.d referansı"
+            echo "                                     varken; --dry: doğrula, dosya YAZMA, 'DRY-OK' basar)"
+            echo "                                     [--emergency]  (yalnız off: ACİL kapatma — kayıt/kilit/"
+            echo "                                     nginx -t geri almasından bağımsız; normal off başarısız"
+            echo "                                     olursa zaten buna düşer. Çalışan nginx hâlâ açıksa"
+            echo "                                     'FM HÂLÂ AÇIK' + çıkış 3/4/5/6; status çalışan durumu sınar)"
+            echo "                                     'on' çıkış 4 = AÇILDI ama canlıda DOĞRULANAMADI (geri ALINMAZ;"
+            echo "                                     'status' ile doğrula). Var olan kayıt dizini yabancı sahipli"
+            echo "                                     ya da grup/herkese yazılabilirse (ör. 0777) on/fm-root/"
+            echo "                                     provision REDDEDER ('kayıt dizini güvenilmez', çıkış 1; mod"
+            echo "                                     sessizce onarılmaz, 'off' yine kapatır). Yetenek:"
+            echo "                                     fm-auth --capabilities -> f9e-on-rc4=1 f9e-state-untrusted=1"
+            echo "    fm-root <domain>|--all [--apply]"
+            echo "                                     YALNIZ /_fm 403 kökü + FM dosyaları (repair'in FPM/AppArmor/"
+            echo "                                     DB/Redis yan etkileri YOK). Varsayılan KURU: yapılacak işi"
+            echo "                                     listeler, hiçbir şey yazmaz. --apply: tek kilit; yazılacak"
+            echo "                                     iş varsa tek nginx -t (hata→HEPSİ geri) + tek reload, yoksa"
+            echo "                                     nginx -t/reload ÇALIŞMAZ. Kök yok→kurar; kayıtlı KAPALI"
+            echo "                                     alanda eksik/kurcalanmış kök→yeniden üretir; kayıtlı AÇIK"
+            echo "                                     alanda 20/21/90'dan biri tanınmıyorsa→403 köküne KAPATIR"
+            echo "                                     (yeniden üretmez, AÇMAZ);"
+            echo "                                     kayıtsız FM adı→devralır (<ad>.srvctl-tampered); yarım"
+            echo "                                     işlem yedeği→kesinti öncesine geri yükler"
+            echo "    staging <domain> [--skip-custom-d]"
+            echo "                                     Staging ortamı oluştur (clone ile AYNI custom.d kapısı:"
+            echo "                                     ihlalde DUR; --skip-custom-d clone'a geçer)"
             echo "    migrate <domain> <user@host>    Sunucular arası taşı"
             echo "    rate-limit <domain> <profil>    Rate-limit profilini değiştir/göster"
             echo "    framework <domain> <ci4|laravel|symfony|none>"
@@ -95,10 +194,14 @@ cmd_domain() {
             echo "                                     ('ci4' putenv'i AÇAR — bilinçli güvenlik ödünü, bkz."
             echo "                                     çıktıdaki uyarı); sonrasında 'domain repair' ÖNERİLİR"
             echo "                                     (disable_functions'ın fiilen render edilmesi için)"
-            echo "    repair <domain>|--all           Eksik chroot kütüphanelerini onarır"
+            echo "    repair <domain>|--all           Alanı GENİŞ onarır: chroot kütüphaneleri, FPM havuzu/unit +"
+            echo "                                     AppArmor (paylaşılan FPM reload/restart), DB yetkisi + parola"
+            echo "                                     senkronu, Redis ACL, cgroups slice, FM dosyaları/403 kökü."
+            echo "                                     YALNIZ /_fm 403 kökü için: fm-root"
             echo "    worker <domain> <eylem> [ad]    Kuyruk worker'ı yönet (start/stop/status/enable/disable)"
             echo "    scheduler <domain> <eylem>      Zamanlanmış görev yönet (start/stop/status/enable/disable)"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }
@@ -601,6 +704,10 @@ _domain_fpm_purge_ghost_pools() {
 _domain_repair() {
     local target="$1"
     [[ -z "$target" ]] && error "Kullanım: srvctl domain repair <domain> | --all"
+    # Fail-closed: repair'in son adımı /_fm 403 kökünü kurar (domconf.sh). domconf yüklenemiyorsa
+    # kök KURULAMAZ; ESKİDEN yalnız uyarı + rc 0 idi ("Domain onarıldı", köksüz alan). Artık HİÇBİR
+    # yan etkiden (FPM/AppArmor/DB/Redis/slice) ÖNCE reddedilir — add/fm-auth/fm-root/nginx-audit ile aynı kural.
+    _domain_load_conf_lib || error "domconf modülü yüklenemedi — repair yan etkilerden ÖNCE iptal edildi (fail-closed: /_fm 403 kökü kurulamazdı)"
 
     if [[ "$target" == "--all" ]]; then
         header "Tüm Domainler Onarılıyor..."
@@ -643,6 +750,11 @@ _domain_repair() {
         local -a failed_domains=()
         local -a ghost_domains=()
         local repair_total=0
+        # FM adımı alan başına nginx reload ETMEZ; yazım yapan alanlar bu dosyaya not düşer
+        # (her alan alt kabukta koşar); dosya boş değilse (hiçbir alan yazmadıysa nginx -t/reload YOK) döngü sonunda TEK 'nginx -t' + TEK reload.
+        local _fm_pending=""
+        _fm_pending=$(mktemp) || _fm_pending=""
+        if [[ -n "$_fm_pending" ]]; then export _DOMAIN_REPAIR_FM_PENDING="$_fm_pending"; fi
         while IFS= read -r domain; do
             [[ -n "$domain" ]] || continue
             if _domain_repair_is_ghost "$domain"; then
@@ -677,6 +789,16 @@ _domain_repair() {
                 failed_domains+=("$domain")
             fi
         done < <(list_all_domains)
+        unset _DOMAIN_REPAIR_FM_PENDING
+        if [[ -n "$_fm_pending" && -s "$_fm_pending" ]]; then
+            if nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1; then
+                success "nginx TEK sefer reload edildi (FM dosyası yenilenen alanlar: $(tr '\n' ' ' < "$_fm_pending"))"
+            else
+                warn "FM dosyaları yazıldı ama toplu 'nginx -t'/reload BAŞARISIZ — çalışan nginx eski yapılandırmada kalmış olabilir (FM HÂLÂ AÇIK OLABİLİR); 'nginx -t' ve 'systemctl status nginx' ile denetleyin"
+                failed_domains+=("(nginx-reload)")
+            fi
+        fi
+        if [[ -n "$_fm_pending" ]]; then rm -f -- "$_fm_pending"; fi
         if [[ "${#failed_domains[@]}" -eq 0 ]]; then
             if [[ "${#ghost_domains[@]}" -gt 0 ]]; then
                 success "Tüm GERÇEK domainler onarıldı (${repair_total}/${repair_total}) — ${#ghost_domains[@]} hayalet kalıntı ATLANDI (yukarıya bakın): ${ghost_domains[*]}"
@@ -870,7 +992,9 @@ _domain_repair() {
         resource_profile_load "$repair_resource_profile"
         # BUG 2: disable_functions listesi framework'e göre türetilir (ci4'te
         # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
-        local repair_framework; repair_framework=$(_domain_read_framework "$target")
+        local repair_framework
+        # shellcheck disable=SC2034  # okuma KASITLI (meta doğrulama yan etkisi); değer şablona fw_declared üzerinden gider
+        repair_framework=$(_domain_read_framework "$target")
         # disable_functions gevşetmesi AÇIK beyan ister (bkz. _domain_framework_declared)
         local repair_fw_declared; repair_fw_declared=$(_domain_framework_declared "$target")
         render_template "${SRVCTL_TEMPLATES}/php-fpm/pool.conf.tpl" \
@@ -1088,12 +1212,36 @@ SQL
     # adı "onar" derken kaynak limitlerini onarmıyordu.
     _domain_repair_cgroups_slice "$target" "$sname" || repair_failed=true
 
+    # fm-auth açıksa auth alt isteği soketi alanın GERÇEK havuzuyla eşleşmeli
+    # (php-switch eski sürümlerde bayat bırakmış olabilir); kayıt yoksa 403 kökü kurulur.
+    _domain_repair_fm_step "$target" "$php_ver" || repair_failed=true
+
     if $repair_failed; then
         warn "Domain KISMEN onarıldı — yukarıdaki hata(lar)a bakın: ${target}"
         return 1
     fi
     success "Domain onarıldı: ${target}"
     return 0
+}
+
+# repair'in FM adımı (FM dosyaları / 403 kökü). 'repair --all' altında (alt kabuklar
+# _DOMAIN_REPAIR_FM_PENDING dosyasını görür) alan başına nginx reload YAPILMAZ; yazım yapan alan
+# adını o dosyaya ekler; dosya boş değilse --all döngü sonunda TEK 'nginx -t' + TEK reload yapar (yazım yoksa ikisi de çalışmaz). rc 0/1.
+_domain_repair_fm_step() {
+    local target="$1" php_ver="$2" fm_reload=1 rc=0
+    if ! _domain_load_conf_lib; then
+        # Fail-closed (savunma derinliği; _domain_repair başında zaten reddeder): kök kurulamadı → rc 1
+        # ("Domain KISMEN onarıldı"), ASLA sessiz başarı değil.
+        warn "domconf modülü yüklenemedi — fm-auth soketi/403 kökü kurulamadı/denetlenemedi (${target})"
+        return 1
+    fi
+    if [[ -n "${_DOMAIN_REPAIR_FM_PENDING:-}" ]]; then fm_reload=0; fi
+    _DOMCONF_FM_WROTE=0
+    _domconf_fm_auth_repair "$target" "$php_ver" "$fm_reload" || rc=$?
+    if [[ "$fm_reload" == "0" && "${_DOMCONF_FM_WROTE:-0}" == "1" ]]; then
+        printf '%s\n' "$target" >> "$_DOMAIN_REPAIR_FM_PENDING" || true
+    fi
+    return $rc
 }
 
 # ───────────────────────────────────────────────────────────────
@@ -1823,25 +1971,108 @@ _domain_purge_conf_files() {
     [[ -n "$sname" ]] || return 0
     rm -f -- "${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}/${sname}.ini"
     rm -rf -- "${SRVCTL_NGINX_CUSTOM_DIR:-/etc/nginx/custom.d}/${sname}"
+    # FM köken kaydı (state dizini): alan dizini ile birlikte gider (fm-auth kilidi altında; kilit
+    # alınamazsa forget UYARIR ve kaydı BIRAKIR — kalıntıyı sonraki 'domain add' kapısı yakalar).
+    # '|| true': remove/geri alma zinciri 'set -e' altında burada kesilmesin.
+    if _domain_load_conf_lib; then
+        _domconf_fm_auth_forget "$sname" || true
+    fi
 }
 
 # 'domain clone' kopyalaması — klonun amacı kaynağın davranışını taşımaktır.
+#
+# FM KARARI: srvctl'in ürettiği FM dosyaları (20/21/90) ve köken kaydı
+# KOPYALANMAZ — klon fm-auth KAPALI başlar (kaynağın "açık" durumunu kopyalamak
+# 'fm-auth on' onay kapısını atlardı; script/release hedefe özgüdür). Yalnız
+# 00-custom.conf kopyalanır ve KOPYADAN ÖNCE izin listesinden geçer; ihlalde klon
+# DURUR. $3=1 (--skip-custom-d): custom.d AÇIKÇA atlanır (taranmaz, kopyalanmaz).
 _domain_clone_conf_files() {
-    local src="$1" dst="$2"
+    local src="$1" dst="$2" skip_nginx="${3:-0}"
     local s_sname; s_sname=$(safe_name "$src")
     local d_sname; d_sname=$(safe_name "$dst")
     [[ -n "$s_sname" && -n "$d_sname" ]] || return 0
     local ini_dir="${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}"
     local ng_root="${SRVCTL_NGINX_CUSTOM_DIR:-/etc/nginx/custom.d}"
 
+    local cand=""
+    if [[ "$skip_nginx" != "1" && -f "${ng_root}/${s_sname}/00-custom.conf" ]]; then
+        cand=$(mktemp) || return 1
+        cp -- "${ng_root}/${s_sname}/00-custom.conf" "$cand" || { rm -f -- "${cand:?}"; return 1; }
+        _domain_clone_conf_scan "$src" "$dst" "$cand" "$skip_nginx" || { rm -f -- "${cand:?}"; return 1; }
+    else
+        _domain_clone_conf_scan "$src" "$dst" "" "$skip_nginx" || return 1
+    fi
+
     mkdir -p "$ini_dir" "${ng_root}/${d_sname}"
     if [[ -f "${ini_dir}/${s_sname}.ini" ]]; then
         cp "${ini_dir}/${s_sname}.ini" "${ini_dir}/${d_sname}.ini"
         chmod 644 "${ini_dir}/${d_sname}.ini"
     fi
-    if [[ -f "${ng_root}/${s_sname}/00-custom.conf" ]]; then
-        cp "${ng_root}/${s_sname}/00-custom.conf" "${ng_root}/${d_sname}/00-custom.conf"
+    if [[ -n "$cand" ]]; then
+        # Kopyalanan, TARANAN adayın kendisi (kaynak taramadan sonra değişse bile).
+        cp "$cand" "${ng_root}/${d_sname}/00-custom.conf"
         chmod 644 "${ng_root}/${d_sname}/00-custom.conf"
+        rm -f -- "${cand:?}"
+    fi
+    # Yalnız 00-custom.conf taşınır; kaynağın DİĞER custom.d dosyaları sessizce kalmasın.
+    if [[ "$skip_nginx" != "1" && -d "${ng_root}/${s_sname}" ]] && _domain_load_conf_lib; then
+        local f b others="" fms=""
+        for f in "${ng_root}/${s_sname}"/*; do
+            [[ -e "$f" || -L "$f" ]] || continue
+            b="${f##*/}"
+            if [[ "$b" == "00-custom.conf" ]]; then continue; fi
+            if _fmprov_known_name "$b"; then fms+="${b} "; else others+="${b} "; fi
+        done
+        if [[ -n "$fms" ]]; then
+            info "BİLGİ: kaynağın FM dosyaları (${fms% }) KOPYALANMADI — klon /_fm 403 kökü ile başlar (fm-auth KAPALI)"
+        fi
+        if [[ -n "$others" ]]; then
+            warn "BİLGİ: kaynağın şu custom.d dosyaları KOPYALANMADI (yalnız 00-custom.conf taşınır): ${others% } — gerekiyorsa 'srvctl domain nginx ${dst} --file <dosya>' ile (izin listesinden geçerek) ekleyin"
+        fi
+    fi
+    return 0
+}
+
+# 'domain clone' ön denetimi: kaynağın 00-custom.conf (ADAY kopya; $3) ve .ini dosyalarını
+# 'domain nginx' / 'domain ini' ile AYNI tarayıcılardan geçirir. $4=1 → nginx kısmı atlanır.
+# PREDİKAT: 0=temiz (ya da kaynakta dosya yok), 1=reddedildi/taranamadı. Hedefe hiçbir şey yazmaz.
+# 00-custom.conf dışındaki kaynak dosyaları kopyalanmaz; bunu _domain_clone_conf_files kopyadan
+# SONRA "BİLGİ:" satırıyla söyler (yorum, kodda olmayan bir uyarıyı vaat etmez).
+_domain_clone_conf_scan() {
+    local src="$1" dst="$2" cand="${3:-}" skip_nginx="${4:-0}" own_cand=0
+    local s_sname; s_sname=$(safe_name "$src")
+    local d_sname; d_sname=$(safe_name "$dst")
+    [[ -n "$s_sname" && -n "$d_sname" ]] || return 0
+    local ini_dir="${SRVCTL_PHP_INI_DIR:-/etc/srvctl/php.d}"
+    local ng_root="${SRVCTL_NGINX_CUSTOM_DIR:-/etc/nginx/custom.d}"
+    local ng_src="${ng_root}/${s_sname}/00-custom.conf" ini_src="${ini_dir}/${s_sname}.ini"
+    if [[ "$skip_nginx" == "1" ]]; then ng_src=""; fi
+    [[ -f "$ng_src" || -f "$ini_src" ]] || return 0
+    if ! _domain_load_conf_lib; then
+        warn "domconf modülü yüklenemedi — klon yapılandırması taranamadı, KOPYALANMADI (${src} → ${dst})"
+        return 1
+    fi
+    if [[ -f "$ng_src" && -z "$cand" ]]; then
+        cand=$(mktemp) || return 1
+        own_cand=1
+        cp -- "$ng_src" "$cand" || { rm -f -- "${cand:?}"; return 1; }
+    fi
+    local findings rc=0 frc=0
+    if [[ -f "$ng_src" ]]; then
+        findings=$(_domconf_user_scan "$cand" "$dst" "00-custom.conf") || frc=$?
+        if (( frc != 0 )); then
+            warn "Kaynağın nginx override'ı (${ng_src}) custom.d izin listesine UYMUYOR ya da doğrulanamadı — klon DURDURULDU (satır:direktif:gerekçe):"
+            printf '%s\n' "$findings" | sed 's/^/    /' >&2
+            warn "Kaynağın custom.d'sini ATLAYARAK klonlamak için: srvctl domain clone ${src} ${dst} --skip-custom-d  (staging için: srvctl domain staging ${src} --skip-custom-d)"
+            rc=1
+        fi
+    fi
+    if (( own_cand )); then rm -f -- "${cand:?}"; fi
+    (( rc == 0 )) || return 1
+    if [[ -f "$ini_src" ]] && ! findings=$(_domconf_scan_ini "$ini_src"); then
+        warn "Kaynağın php .ini override'ı (${ini_src}) izolasyonu delen anahtar içeriyor — klonlanmadı:"
+        printf '%s\n' "$findings" >&2
+        return 1
     fi
     return 0
 }
@@ -1921,7 +2152,9 @@ _domain_render_fpm_unit() {
     # 'putenv' hariç) — bkz. _domain_disable_functions_for başlık yorumu.
     # .srvctl-meta henüz yazılmamışsa (ör. birim testleri) 'ci4' varsayılanına
     # düşer — _domain_read_framework'ün kendi güvenli fallback'i.
-    local unit_framework; unit_framework=$(_domain_read_framework "$domain")
+    local unit_framework
+    # shellcheck disable=SC2034  # okuma KASITLI (meta doğrulama yan etkisi); değer şablona fw_declared üzerinden gider
+    unit_framework=$(_domain_read_framework "$domain")
     # disable_functions gevşetmesi AÇIK beyan ister (bkz. _domain_framework_declared)
     local unit_fw_declared; unit_fw_declared=$(_domain_framework_declared "$domain")
 
@@ -2029,7 +2262,7 @@ _domain_activate_fpm_unit() {
     # 2. AppArmor profili yüklü mü? Unit'teki AppArmorProfile= yüklü olmayan bir
     #    profile işaret ederse systemd start'ı reddeder; önceden söyle.
     if command -v aa-status &>/dev/null; then
-        aa-status 2>/dev/null | grep -q "srvctl-${sname}" \
+        _domain_aa_profile_loaded "srvctl-${sname}" \
             || warn "AppArmor profili yüklü değil: srvctl-${sname} (unit başlamayabilir)"
     fi
 
@@ -2630,6 +2863,17 @@ _domain_add() {
         *) error "Geçersiz --framework değeri: ${framework} (ci4|laravel|symfony)" ;;
     esac
 
+    # ─── /_fm 403 KÖKÜ ÖN KOŞUL KAPISI ───
+    # Kök aşağıda (vhost yazıldıktan sonra) kurulamazsa add FAIL-CLOSED durur ve geri alınır; ama
+    # öngörülebilir nedenler (flock yok/kilit alınamıyor, köken kayıt dizini güvenilmez, kalıntı
+    # kayıt/yarım yedek, custom.d yazılamaz/dosya/bağ, FM adlı kayıtsız dosya — sarkan bağ dahil)
+    # HİÇBİR alan kaynağı (kullanıcı, dizin, DB, vhost) yaratılmadan BURADA yakalanır.
+    # 'domain clone'/'domain staging' de buradan geçer (_domain_add'i çağırırlar).
+    _domain_load_conf_lib || error "domconf modülü yüklenemedi — /_fm 403 kökü kurulamaz; domain add DURDURULDU (hiçbir kaynak oluşturulmadı)"
+    local _fm_gate_why=""
+    _fm_gate_why=$(_domconf_fm_root_precheck "$domain") \
+        || error "domain add DURDURULDU (hiçbir kaynak oluşturulmadı): /_fm 403 kökü kurulamaz — ${_fm_gate_why}"
+
     # Değişkenler
     local sname
     sname=$(safe_name "$domain")
@@ -2902,6 +3146,24 @@ _domain_add() {
 
     _domain_write_vhost "$domain" "$php_version" "$rate_profile" http
 
+    # /_fm 403 kökü (kullanıcı kararı): fm-auth hiç açılmasa da yol CI4'e düşmez.
+    # srvctl üretimi + köken kaydı; reload'u aşağıdaki adım yapar. Kurulamazsa add
+    # FAIL-CLOSED DURUR — 'error' → EXIT tuzağı → _domain_add_rollback (_domain_purge_resources):
+    # vhost hiç reload edilmeden, SSL'den ÖNCE geri alınır (köksüz alan canlıya ÇIKMAZ; Let's
+    # Encrypt kotası harcanmaz). Öngörülebilir nedenler yukarıdaki ön koşul kapısında yakalanır.
+    if _domain_load_conf_lib; then
+        _domconf_fm_root_provision "$domain" 0 \
+            || error "/_fm 403 kökü KURULAMADI (${domain}) — domain add DURDURULDU, kısmi kaynaklar geri alınıyor (köksüz alan canlıya çıkmaz). Nedeni yukarıda; düzeltip yeniden: srvctl domain add ${domain}"
+    else
+        error "domconf modülü yüklenemedi — /_fm 403 kökü kurulamadı (${domain}); domain add DURDURULDU, kısmi kaynaklar geri alınıyor"
+    fi
+
+    # Vhost'u ETKİNLEŞTİREN bağ (sites-enabled) 403 kökü KURULDUKTAN SONRA oluşturulur. ESKİDEN bağ kökten
+    # ÖNCE kuruluyordu: provizyonun 'flock -w 30' beklemesinde ya da SIGKILL penceresinde bağımsız bir nginx reload
+    # (başka bir srvctl komutu, logrotate, certbot hook) köksüz yeni vhost'u canlıya çıkarıp /_fm'yi uygulamaya
+    # düşürebiliyordu (laboratuvarda 'domain add' SIGKILL ile erken kesilince ölçüldü). Artık vhost dosyası sites-available'da dururken
+    # nginx onu HİÇ görmez; kök hazırlanınca bağ atılır, hemen ardından aşağıdaki nginx -t + reload gelir. Hata
+    # yolu: kök kurulamazsa 'error' → _domain_add_rollback bağ henüz YOKKEN çalışır (rm -f bağsızlıkta zararsız).
     ln -sf "/etc/nginx/sites-available/${domain}.conf" \
         "/etc/nginx/sites-enabled/${domain}.conf"
 
@@ -3700,7 +3962,7 @@ _domain_info() {
 
     # AppArmor
     local aa_status="${RED}❌ Yok${NC}"
-    if aa-status 2>/dev/null | grep -q "srvctl-${sname}"; then
+    if _domain_aa_profile_loaded "srvctl-${sname}"; then
         aa_status="${GREEN}✅ Enforce${NC}"
     fi
     echo -e "  AppArmor:       ${aa_status}"
@@ -3847,11 +4109,18 @@ ProtectKernelTunables=true"
 # ═══════════════════════════════════════════════════════════════
 
 # ───────────────────────────────────────────────────────────────
-#  domain clone <kaynak> <hedef>
+#  domain clone <kaynak> <hedef> [--skip-custom-d]
 # ───────────────────────────────────────────────────────────────
 _domain_clone() {
-    local src="$1" dst="$2"
-    [[ -z "$src" || -z "$dst" ]] && error "Kullanım: srvctl domain clone <kaynak> <hedef>"
+    local src="" dst="" skip_custom_d=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --skip-custom-d) skip_custom_d=1 ;;
+            -*)              error "Bilinmeyen seçenek: ${arg} (kullanım: srvctl domain clone <kaynak> <hedef> [--skip-custom-d])" ;;
+            *)               if [[ -z "$src" ]]; then src="$arg"; elif [[ -z "$dst" ]]; then dst="$arg"; else error "Fazla argüman: ${arg}"; fi ;;
+        esac
+    done
+    [[ -z "$src" || -z "$dst" ]] && error "Kullanım: srvctl domain clone <kaynak> <hedef> [--skip-custom-d]"
     domain_exists "$src" || error "Kaynak domain bulunamadı: ${src}"
     domain_exists "$dst" && error "Hedef domain zaten mevcut: ${dst}"
 
@@ -3862,6 +4131,11 @@ _domain_clone() {
     # Kimlikleri dosyaya güvenmeden safe_name'den türet; PHP'yi doğrula
     local src_php; src_php=$(_derive_php "$src" "${DEFAULT_PHP_VERSION}")
     local src_db="db_${src_sname}"
+
+    # Yapılandırma override'ları taranamaz/reddedilirse HİÇBİR şey oluşturulmadan dur
+    # (yarım hedef domain bırakma).
+    _domain_clone_conf_scan "$src" "$dst" "" "$skip_custom_d" \
+        || error "Klon durduruldu: kaynağın override dosyaları taramadan geçemedi (yukarıya bakın)"
 
     header "Domain Klonlama: ${src} → ${dst}"
 
@@ -3880,7 +4154,8 @@ _domain_clone() {
     # DAVRANIŞINI taşımaktır; memory_limit/client_max_body_size gibi ayarlar
     # geride kalırsa klon "aynı site" olmaz. _domain_add iskeletleri zaten
     # oluşturdu; burada kaynağın gerçek içeriğiyle ÜZERİNE yazılıyor.
-    _domain_clone_conf_files "$src" "$dst"
+    _domain_clone_conf_files "$src" "$dst" "$skip_custom_d" \
+        || error "Klon durduruldu: override dosyaları kopyalanmadı (hedef domain oluşturuldu — gerekirse: srvctl domain remove ${dst})"
 
     step "2/4" "Dosyalar kopyalanıyor..."
     if [[ -d "${src_base}/public_html" ]]; then
@@ -4050,6 +4325,24 @@ _domain_php_switch() {
     # KARAR 2: atomik/portable _sed_inplace (bkz. core.sh).
     _sed_inplace "/etc/nginx/sites-available/${domain}.conf" \
         "s|php${old_ver}-fpm-${sname}.sock|php${new_ver}-fpm-${sname}.sock|g"
+    # fm-auth açıksa custom.d/<sname>/90-srvctl-fm-auth.conf bu alanın KENDİ
+    # soketini taşır; eski havuz silindiği için güncellenmezse '/__fm_auth'
+    # 502 verir ve her yükleme parçası 500 alır (status "AÇIK" derdi).
+    if _domain_load_conf_lib; then
+        local fm_rc=0
+        _domconf_fm_auth_sock_sync "$domain" "$new_ver" || fm_rc=$?
+        case "$fm_rc" in
+            0)  ;;
+            10) if [[ "${_DOMCONF_FM_SWITCH_CLOSED:-0}" == "1" ]]; then
+                    warn "fm-auth alanı KAPATILDI (403 kökü): ${domain} — soket güncellenmedi; kayıt/disk 'açık' ya da tanınmayan bir durumdaydı. Yalnız açık 'srvctl domain fm-auth ${domain} on --script=…' açar"
+                else
+                    info "fm-auth soketi php${new_ver}'e çekildi"
+                fi ;;
+            *)  warn "fm-auth soketi güncellenemedi — 'srvctl domain repair ${domain}' çalıştırın" ;;
+        esac
+    else
+        warn "domconf modülü yüklenemedi — fm-auth soketi güncellenmedi ('srvctl domain repair ${domain}')"
+    fi
     nginx_test && systemctl reload nginx
     success "Nginx güncellendi"
 
@@ -4273,17 +4566,26 @@ _domain_resources() {
 }
 
 # ───────────────────────────────────────────────────────────────
-#  domain staging <domain>  — staging.<domain> klonu
+#  domain staging <domain> [--skip-custom-d]  — staging.<domain> klonu
+#  'clone' ile AYNI custom.d kapısı: kaynağın 00-custom.conf'u izin listesine
+#  uymuyorsa varsayılan DUR; --skip-custom-d açıkça atlar (clone'a aynen geçer).
 # ───────────────────────────────────────────────────────────────
 _domain_staging() {
-    local domain="$1"
-    [[ -z "$domain" ]] && error "Kullanım: srvctl domain staging <domain>"
+    local domain="" skip_flag=() arg
+    for arg in "$@"; do
+        case "$arg" in
+            --skip-custom-d) skip_flag=(--skip-custom-d) ;;
+            -*)              error "Bilinmeyen seçenek: ${arg} (kullanım: srvctl domain staging <domain> [--skip-custom-d])" ;;
+            *)               if [[ -z "$domain" ]]; then domain="$arg"; else error "Fazla argüman: ${arg}"; fi ;;
+        esac
+    done
+    [[ -z "$domain" ]] && error "Kullanım: srvctl domain staging <domain> [--skip-custom-d]"
     domain_exists "$domain" || error "Domain bulunamadı: ${domain}"
     local staging="staging.${domain}"
     domain_exists "$staging" && error "Staging zaten mevcut: ${staging}"
 
     info "Staging ortamı oluşturuluyor: ${staging}"
-    _domain_clone "$domain" "$staging"
+    _domain_clone "$domain" "$staging" ${skip_flag[@]+"${skip_flag[@]}"}
     echo ""
     success "Staging hazır: https://${staging}"
     warn "DNS: ${staging} A kaydı + 'srvctl ssl renew' gerekebilir."
@@ -4333,7 +4635,8 @@ _domain_migrate() {
     # YENİ: hedefte /root altında 0700 özel dizin (umask 077), 'scp -p',
     # sonrasında açık chmod; uzak komut argümanları printf %q ile tırnaklanır;
     # yerel paket işin sonunda silinir; uzak dizin için temizlik talimatı.
-    local remote_dir="/root/.srvctl-migrate/$(basename "$bundle")"
+    local remote_dir
+    remote_dir="/root/.srvctl-migrate/$(basename "$bundle")"
     local q_remote_dir q_domain q_php q_webroot q_db
     printf -v q_remote_dir '%q' "$remote_dir"
     printf -v q_domain '%q' "$domain"
@@ -4541,15 +4844,101 @@ _domain_working_dir() {
     printf '%s/%s/current\n' "${WEB_ROOT}" "$1"
 }
 
+# Komutu alanın WEB KULLANICISI olarak çalıştırır (ayrıcalık düşürme).
+# Dönüş: komutun çıkış kodu; kullanıcı yok ya da hiçbir düşürme aracı
+# (setpriv/runuser/su) yoksa 1 — çağıran bunu "güvenli geri çekilme" sayar
+# (root olarak tenant ağacında ASLA çalışılmaz). Test seam'i: bu fonksiyon
+# testlerde geçersiz kılınır.
+_domain_run_as_web_user() {
+    local user="$1"; shift
+    local uid gid
+    # Yalnız srvctl'in ürettiği web kullanıcı biçimi (web_<safe_name>); root/
+    # başka hesaba "düşürme" asla yapılmaz.
+    [[ "$user" =~ ^web_[a-z0-9_]+$ ]] || return 1
+    uid=$(id -u "$user" 2>/dev/null) || return 1
+    gid=$(id -g "$user" 2>/dev/null) || return 1
+    # uid/gid SAYISAL ve 0 DEĞİL olmalı (kullanıcı kaydı bozuk/uid 0 ise
+    # 'düşürme' root kalırdı → tenant ağacında root olarak çalışmak).
+    [[ "$uid" =~ ^[1-9][0-9]*$ && "$gid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if command -v setpriv >/dev/null 2>&1; then
+        setpriv --reuid="$uid" --regid="$gid" --clear-groups -- "$@"
+    elif command -v runuser >/dev/null 2>&1; then
+        runuser -u "$user" -- "$@"
+    elif command -v su >/dev/null 2>&1; then
+        local q="" a
+        for a in "$@"; do q+="$(printf '%q' "$a") "; done
+        su -s /bin/bash "$user" -c "$q"
+    else
+        return 1
+    fi
+}
+
+# 'timeout' (GNU coreutils; macOS'ta gtimeout). Yoksa boş basar.
+_domain_timeout_bin() {
+    command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true
+}
+
+# Release içindeki modüllerin 'Commands/*.php' dosyalarında '<komut>' adının
+# TANIMLI olup olmadığını STATİK olarak yoklar (0=var, 1=yok/yoklanamadı).
+# Uygulama kodu ASLA çalıştırılmaz ('php spark list' root olarak kullanıcı
+# kodu yürütmek olurdu).
+#
+# TEHDİT MODELİ: srvctl root'tur, release ağacı ise KİRACININ (web_<sname>).
+# Bu yüzden arama root olarak DEĞİL alanın web kullanıcısıyla yapılır
+# (_domain_run_as_web_user): sembolik bağla başka kiracının dosyasına
+# yönlendirmek ya da FIFO ile asmak yalnız o kullanıcının yetkisine takılır.
+# Ayrıca:
+#   - 'modules' kök dizini sembolik bağsa REDDEDİLİR ([[ -L ]]);
+#   - find -P + -type f: dizin ağacında sembolik bağ izlenmez, FIFO/aygıt atlanır;
+#   - grep -D skip, -size tavanı (512k) ve timeout (10 sn) tavanı;
+#   - YALNIZ Commands/*.php ve YALNIZ `$name = 'komut'` / `$name = "komut"`
+#     atamasının satır başında (yorum satırı ve `$usage` eşleşmez).
+# Düşürme aracı ya da timeout yoksa 1 döner (güvenli geri çekilme: worker
+# varyantı seçilmez, eski davranış korunur).
+_domain_ci4_has_command() {
+    local domain="$1" cmd="$2"
+    [[ "$cmd" =~ ^[a-z0-9:_-]+$ ]] || return 1
+    local mods; mods="$(_domain_working_dir "$domain")/modules"
+    [[ -L "$mods" ]] && return 1
+    [[ -d "$mods" ]] || return 1
+    local tmo; tmo=$(_domain_timeout_bin)
+    [[ -n "$tmo" ]] || return 1
+    local web_user; web_user="web_$(safe_name "$domain")"
+    local pat="^[[:space:]]*((public|protected|private)[[:space:]]+)?\\\$name[[:space:]]*=[[:space:]]*(['\"]${cmd}['\"])"
+    local hits
+    hits=$(_domain_run_as_web_user "$web_user" "$tmo" 10 \
+        find -P "$mods" -type f -name '*.php' -path '*/Commands/*' -size -512k \
+        -exec grep -lEs -D skip -e "$pat" {} + 2>/dev/null) || true
+    # find'ın çıkış kodu BİLİNÇLİ yok sayılır ('+' ile bir toplu çağrıda eşleşme
+    # olmaması find'ı sıfırdan farklı yapar); karar yalnız eşleşen dosya var mı.
+    [[ -n "$hits" ]]
+}
+
 # Framework'e göre TAM worker komutunu üretir (PHP CLI mutlak yol + framework
 # komutu — komut satırı argümanları WorkingDirectory'e GÖRELİ çözülür).
 # Çıktı boşsa (framework worker desteklemiyor) 1 döner; warn() zaten stderr'e
 # yazar (KARAR 1) — stdout çağıran tarafta $() ile temiz yakalanır.
+#
+# 3. argüman (opsiyonel) "varyant": yalnız framework=ci4 için anlamlı.
+#   ci4ms → 'spark ci4ms:worker' (ci4ms Backend modülünün genel worker
+#           dağıtıcısı; modüller worker'larını config ile kaydeder, srvctl
+#           modül adını BİLMEZ). Varyantı çağıran STATİK tespitle verir
+#           (_domain_ci4_has_command) — komut release'de yoksa unit
+#           crash-loop'a girerdi, o yüzden varsayılan ci4 davranışı DEĞİŞMEZ.
+#   boş   → eski davranış: ci4 için worker YOK (genel CI4'ün kuyruğu yok).
 _domain_worker_cmd() {
-    local framework="$1" php_bin="$2"
+    local framework="$1" php_bin="$2" variant="${3:-}"
     case "$framework" in
         laravel) echo "${php_bin} artisan queue:work --sleep=3 --tries=3" ;;
         symfony) echo "${php_bin} bin/console messenger:consume async" ;;
+        ci4)
+            if [[ "$variant" == "ci4ms" ]]; then
+                echo "${php_bin} spark ci4ms:worker"
+            else
+                warn "Framework 'ci4' için varsayılan worker komutu tanımlı değil (release'de 'ci4ms:worker' komutu bulunamadı; yalnız laravel/symfony ve ci4ms destekleniyor)"
+                return 1
+            fi
+            ;;
         *)
             warn "Framework '${framework}' için varsayılan worker komutu tanımlı değil (yalnız laravel/symfony destekleniyor)"
             return 1
@@ -4558,11 +4947,23 @@ _domain_worker_cmd() {
 }
 
 # Framework'e göre TAM scheduler komutunu üretir (bkz. _domain_worker_cmd notu).
+#
+# ci4 için iki farklı dünya vardır: genel CI4 (codeigniter4/tasks paketi →
+# 'tasks:run') ve ci4ms ('cronjobs:run', modules/Cronjobs). Körlemesine
+# değiştirmek genel CI4 sitelerini kırardı; bu yüzden 3. argüman "varyant":
+# 'cronjobs' verilirse (release'de komut STATİK olarak bulunduysa) ci4ms
+# komutu, aksi halde eski 'tasks:run' (geriye uyum).
 _domain_scheduler_cmd() {
-    local framework="$1" php_bin="$2"
+    local framework="$1" php_bin="$2" variant="${3:-}"
     case "$framework" in
         laravel) echo "${php_bin} artisan schedule:run" ;;
-        ci4)     echo "${php_bin} spark tasks:run" ;;
+        ci4)
+            if [[ "$variant" == "cronjobs" ]]; then
+                echo "${php_bin} spark cronjobs:run"
+            else
+                echo "${php_bin} spark tasks:run"
+            fi
+            ;;
         *)
             warn "Framework '${framework}' için yerleşik scheduler komutu yok (Symfony: messenger worker'a devredilir, ci4/laravel destekleniyor)"
             return 1
@@ -4592,7 +4993,11 @@ _domain_render_worker_unit() {
     local sname web_user php_bin framework
     read -r sname web_user php_bin framework <<< "$ctx"
 
-    local app_cmd; app_cmd=$(_domain_worker_cmd "$framework" "$php_bin") || return 1
+    local variant=""
+    if [[ "$framework" == "ci4" ]] && _domain_ci4_has_command "$domain" "ci4ms:worker"; then
+        variant="ci4ms"
+    fi
+    local app_cmd; app_cmd=$(_domain_worker_cmd "$framework" "$php_bin" "$variant") || return 1
 
     local sysd_dir="${SRVCTL_SYSTEMD_DIR:-/etc/systemd/system}"
     mkdir -p "$sysd_dir"
@@ -4623,7 +5028,11 @@ _domain_render_scheduler_unit() {
     local sname web_user php_bin framework
     read -r sname web_user php_bin framework <<< "$ctx"
 
-    local app_cmd; app_cmd=$(_domain_scheduler_cmd "$framework" "$php_bin") || return 1
+    local variant=""
+    if [[ "$framework" == "ci4" ]] && _domain_ci4_has_command "$domain" "cronjobs:run"; then
+        variant="cronjobs"
+    fi
+    local app_cmd; app_cmd=$(_domain_scheduler_cmd "$framework" "$php_bin" "$variant") || return 1
 
     local sysd_dir="${SRVCTL_SYSTEMD_DIR:-/etc/systemd/system}"
     mkdir -p "$sysd_dir"
@@ -4675,7 +5084,7 @@ _domain_worker() {
             # referans veriyor — yüklü değilse systemd start'ı REDDEDER (aynı
             # ön-kontrol deseni: _domain_activate_fpm_unit).
             if command -v aa-status &>/dev/null; then
-                aa-status 2>/dev/null | grep -q "srvctl-${sname}-cli" \
+                _domain_aa_profile_loaded "srvctl-${sname}-cli" \
                     || warn "AppArmor CLI profili yüklü değil: srvctl-${sname}-cli (unit başlamayacak — 'srvctl domain repair ${domain}' ile yükleyin)"
             fi
             if [[ "$action" == "enable" ]]; then
@@ -4730,7 +5139,7 @@ _domain_scheduler() {
             [[ -d "$wd" ]] || warn "WorkingDirectory henüz yok: ${wd} (ilk 'srvctl deploy ${domain}' bekleniyor — timer tetiklendiğinde çalışmayabilir)"
             # AppArmor CLI profili yüklü mü? (bkz. _domain_worker aynı kontrol)
             if command -v aa-status &>/dev/null; then
-                aa-status 2>/dev/null | grep -q "srvctl-${sname}-cli" \
+                _domain_aa_profile_loaded "srvctl-${sname}-cli" \
                     || warn "AppArmor CLI profili yüklü değil: srvctl-${sname}-cli (unit başlamayacak — 'srvctl domain repair ${domain}' ile yükleyin)"
             fi
             if [[ "$action" == "enable" ]]; then

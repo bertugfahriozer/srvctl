@@ -64,6 +64,10 @@ cmd_selfupdate() {
         run)       _selfupdate_run ;;
         rollback)  _selfupdate_rollback "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen self-update alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl self-update [check|run|rollback]"
             echo ""
@@ -79,6 +83,7 @@ cmd_selfupdate() {
             echo "  arasındaki pencerede repo ele geçirilip içerik SESSİZCE değiştirilebilirdi."
             echo "  Pin dosyası yoksa 'run' HİÇBİR ŞEY KURMADAN durur ve bunu açıkça bildirir."
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }
@@ -357,6 +362,21 @@ _selfupdate_install_from_staging() {
     done
 }
 
+# FM acil durum dizinini hazırlar: /var/lib/srvctl/fm-emergency, root:root 0700. İşlev lib/domconf.sh'tadır
+# (_domconf_fm_em_state_dir_prepare); self-update YENİ dosyaları az önce kurduğundan çalışan (ESKİ) kabuktan DEĞİL, kurulu
+# dosyalardan TAZE bir kabukta çağrılır. Sağlık kontrolünden SONRA çalışır (bash -n geçmemiş dosya source edilmez).
+# Başarısızlık güncellemeyi geri ALMAZ ama sessiz geçmez: uyarı. DİKKAT: bu işlevi taşımayan ESKİ bir selfupdate.sh
+# çalışırken ilk güncelleme bu adımı koşturamaz (çalışan kod eskidir) — dizin ilk ihtiyaçta lib/domconf.sh tarafından
+# oluşturulur ya da `sudo bash install.sh` / `srvctl init` ile hazırlanır.
+_selfupdate_prepare_fm_state_dir() {
+    if bash -c 'source "$1/lib/core.sh" && source "$1/lib/domconf.sh" && _domconf_fm_em_state_dir_prepare' _ "$SRVCTL_ROOT"; then
+        return 0
+    fi
+    warn "FM acil durum dizini hazırlanamadı (/var/lib/srvctl/fm-emergency): acil kapatma işareti ikinci konuma yazılamayabilir (rc 6)."
+    warn "Elle: sudo install -d -m 700 -o root -g root /var/lib/srvctl /var/lib/srvctl/fm-emergency"
+    return 1
+}
+
 # Kurulum sonrası duman testi. Herhangi biri başarısız olursa 1 döner —
 # çağıran (_selfupdate_run) bunu OTOMATİK rollback tetiklemek için kullanır.
 _selfupdate_health_check() {
@@ -528,6 +548,7 @@ _selfupdate_run() {
         fi
     fi
     success "Sağlık kontrolü geçti."
+    _selfupdate_prepare_fm_state_dir || true
 
     # ── 7. Commit hash'i + pin dosyasını finalize et ──
     echo "$PINNED_COMMIT" > "$SRVCTL_CURRENT_COMMIT"
@@ -570,26 +591,40 @@ _selfupdate_run() {
     echo ""
     warn "ÖNEMLİ — CONFIG DRIFT: şablonlar (nginx/apparmor/php-fpm/systemd) güncellenmiş"
     warn "olabilir ama MEVCUT domain config'leri OTOMATİK yeniden üretilmez. Bir güvenlik"
-    warn "düzeltmesinin TÜM domain'lere ulaşması için ÇALIŞTIRIN:"
+    warn "düzeltmesinin TÜM domain'lere ulaşması için (GENİŞ etki: FPM havuzu/unit + paylaşılan"
+    warn "FPM reload/restart, AppArmor, DB yetkisi + parola senkronu, Redis ACL — bakım penceresinde):"
     warn "  sudo srvctl domain repair --all"
     echo ""
 
-    # Mümkünse otomatik çağır — ama unattended/cron tetiklemeli bir
-    # self-update'te 'domain repair --all' servis yeniden başlatmaları
-    # tetikleyebileceğinden (nginx reload, FPM pool restart vb.) bunu operatör
-    # ONAYI olmadan ZORLA çalıştırmak sürpriz bir kesintiye yol açabilir.
-    # Interaktif değilse (stdin tty değil) 'confirm' zaten 'hayır' sayar ve
-    # yukarıdaki NET talimat operatöre kalır.
-    if confirm "Şimdi 'srvctl domain repair --all' çalıştırılsın mı?"; then
+    _selfupdate_offer_fm_root
+}
+
+# GEÇİŞ NOTU: bu davranış YALNIZ FM destekli (403 kökü) bir kurulumdan yapılan güncellemede çalışır — çalışan süreç
+# KENDİ (bellekteki) gövdesini yürütür. FM destekli sürüme İLK güncellemede bellekteki ESKİ _selfupdate_run "Şimdi 'srvctl domain
+# repair --all'" diye sorar ve DEĞİŞTİRİLEMEZ; bu yüzden orada geniş eylemi lib/domain.sh
+# (_domain_selfupdate_transition_redirect) üstlenir: _selfupdate_run zincirindeki 'repair' isteği fm-root yoluna
+# yönlendirilir. Operatör rehberi: FM destekli sürüme ilk güncellemede o soruya HAYIR de, sonra fm-root --all → --apply.
+# Güncelleme sonrası onaylı otomatik adım YALNIZ /_fm 403 kökü içindir ('domain fm-root'):
+# FM dosyaları dışında hiçbir şeye dokunmaz; yazılacak iş varsa tek nginx -t + tek reload (yoksa ikisi de çalışmaz). Önce KURU plan gösterilir;
+# geniş 'repair --all' artık burada ÖNERİLMEZ/ÇALIŞTIRILMAZ (yukarıdaki talimat operatöre kalır).
+# Interaktif değilse (stdin tty değil) 'confirm' zaten 'hayır' sayar.
+_selfupdate_offer_fm_root() {
+    if ! declare -f cmd_domain &>/dev/null; then
+        # shellcheck disable=SC1091
         source "${SRVCTL_ROOT}/lib/domain.sh" 2>/dev/null || true
-        if declare -f cmd_domain &>/dev/null; then
-            cmd_domain repair --all
-        else
-            warn "lib/domain.sh yüklenemedi — manuel çalıştırın: sudo srvctl domain repair --all"
-        fi
-    else
-        info "Atlandı. Unutmayın: sudo srvctl domain repair --all"
     fi
+    if ! declare -f cmd_domain &>/dev/null; then
+        warn "lib/domain.sh yüklenemedi — /_fm 403 kökü için manuel: sudo srvctl domain fm-root --all  (sonra --apply)"
+        return 0
+    fi
+    info "/_fm 403 kökü durumu (KURU — hiçbir şey yazılmaz):"
+    cmd_domain fm-root --all || true
+    if confirm "Eksik /_fm 403 kökleri şimdi kurulsun mu ('srvctl domain fm-root --all --apply'; yalnız FM dosyaları; yazılacak iş varsa tek nginx -t + tek reload, yoksa ikisi de çalışmaz)?"; then
+        cmd_domain fm-root --all --apply || warn "fm-root --apply tamamlanamadı — yukarıya bakın; önce: sudo srvctl domain fm-auth <alan> status; kayıt dizini güvensizse ÖNCE root:root 0700 yapıp 'sudo srvctl domain fm-auth <alan> off' koşun (repair/fm-root alanı hiçbir koşulda açmaz — yalnız açık 'fm-auth <alan> on' açar); sonra tekrar: sudo srvctl domain fm-root --all --apply"
+    else
+        info "Atlandı. Unutmayın: sudo srvctl domain fm-root --all --apply"
+    fi
+    return 0
 }
 
 _selfupdate_rollback() {

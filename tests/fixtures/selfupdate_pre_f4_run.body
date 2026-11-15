@@ -1,0 +1,162 @@
+# Sabit kanıt: F4 ÖNCESİ (taban 4411744) lib/selfupdate.sh:_selfupdate_run gövdesi, BİREBİR (sed -n 435,593p).
+# F4-sonrası-ilk güncellemede çalışan sürecin BELLEKTEKİ eski gövdesidir; yeni dosyalar kopyalandıktan sonra yeni lib/domain.sh'i source edip
+# "cmd_domain repair --all" çağırır. DEĞİŞTİRME — test_selfupdate_first_update_transition.sh bunu eski süreç yerine kullanır.
+_selfupdate_run() {
+    header "srvctl Güncelleme"
+
+    command -v git &>/dev/null || error "git kurulu değil. Kurun: apt install git"
+    _selfupdate_validate_repo_url "$SRVCTL_REPO" \
+        || error "Güvensiz SRVCTL_REPO reddedildi: ${SRVCTL_REPO}"
+
+    local current_version="${SRVCTL_VERSION}"
+    info "Mevcut sürüm: ${current_version}"
+
+    # ── 1. Pinlenmiş commit'i oku (GÜVENLİK: 'check' ÖNCE çalıştırılmış olmalı) ──
+    # KULLANILABİLİRLİK DÜZELTMESİ (üretimde ölçüldü — bkz. rapor): bu dal
+    # önceden yalnız 'error' ile TEK satırlık bir mesaj basıyordu. 'error'
+    # STDERR'e yazar (bkz. core.sh) ve script burada exit 1 ile durur; yalnız
+    # STDOUT'u yakalayan bir log/izleme kurulumunda ('srvctl self-update run
+    # >> log.txt' — '2>&1' OLMADAN) operatör "Mevcut sürüm: X" satırından
+    # sonra HİÇBİR ŞEY görmüyor, NEDENİNİ asla öğrenemiyordu. Düzeltme: asıl
+    # açıklama artık STDOUT'a ('info') basılıyor — hangi akış yakalanırsa
+    # yakalansın görünür olsun diye — son satır yine 'error' ile hem STDERR'e
+    # tekrarlanıp hem de exit 1 ile script sonlandırılıyor.
+    if [[ ! -f "$SRVCTL_SELFUPDATE_PIN" ]]; then
+        echo ""
+        info "Pinlenmiş bir güncelleme bulunamadı — 'run' HİÇBİR DOSYAYI DEĞİŞTİRMEDEN durdu."
+        info "self-update İKİ AŞAMALI çalışır (bilinçli güvenlik tasarımı):"
+        info "  1) sudo srvctl self-update check   → uzak HEAD'in TAM commit hash'ini okur ve PİNLER"
+        info "  2) sudo srvctl self-update run     → SADECE o pinlenmiş hash'i indirir, doğrular, kurar"
+        info "Neden: indirilecek içerik önce ('check' ile) görülüp SABİTLENMEDEN kurulursa,"
+        info "'check' ile 'run' arasında repo ele geçirilip içerik SESSİZCE değiştirilebilirdi."
+        echo ""
+        error "Önce çalıştırın: sudo srvctl self-update check"
+    fi
+    _selfupdate_assert_pin_owned "$SRVCTL_SELFUPDATE_PIN" \
+        || error "GÜVENLİK: ${SRVCTL_SELFUPDATE_PIN} root sahipli/izinli değil (tamper olabilir). Reddedildi — 'sudo srvctl self-update check' ile yeniden pinleyin."
+
+    local PINNED_COMMIT="" PINNED_AT="" PINNED_REPO=""
+    read_kv_file "$SRVCTL_SELFUPDATE_PIN" PINNED_COMMIT PINNED_AT PINNED_REPO
+    [[ -n "$PINNED_COMMIT" ]] \
+        || error "Pin dosyası bozuk (PINNED_COMMIT eksik). 'sudo srvctl self-update check' ile yeniden pinleyin."
+    [[ "$PINNED_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+        || error "Pin dosyası bozuk (geçersiz commit hash biçimi): ${PINNED_COMMIT}. 'sudo srvctl self-update check' ile yeniden pinleyin."
+    if [[ -n "$PINNED_REPO" && "$PINNED_REPO" != "$SRVCTL_REPO" ]]; then
+        error "GÜVENLİK: pin farklı bir repo için alınmış (${PINNED_REPO} ≠ ${SRVCTL_REPO}). Reddedildi — 'sudo srvctl self-update check' ile yeniden pinleyin."
+    fi
+
+    info "Pinlenmiş commit uygulanacak: ${PINNED_COMMIT:0:8} (pinlendi: ${PINNED_AT:-bilinmiyor})"
+    # ── Bilgilendirme: pin BAYAT olabilir mi? (uzak HEAD pinlendiğinden beri
+    #    ilerlemiş olabilir). Bu SADECE bilgilendirmedir — ENGELLEMEZ: TOFU
+    #    modelinin özü "operatörün 'check' anında GÖRDÜĞÜ TAM O commit'i kur"
+    #    olduğundan, pin bayat diye sessizce en yeni HEAD'e ATLAMAK TOFU'yu
+    #    by-pass eder, pin bayat diye kurulumu DURDURMAK ise operatörün zaten
+    #    onayladığı bir işlemi gereksiz yere engeller. Doğru davranış: haber
+    #    ver, kararı operatöre bırak (bkz. dosya başı GÜVENLİK MODELİ).
+    _selfupdate_warn_if_pin_stale "$PINNED_REPO" "$PINNED_COMMIT"
+
+    # ── 2. Mevcut kurulumun YEDEĞİ (staging oluşturulmadan ÖNCE — bkz. aşağıdaki
+    #      not: staging '.selfupdate-clone.*' adı hiçbir kopyalama globuna
+    #      uymadığından zaten yedeğe karışmazdı, ama önce almak daha temiz:
+    #      yedek her zaman "son bilinen iyi durum"u yansıtır). ──
+    local backup_dir
+    backup_dir="$(_selfupdate_backup_current)" || error "Yedekleme başarısız — güncelleme iptal edildi."
+    info "Mevcut kurulum yedeklendi → ${backup_dir}"
+
+    # ── 3. Root-only klon çalışma dizini (GÜVENLİK: '/tmp' KULLANILMAZ) ──
+    # bkz. dosya başı GÜVENLİK MODELİ notu.
+    local staging
+    staging="$(mktemp -d "${SRVCTL_ROOT}/.selfupdate-clone.XXXXXX")" \
+        || error "Geçici klon dizini oluşturulamadı."
+    chmod 700 "$staging"
+    # shellcheck disable=SC2064
+    trap "rm -rf -- '${staging}'" EXIT INT TERM
+
+    # ── 4. Pinlenmiş commit'i klonla + doğrula ──
+    step "1/5" "Pinlenmiş commit çekiliyor: ${PINNED_COMMIT:0:8}..."
+    if ! _selfupdate_fetch_pinned "$PINNED_REPO" "$PINNED_COMMIT" "$staging"; then
+        error "Pinlenmiş commit çekilemedi/doğrulanamadı — güncelleme iptal edildi (fail-closed). Hiçbir dosya değiştirilmedi."
+    fi
+    success "Doğrulandı: klonun HEAD'i pinlenmiş commit ile TAM eşleşiyor (${PINNED_COMMIT:0:8})"
+    _selfupdate_verify_tag_signature "$staging" "$PINNED_COMMIT"
+
+    # ── 5. Dosyaları kopyala ──
+    step "2/5" "Dosyalar güncelleniyor..."
+    _selfupdate_install_from_staging "$staging"
+
+    # ── 6. Sağlık kontrolü — başarısızsa OTOMATİK rollback (fail-closed) ──
+    step "3/5" "Sağlık kontrolü çalıştırılıyor (bash -n, nginx -t, srvctl version)..."
+    if ! _selfupdate_health_check; then
+        warn "Sağlık kontrolü BAŞARISIZ — otomatik geri alınıyor (rollback)..."
+        if _selfupdate_restore_from_backup "$backup_dir"; then
+            log_action "SECURITY: self-update health check failed, auto-rolled-back (pinned=${PINNED_COMMIT})"
+            error "Güncelleme geri alındı. Kurulum ÖNCEKİ sürüme (${current_version}) döndürüldü. Yedek: ${backup_dir}"
+        else
+            log_action "SECURITY: self-update health check failed AND rollback failed (pinned=${PINNED_COMMIT}, backup=${backup_dir})"
+            error "KRİTİK: sağlık kontrolü başarısız VE otomatik rollback de başarısız oldu. Manuel müdahale gerekli — yedek: ${backup_dir}"
+        fi
+    fi
+    success "Sağlık kontrolü geçti."
+
+    # ── 7. Commit hash'i + pin dosyasını finalize et ──
+    echo "$PINNED_COMMIT" > "$SRVCTL_CURRENT_COMMIT"
+    rm -f "$SRVCTL_SELFUPDATE_PIN"
+
+    # '|| true': 'grep -m1' EŞLEŞME BULAMAZSA nonzero döner — 'set -e' altında
+    # bu, dosyalar ZATEN başarıyla kurulmuş VE sağlık kontrolünden geçmiş
+    # olsa BİLE, script'i tam bu noktada SESSİZCE keserdi: "Tamamlandı" banner'ı,
+    # yedek temizliği, changelog kaydı ve 'domain repair --all' daveti HİÇ
+    # ÇALIŞMAZ; operatör güncellemenin BAŞARISIZ olduğunu SANIR (oysa dosyalar
+    # kuruludur). Aşağıdaki "[[ -n ]] || bilinmiyor" düşme-yolu tam da bunun
+    # için vardı ama '|| true' olmadan asla ÇALIŞTIRILAMAZDI.
+    local new_version
+    new_version="$(grep -m1 '^SRVCTL_VERSION=' "${SRVCTL_ROOT}/lib/core.sh" 2>/dev/null | cut -d= -f2 | tr -d '"')" || true
+    [[ -n "$new_version" ]] || new_version="bilinmiyor"
+
+    step "4/5" "Eski yedekler temizleniyor (son ${SELFUPDATE_KEEP_BACKUPS:-3} tutulur)..."
+    _selfupdate_prune_backups
+
+    # Cross-module: yalnız guard'lı source (bkz. CLAUDE.md deseni,
+    # lib/domain.sh:_domain_purge_resources'un backup.sh'ı source etmesiyle
+    # aynı desen). ESKİ kod var olmayan 'changelog_write' adında bir fonksiyonu
+    # çağırıyordu (gerçek adı 'log_to_changelog'dur) — bu 'declare -f' kontrolü
+    # HER ZAMAN false dönüyordu, yani changelog kaydı hiçbir zaman yazılmıyordu.
+    # Düzeltildi.
+    source "${SRVCTL_ROOT}/lib/changelog.sh" 2>/dev/null || true
+    if declare -f log_to_changelog &>/dev/null; then
+        log_to_changelog "SELF-UPDATE: ${current_version} → ${new_version} (${PINNED_COMMIT:0:8})"
+    fi
+    log_action "SELF-UPDATE: ${current_version} -> ${new_version} (${PINNED_COMMIT})"
+
+    step "5/5" "Tamamlandı"
+    success "srvctl güncellendi!"
+    info "  Eski: ${current_version}"
+    info "  Yeni: ${new_version} (${PINNED_COMMIT:0:8})"
+    info "  Yedek: ${backup_dir}"
+    echo ""
+    warn "NOT: conf/srvctl.conf ayarlarınıza/sırlarınıza dokunulmadı."
+    warn "NOT: conf/rate-profiles.conf güncellendi (veri dosyasıdır, kullanıcı ayarı değil)."
+    echo ""
+    warn "ÖNEMLİ — CONFIG DRIFT: şablonlar (nginx/apparmor/php-fpm/systemd) güncellenmiş"
+    warn "olabilir ama MEVCUT domain config'leri OTOMATİK yeniden üretilmez. Bir güvenlik"
+    warn "düzeltmesinin TÜM domain'lere ulaşması için ÇALIŞTIRIN:"
+    warn "  sudo srvctl domain repair --all"
+    echo ""
+
+    # Mümkünse otomatik çağır — ama unattended/cron tetiklemeli bir
+    # self-update'te 'domain repair --all' servis yeniden başlatmaları
+    # tetikleyebileceğinden (nginx reload, FPM pool restart vb.) bunu operatör
+    # ONAYI olmadan ZORLA çalıştırmak sürpriz bir kesintiye yol açabilir.
+    # Interaktif değilse (stdin tty değil) 'confirm' zaten 'hayır' sayar ve
+    # yukarıdaki NET talimat operatöre kalır.
+    if confirm "Şimdi 'srvctl domain repair --all' çalıştırılsın mı?"; then
+        source "${SRVCTL_ROOT}/lib/domain.sh" 2>/dev/null || true
+        if declare -f cmd_domain &>/dev/null; then
+            cmd_domain repair --all
+        else
+            warn "lib/domain.sh yüklenemedi — manuel çalıştırın: sudo srvctl domain repair --all"
+        fi
+    else
+        info "Atlandı. Unutmayın: sudo srvctl domain repair --all"
+    fi
+}

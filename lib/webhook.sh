@@ -181,6 +181,10 @@ cmd_webhook() {
         status) _webhook_status ;;
         setup)  _webhook_setup "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen webhook alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl webhook <start|stop|status|setup>"
             echo ""
@@ -195,6 +199,7 @@ cmd_webhook() {
             echo "    gösterilen 'https://<domain>/__srvctl_webhook/<...>' "
             echo "    adresini GitHub/GitLab'a Payload URL olarak girin."
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }

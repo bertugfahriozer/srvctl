@@ -1,5 +1,8 @@
 # `domain reload` + per-domain `.ini` / nginx `.conf` düzenleme — Uygulama Planı
 
+> **GÜNCEL DURUM (2026-10-25):** bu planın `proxy_pass` serbest kararı ve `location /api/ { proxy_pass http://127.0.0.1:3000; }` örnekleri GEÇERSİZDİR — `proxy_pass` kullanıcı dosyasında TAM YASAKTIR (README "`proxy_pass` ilkesi"). Plan tarihsel kayıttır.
+
+
 > **Agentic worker'lar için:** ZORUNLU ALT-SKILL: Bu planı task-task uygulamak için `superpowers:subagent-driven-development` (önerilen) veya `superpowers:executing-plans` kullan. Adımlar takip için checkbox (`- [ ]`) sözdizimi kullanır.
 
 **Hedef:** Operatörün per-domain PHP ve nginx ayarlarını, bir sonraki `repair`de sessizce kaybolmayacak biçimde düzenleyebilmesi ve doğru FPM unit'ini tek komutla reload edebilmesi.

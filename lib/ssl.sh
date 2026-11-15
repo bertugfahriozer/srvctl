@@ -9,12 +9,17 @@ cmd_ssl() {
         renew)  _ssl_renew ;;
         status) _ssl_status ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen ssl alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl ssl <renew|status>"
             echo ""
             echo "    renew     Tüm sertifikaları yenile"
             echo "    status    Sertifika durumlarını göster"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }

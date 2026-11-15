@@ -82,6 +82,14 @@ id() { return 0; }
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/lib/domain.sh"
 
+# QL5-L1: _domain_repair domconf yüklenemezse artık REDDEDER (fail-closed). core.sh SRVCTL_ROOT'u sabit
+# '/usr/local/srvctl' tuttuğundan Bölüm A–E domconf'u yükleyemez ve FM adımını kilitlemez: orijinaller
+# saklanır, stub'lanır; Bölüm F (SRVCTL_ROOT=depo, gerçek domconf) orijinalleri GERİ getirir.
+_QL5_ORIG_LOAD_CONF="$(declare -f _domain_load_conf_lib)"
+_QL5_ORIG_FM_STEP="$(declare -f _domain_repair_fm_step)"
+_domain_load_conf_lib() { return 0; }
+_domain_repair_fm_step() { return 0; }
+
 if ! declare -F _domain_repair >/dev/null 2>&1; then
     echo "  SKIP: _domain_repair tanımlı değil"
     test_summary
@@ -405,5 +413,63 @@ assert_not_contains "$outDirect" "Domain onarıldı:" "E3: doğrudan çağrıda 
 id() { return 0; }
 
 rm -rf "$WEB_ROOT" "$SRVCTL_STATE_DIR" "$SRVCTL_FPM_DIR" "$SRVCTL_SYSTEMD_DIR" "$SRVCTL_PHP_POOL_DIR"
+
+# ═══════════ Bölüm F: fm-auth açıkken repair FM dosyalarını KAYITLI parametrelerle yeniler ═══════════
+# php-switch eski sürümlerde bayat soket bırakmış olabilir (eski havuz silindi → 502, her yükleme
+# parçası 500). F3: dosyalar şablondan + köken kaydıyla üretilir; 'repair' sed ile DEĞİL, render +
+# kayıt güncellemesiyle onarır. Test iskelesi: kayıt dizini WEB_ROOT ALTINDA, _stat_owner taklidi,
+# flock taklidi (macOS'ta flock yok).
+WEB_ROOT="$(mktemp -d)"
+SRVCTL_STATE_DIR="${WEB_ROOT}/.state"
+SRVCTL_FPM_DIR="$(mktemp -d)"
+SRVCTL_SYSTEMD_DIR="$(mktemp -d)"
+SRVCTL_PHP_POOL_DIR="$(mktemp -d)"
+SRVCTL_NGINX_CUSTOM_DIR="$(mktemp -d)"
+export WEB_ROOT SRVCTL_STATE_DIR SRVCTL_FPM_DIR SRVCTL_SYSTEMD_DIR SRVCTL_PHP_POOL_DIR SRVCTL_NGINX_CUSTOM_DIR
+mkdir -p "$SRVCTL_STATE_DIR"
+eval "$_QL5_ORIG_LOAD_CONF"; eval "$_QL5_ORIG_FM_STEP"   # QL5-L1: Bölüm F gerçek domconf + gerçek FM adımıyla koşar
+# shellcheck disable=SC2034  # _domain_load_conf_lib domconf.sh'i bu değişkenden yükler (kaynak edilen kodda okunur)
+SRVCTL_ROOT="${REPO_ROOT}"
+FMSTUB="$(mktemp -d)"; printf '#!/bin/bash\nexit 0\n' > "${FMSTUB}/flock"; chmod +x "${FMSTUB}/flock"
+PATH="${FMSTUB}:${PATH}"
+_stat_owner() { printf 'root'; }
+nginx() { return 0; }
+dF="fm-repair.test"
+snameF=$(safe_name "$dF")
+_setup_domain "$dF"
+_domain_load_conf_lib
+FMCONF="${SRVCTL_NGINX_CUSTOM_DIR}/${snameF}/90-srvctl-fm-auth.conf"
+FMSCRIPT="/current/modules/FileManager/Auth/fm-auth.php"
+# fm-auth'ı BAYAT bir PHP sürümüyle (8.1) aç: gerçek yazım çekirdeği, kayıt dahil
+_fmprov_with_lock _domconf_fm_apply "$dF" "$snameF" on eu "$FMSCRIPT" 8.1 1 0 >/dev/null 2>&1
+assert_contains "$(cat "$FMCONF")" "php8.1-fpm-${snameF}.sock" "Bölüm F: sondaj: bayat (php8.1) soketle açıldı"
+outF=$(_domain_repair "$dF" 2>&1); rcF=$?
+assert_eq "$rcF" "0" "Bölüm F: bayat fm-auth olan domain repair başarılı"
+assert_contains "$(cat "$FMCONF")" "fastcgi_pass unix:/run/php/php8.3-fpm-${snameF}.sock;" \
+    "Bölüm F: repair /__fm_auth soketini alanın GERÇEK havuzuna (php8.3) çekti"
+assert_contains "$outF" "fm-auth yeniden üretildi" "Bölüm F: onarım AÇIKÇA raporlandı"
+assert_contains "$(cat "${SRVCTL_STATE_DIR}/_fm-auth/${snameF}.manifest")" "php_version 8.3" "Bölüm F: köken kaydı da güncellendi"
+assert_ok _fmprov_is_generated "$snameF" "$FMCONF"
+# fm-auth hiç açılmamış domain: repair YALNIZ 403 kökünü (20, kayıt state off) kurar; 90/21 YARATMAZ
+dF2="fm-off.test"; snameF2=$(safe_name "$dF2"); _setup_domain "$dF2"
+_domain_repair "$dF2" >/dev/null 2>&1
+assert_eq "$([[ -e "${SRVCTL_NGINX_CUSTOM_DIR}/${snameF2}/90-srvctl-fm-auth.conf" ]] && echo var || echo yok)" "yok" \
+    "Bölüm F: fm-auth kapalı domainde repair 90 dosyası YARATMAZ"
+assert_eq "$([[ -e "${SRVCTL_NGINX_CUSTOM_DIR}/${snameF2}/20-srvctl-fm-upload.conf" ]] && echo var || echo yok)" "var" \
+    "Bölüm F: fm-auth kapalı domainde repair 403 kökünü (20) kurar"
+assert_contains "$(cat "${SRVCTL_STATE_DIR}/_fm-auth/${snameF2}.manifest" 2>/dev/null)" "state off" \
+    "Bölüm F: fm-auth kapalı domainde repair 403 kökünü köken kaydına 'state off' girer"
+# soket onarılamazsa (nginx -t başarısız) repair dürüstçe başarısız
+_fmprov_with_lock _domconf_fm_apply "$dF" "$snameF" on eu "$FMSCRIPT" 8.1 1 0 >/dev/null 2>&1
+nginx() { return 1; }
+outF3=$(_domain_repair "$dF" 2>&1); rcF3=$?
+assert_eq "$([[ "$rcF3" -ne 0 ]] && echo NONZERO || echo ZERO)" "NONZERO" \
+    "Bölüm F: onarım yazıldı ama nginx -t başarısız → repair SIFIRDAN FARKLI döner"
+assert_not_contains "$outF3" "Domain onarıldı:" "Bölüm F: başarı mesajı basılmadı"
+assert_contains "$(cat "$FMCONF")" "php8.1-fpm-${snameF}.sock" "Bölüm F: başarısız onarım geri alındı (eski dosya yerinde)"
+nginx() { return 0; }
+unset -f _stat_owner
+
+rm -rf "$WEB_ROOT" "$SRVCTL_FPM_DIR" "$SRVCTL_SYSTEMD_DIR" "$SRVCTL_PHP_POOL_DIR" "$SRVCTL_NGINX_CUSTOM_DIR" "$FMSTUB"
 
 test_summary

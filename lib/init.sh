@@ -67,6 +67,18 @@ _init_run_step() {
     fi
 }
 
+# FM acil durum dizinini hazırlar: /var/lib/srvctl/fm-emergency, root:root 0700 (idempotent; her `srvctl init`
+# çalıştırmasında, adım işaretçisine bağlı OLMADAN). İşlev lib/domconf.sh'tadır (_domconf_fm_em_state_dir_prepare); taze kabuk.
+# Başarısızlık: uyarı + 1 döner (çağıran init'i "kısmen tamamlandı" işaretler).
+_init_prepare_fm_state_dir() {
+    if bash -c 'source "$1/lib/core.sh" && source "$1/lib/domconf.sh" && _domconf_fm_em_state_dir_prepare' _ "$SRVCTL_ROOT"; then
+        return 0
+    fi
+    warn "FM acil durum dizini hazırlanamadı (/var/lib/srvctl/fm-emergency): acil kapatma işareti ikinci konuma yazılamayabilir (rc 6)."
+    warn "Elle: sudo install -d -m 700 -o root -g root /var/lib/srvctl /var/lib/srvctl/fm-emergency"
+    return 1
+}
+
 cmd_init() {
     require_root
     _init_apt_noninteractive
@@ -85,6 +97,8 @@ cmd_init() {
     # (bkz. _init_run_step yorumu) — kapanışta "Tamamlandı" yerine "Kısmen
     # Tamamlandı" banner'ı basmak ve log_action'a doğru sonucu yazmak için.
     _INIT_ANY_DEGRADED=false
+
+    _init_prepare_fm_state_dir || _INIT_ANY_DEGRADED=true
 
     if [[ "$SRVCTL_INIT_FORCE" == "true" ]]; then
         warn "--force: TÜM adımlar yeniden çalıştırılacak (UFW kuralları sıfırlanır — ip.sh whitelist/blacklist dosyaları /etc/srvctl/ip-*.conf'ta kalır ama ufw/fail2ban'e yeniden UYGULANMAZ; gerekirse 'srvctl ip' komutlarını tekrar çalıştırın)"

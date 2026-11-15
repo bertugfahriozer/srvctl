@@ -33,6 +33,12 @@ mysql() { return 0; }
 systemctl() { return 0; }
 redis-cli() { return 0; }
 source "${REPO_ROOT}/lib/domain.sh"
+
+# QL5-L1: _domain_repair domconf yüklenemezse artık REDDEDER (fail-closed). core.sh SRVCTL_ROOT'u sabit
+# '/usr/local/srvctl' tuttuğundan bu test domconf'u yükleyemez; test FM adımını değil .credentials üretimini kilitler.
+# FM adımı burada stub'lanır (yükleme-başarısızlığı kolu: test_domain_repair_conf_lib_failclosed.sh).
+_domain_load_conf_lib() { return 0; }
+_domain_repair_fm_step() { return 0; }
 source "${REPO_ROOT}/lib/security.sh"
 
 echo "== 1) '.credentials' eksik + GERÇEK domain (web kullanıcısı var) → yeniden üretilir =="

@@ -55,6 +55,23 @@ _ask() {
     [[ "$answer" == "evet" ]]
 }
 
+# ─── FM acil durum dizini ───
+# Acil kapatma işaretinin KAYIT DİZİNİNDEN BAĞIMSIZ ikinci konumu (/var/lib/srvctl/fm-emergency, root:root 0700) daha önce
+# yalnız ihtiyaç anında `mkdir -p` ile doğuyordu: kurulumda hiç hazırlanmadığından üst dizin (/var/lib/srvctl) ya da sahiplik
+# beklenmedik olabilir ve işaret tam acil anda YAZILAMAZ (rc 6). Hazırlık tek işlevde (lib/domconf.sh ::
+# _domconf_fm_em_state_dir_prepare: mkdir -p + chmod 700 + root sahipliği doğrulaması, idempotent); kurulu dosyalardan TAZE bir
+# kabukta çağrılır. Başarısızlık kurulumu DURDURMAZ ama sessiz geçmez: uyarı + elle komut basılır.
+_install_prepare_fm_state_dir() {
+    local root="${1:-${INSTALL_DIR}}"
+    if bash -c 'source "$1/lib/core.sh" && source "$1/lib/domconf.sh" && _domconf_fm_em_state_dir_prepare' _ "$root"; then
+        return 0
+    fi
+    echo -e "${YELLOW}⚠${NC}  FM acil durum dizini hazırlanamadı (/var/lib/srvctl/fm-emergency)."
+    echo "   Acil kapatma işareti ikinci konuma yazılamayabilir (rc 6). Elle hazırlayın:"
+    echo "     sudo install -d -m 700 -o root -g root /var/lib/srvctl /var/lib/srvctl/fm-emergency"
+    return 1
+}
+
 # ─── OS kontrolü ───
 # Desteklenen sürümler: 22.04 (jammy) ve 24.04 (noble) — bkz. .claude/ubuntu-compat.md.
 # NOT: bu KAPI, "hangi Ubuntu LTS'yiz" sorusuna cevap verdiğinden doğası gereği
@@ -239,6 +256,7 @@ echo -e "  ${CYAN}[5/5]${NC} Log dizini hazırlanıyor..."
 mkdir -p "${INSTALL_DIR}/logs"
 touch "${INSTALL_DIR}/logs/srvctl.log"
 chmod 640 "${INSTALL_DIR}/logs/srvctl.log"
+_install_prepare_fm_state_dir "${INSTALL_DIR}" || true
 
 # ─── Doğrulama ───
 echo ""

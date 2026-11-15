@@ -13,6 +13,10 @@ cmd_changelog() {
         search) _changelog_search "${@:2}" ;;
         export) _changelog_export "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen changelog alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl changelog <show|tail|search|export>"
             echo ""
@@ -21,6 +25,7 @@ cmd_changelog() {
             echo "    search <terim>       Arama yap"
             echo "    export [dosya]       Değişiklikleri dışa aktar"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }

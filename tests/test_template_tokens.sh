@@ -43,31 +43,35 @@ TEMPLATES_DIR="${REPO_ROOT}/templates"
 # aynı satırdaki açıklama sonekini (ör. maintenance.html: 'DOMAIN —
 # Besleyen: ...') hem de SONRAKİ satırlardaki gerçek 'Besleyen: ...'
 # paragrafını doğal olarak eler (ikisi de küçük harf/noktalama içerir).
+#
+# UYGULAMA NOTU (QL9-L8, KÖK NEDEN — deneyle kanıtlı): önceki sürüm dosyanın geri
+# kalanını bir bash DEĞİŞKENİNE alıp (a) '${rest//#/ }' vb. toplu değiştirmeyle
+# süslüyor, (b) 'for w in $rest' ile TIRNAKSIZ genişletiyordu. (b) pathname
+# expansion (glob) yapar: profile-cli.tpl'deki '/home/**' sözcüğü macOS'ta
+# autofs bağlı '/home' için opendir(2)'ı süresiz bloklar (set -f ile anında biter;
+# aynı sözcük tek başına 'for w in /home/**' 5 sn'de bitmez). (a) bash 3.2'de
+# UTF-8 yerelinde O(n*eşleşme): 36 KB'lık şablonda 4 değiştirme ~30 sn. Çözüm:
+# tüm ayrıştırma tek awk'ta (alan bölme glob yapmaz, doğrusal), bash kelime
+# genişletmesi hiç yok.
 _tpl_declared_tokens() {
-    local file="$1"
-    local rest
-    rest=$(awk '
-        BEGIN{found=0}
-        {
-            if (!found) {
-                idx = index($0, "TOKENS:")
-                if (idx > 0) { found=1; print substr($0, idx+7); next }
-            } else {
-                print
+    LC_ALL=C awk '
+        function flush(   i, n, w, a) {
+            gsub(/#/, " "); gsub(/;/, " "); gsub(/<!--/, " "); gsub(/-->/, " ")
+            n = split($0, a, /[ \t]+/)
+            for (i = 1; i <= n; i++) {
+                w = a[i]
+                if (w == "") continue
+                if (w ~ /^[A-Z_][A-Z0-9_]*$/) { tok[w] = 1 } else { stop = 1; return }
             }
         }
-    ' "$file")
-    rest="${rest//#/ }"; rest="${rest//;/ }"; rest="${rest//<!--/ }"; rest="${rest//-->/ }"
-    local w
-    local -a tokens=()
-    for w in $rest; do
-        if [[ "$w" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
-            tokens+=("$w")
-        else
-            break
-        fi
-    done
-    [[ "${#tokens[@]}" -gt 0 ]] && printf '%s\n' "${tokens[@]}" | sort -u
+        stop { next }
+        found { flush(); next }
+        {
+            idx = index($0, "TOKENS:")
+            if (idx > 0) { found = 1; $0 = substr($0, idx + 7); flush() }
+        }
+        END { for (w in tok) print w }
+    ' "$1" | sort -u
     return 0
 }
 
@@ -147,6 +151,19 @@ assert_contains     "$probe_findings" "missing_usage.tpl"     "dedektör: TOKENS
 assert_contains     "$probe_findings" "undeclared_usage.tpl"  "dedektör: DALGA 5 sınıfı — TOKENS'ta BEYAN EDİLMEYEN ama KULLANILAN token'ı yakalıyor"
 assert_not_contains "$probe_findings" "ok.tpl"                "doğru/eşleşen şablon için YANLIŞ POZİTİF üretilmiyor"
 assert_not_contains "$probe_findings" "multiline.tpl"         "çok satırlı 'TOKENS:' devamı doğru ayrıştırılıyor (YANLIŞ POZİTİF yok)"
+
+# (e) QL9-L8 regresyonu: TOKENS: bloğundan sonra gelen glob karakterli sözcük
+#     (profile-cli.tpl'deki '/home/**' deseni) PATHNAME EXPANSION'a UĞRAMAMALI.
+#     Tarayıcı tırnaksız genişletirse macOS'ta autofs '/home' opendir'de askıda
+#     kalır (gerçek hata); burada aynı sınıfı autofs'suz, DAVRANIŞLA yakalarız:
+#     çalışma dizininde 'BAR' adlı bir dosya var ve 'TOKENS: FOO *' yazıyor.
+#     Doğru (glob yok): '*' token değil -> beyan yalnız {FOO}. Hatalı (glob var):
+#     '*' -> 'BAR' dosyası -> beyan {BAR FOO} (SAHTE tutarlılık).
+globcwd="${probe_dir}.globcwd"; mkdir -p "$globcwd"; : > "${globcwd}/BAR"
+printf '%s\n' '# TOKENS: FOO *' 'echo {{FOO}} {{BAR}}' > "${globcwd}/glob.tpl"
+glob_decl="$(cd "$globcwd" && _tpl_declared_tokens "${globcwd}/glob.tpl" | tr '\n' ' ')"
+assert_eq "$glob_decl" "FOO " "TOKENS: sonrası glob sözcüğü ('*') genişletilmiyor — yalnızca FOO beyan sayılır (pathname expansion yok)"
+rm -rf "$globcwd"
 
 rm -rf "$probe_dir"
 test_summary

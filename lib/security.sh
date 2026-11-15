@@ -51,8 +51,10 @@ _audit_parse_active_units() {
 # master PID'i üzerinden çağırır (bkz. _audit_domain_fpm_pid).
 _audit_aa_attr_enforced() {
     local text="$1" profile="$2"
+    # İlk satır: boru YOK (pipefail altında 'printf | head -n1' SIGPIPE yarışı sınıfı,
+    # güvenlik denetiminde yanlış-negatif üretirdi) — parametre genişletmesi aynı sonucu verir.
     local first_line
-    first_line="$(printf '%s' "$text" | head -n1)"
+    first_line="${text%%$'\n'*}"
     [[ "$first_line" == "${profile} (enforce)" ]]
 }
 
@@ -747,11 +749,16 @@ cmd_security() {
         harden-fs)  _security_harden_fs "${@:2}" ;;
         harden-fpm) _security_harden_fpm "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen security alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl security audit"
             echo "            srvctl security harden-fs <domain>|--all [--apply|--revert]"
             echo "            srvctl security harden-fpm <domain>|--all [--apply]"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }

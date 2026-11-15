@@ -3,6 +3,11 @@
 #  Kurulum: cp completions/srvctl.bash /etc/bash_completion.d/srvctl
 # ═══════════════════════════════════════════════
 
+# SC2207 bu dosyada kasıtlıdır: `COMPREPLY=($(compgen -W "…" -- "$cur"))` bash-completion'ın standart kalıbıdır; compgen -W çıktısı
+# boşluksuz sözcüklerdir ve sözcük bölme istenen davranıştır. `mapfile` bash 4+ gerektirir (macOS yönetici kabuğu 3.2'dir; bu dosya
+# etkileşimli kabuklarda source edilir). Dosyada 36 kullanım vardı, FM komut ağacı 6 tane ekledi (toplam 42): hepsi aynı kalıp.
+# shellcheck disable=SC2207
+
 _srvctl_completions() {
     local cur prev commands
     COMPREPLY=()
@@ -21,22 +26,38 @@ _srvctl_completions() {
     # 2. seviye — alt komutlar
     case "${COMP_WORDS[1]}" in
         domain)
-            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources reload ini nginx open-basedir staging migrate rate-limit framework repair worker scheduler"
+            local domain_cmds="add remove list info clone suspend unsuspend php-switch resources reload ini nginx nginx-audit fm-auth fm-root open-basedir staging migrate rate-limit framework repair worker scheduler"
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$domain_cmds" -- "$cur"))
             elif [[ ${COMP_CWORD} -eq 3 ]]; then
                 # Domain adı tamamlama ('reload' ve 'open-basedir' ayrıca --all kabul eder)
-                [[ "${COMP_WORDS[2]}" == "reload" || "${COMP_WORDS[2]}" == "open-basedir" ]] \
+                [[ "${COMP_WORDS[2]}" == "reload" || "${COMP_WORDS[2]}" == "open-basedir" || "${COMP_WORDS[2]}" == "nginx-audit" || "${COMP_WORDS[2]}" == "fm-root" ]] \
                     && COMPREPLY=($(compgen -W "--all" -- "$cur"))
                 _srvctl_complete_domains
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "reload" ]]; then
                 COMPREPLY=($(compgen -W "--fpm --nginx" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "open-basedir" ]]; then
                 COMPREPLY=($(compgen -W "on off --show --all" -- "$cur"))
+            elif [[ ${COMP_CWORD} -eq 4 && "${COMP_WORDS[2]}" == "fm-auth" ]]; then
+                COMPREPLY=($(compgen -W "on off status" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 5 && "${COMP_WORDS[2]}" == "fm-auth" ]]; then
+                COMPREPLY=($(compgen -W "--script= --region= --force --dry --emergency" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "nginx-audit" ]]; then
+                COMPREPLY=($(compgen -W "--quarantine" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "fm-root" ]]; then
+                # shellcheck disable=SC2207  # dosyanın geri kalanıyla aynı desen (sabit sözcük listesi)
+                COMPREPLY=($(compgen -W "--apply" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 5 && "${COMP_WORDS[2]}" == "clone" ]]; then
+                COMPREPLY=($(compgen -W "--skip-custom-d" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "staging" ]]; then
+                COMPREPLY=($(compgen -W "--skip-custom-d" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "resources" ]]; then
                 COMPREPLY=($(compgen -W "--memory= --cpu= --io= --reset --show" -- "$cur"))
-            elif [[ ${COMP_CWORD} -ge 4 && ( "${COMP_WORDS[2]}" == "ini" || "${COMP_WORDS[2]}" == "nginx" ) ]]; then
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "ini" ]]; then
                 COMPREPLY=($(compgen -W "--show --file= --force" -- "$cur"))
+            elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "nginx" ]]; then
+                # 'domain nginx': --force YOK (izin listesinin baypası yok)
+                COMPREPLY=($(compgen -W "--show --file=" -- "$cur"))
             elif [[ ${COMP_CWORD} -ge 4 && "${COMP_WORDS[2]}" == "add" ]]; then
                 # 'domain add' bayrak tamamlama (--redis-queue dahil)
                 COMPREPLY=($(compgen -W "--php= --rate= --sensitive= --framework= --resources= --no-ssl --redis-queue" -- "$cur"))

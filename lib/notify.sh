@@ -16,12 +16,17 @@ cmd_notify() {
         test)   _notify_test ;;
         setup)  _notify_setup ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen notify alt komutu: ${1}"
             echo ""
             echo "  Kullanım: srvctl notify <test|setup>"
             echo ""
             echo "    setup     Bildirim kanallarını yapılandır"
             echo "    test      Test bildirimi gönder"
             echo ""
+            return "$_usage_rc"
             ;;
     esac
 }

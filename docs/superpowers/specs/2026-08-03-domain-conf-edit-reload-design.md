@@ -202,6 +202,8 @@ Glob include sıfır eşleşmeyi hatasız kabul eder, bu yüzden dizin yokken de
 
 **`proxy_pass` bilinçli olarak serbesttir.** Tehdit modeli burada "saldırgan" değil "operatörün ayağına sıkması" — dosyayı yalnız root düzenler. Bir Node/websocket servisine proxy meşru ve yaygın bir ihtiyaçtır; reddetmek operatörü srvctl'i baypas edip vhost'u elle düzenlemeye iter, ki o değişiklik ilk `repair`de sessizce kaybolur (RC1).
 
+> **GÜNCEL DURUM (kullanıcı kararı 2026-10-25): BU KARAR GEÇERSİZDİR.** `proxy_pass` kullanıcı `custom.d` dosyasında artık TAM YASAKTIR (root yetkisiyle yüklenen dosyada ters vekil = kiracı atlama/SSRF sınıfı). Ters vekil ihtiyacı için srvctl'e ayrı şablonlu komut istenir; kullanıcı dosyasından asla. Mevcut dosyalar kırılmaz, `nginx-audit` raporlar. Bkz. README "`proxy_pass` ilkesi". Aşağıdaki metin tarihsel kayıt olarak durur.
+
 **`add_header` taranmıyor, iskelette uyarılıyor.** nginx'te bir `location` bloğu içinde `add_header` kullanmak, o location için üst bloğun **tüm** güvenlik başlıklarını (HSTS, X-Frame-Options, Referrer-Policy…) sessizce düşürür. Bunu güvenilir biçimde yakalamak blok-farkında bir parser gerektirir; satır bazlı bir tarama ya yanlış pozitif üretir ya da kaçırır. İskelet dosyasının yorumlarında bu tuzağı açıkça anlatmak dürüst ve etkili çözümdür.
 
 ### 6.2 Tarama yöntemi ve sınırları

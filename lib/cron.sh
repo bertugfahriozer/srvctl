@@ -240,7 +240,12 @@ cmd_cron() {
         # Bilinçli olarak help metninde/completions'ta LİSTELENMEZ.
         _on-failure) _cron_on_failure "${@:2}" ;;
         *)
+            # Bilinmeyen alt komut kullanımı basar ama rc≠0 döner; yalnız açık yardım isteği rc 0.
+            local _usage_rc=1
+            case "${1:-help}" in help|-h|--help) _usage_rc=0 ;; esac
+            [[ "$_usage_rc" -eq 0 ]] || warn "Bilinmeyen cron alt komutu: ${1}"
             _cron_help
+            return "$_usage_rc"
             ;;
     esac
 }
@@ -1410,7 +1415,14 @@ _cron_profile_loaded() {
         return 1
     fi
     if command -v aa-status >/dev/null 2>&1; then
-        aa-status 2>/dev/null | grep -q -- "$profile" && return 0
+        # 'aa-status | grep -q' pipefail altında SIGPIPE yarışıdır: grep ilk
+        # eşleşmede çıkar, aa-status hâlâ yazıyorsa (çok profilli sunucuda çıktı
+        # stdio tamponunu aşar) SIGPIPE ile ölür → boru hattı 141 → YÜKLÜ profil
+        # "yok" sanılırdı (yanlış-negatif). Çıktı önce değişkene alınır
+        # (lib/domain.sh _domain_aa_profile_loaded ile aynı yöntem, M6).
+        local aa_out
+        aa_out=$(aa-status 2>/dev/null) || true
+        grep -q -- "$profile" <<< "$aa_out" && return 0
         return 1
     fi
     return 2
