@@ -245,8 +245,40 @@ _monitor_uptime() {
         printf "  %-30s %-8b %-10s %-10b\n" "$domain" "$http_status" "${response_time}ms" "$ssl_status"
     done
 
+    # K13: fm-up host'ları (up.<alan>; WEB_ROOT dizini yok) — yalnız sertifika süresi (HTTP kökü bilerek 404).
+    local uphost
+    while IFS= read -r uphost; do
+        [[ -n "$uphost" ]] || continue
+        printf "  %-30s %-8s %-10s %-10b\n" "$uphost" "up" "-" "$(_monitor_up_cert_days "$uphost")"
+    done < <(_monitor_up_hosts)
+
     divider
     echo ""
+}
+
+# fm-up host listesi (edge.sh yoksa boş) ve sertifika kalan gün (stdout: renkli etiket; "-" yok).
+_monitor_up_hosts() {
+    declare -F _edge_fmup_hosts >/dev/null 2>&1 || { [[ -f "${SRVCTL_ROOT}/lib/edge.sh" ]] && source "${SRVCTL_ROOT}/lib/edge.sh" 2>/dev/null; } || return 0
+    _edge_fmup_hosts
+}
+# $1 host → kalan gün tamsayısı ("" = sertifika yok/okunamadı) stdout
+_monitor_up_cert_raw_days() {
+    local pem="${SRVCTL_LE_LIVE_DIR:-/etc/letsencrypt/live}/${1}/fullchain.pem" ee exp
+    [[ -f "$pem" ]] || return 0
+    exp=$(openssl x509 -enddate -noout -in "$pem" 2>/dev/null | cut -d= -f2)
+    ee=$(date -d "$exp" +%s 2>/dev/null || date -j -f '%b %e %T %Y %Z' "$exp" +%s 2>/dev/null || echo 0)
+    echo $(( (ee - $(date +%s)) / 86400 ))
+}
+# fm-up günlüğünün (ayrı log_format: '<ip> [<zaman>] "<yöntem> <uri>" <durum> …') son 300 satırında 403/429 sayısı.
+_monitor_up_abuse_count() {
+    tail -n 300 "$1" 2>/dev/null | awk '{ n = split($0, a, "\""); if (n >= 3) { split(a[3], b, " "); if (b[1] == "403" || b[1] == "429") c++ } } END { print c + 0 }'
+}
+_monitor_up_cert_days() {
+    local d; d=$(_monitor_up_cert_raw_days "$1")
+    if [[ -z "$d" ]]; then printf '%b' "${RED}yok${NC}"
+    elif [[ "$d" -lt 7 ]]; then printf '%b' "${RED}${d}d${NC}"
+    elif [[ "$d" -lt 30 ]]; then printf '%b' "${YELLOW}${d}d${NC}"
+    else printf '%b' "${GREEN}${d}d${NC}"; fi
 }
 
 # ═══════════════════════════════════════════════
@@ -308,6 +340,44 @@ _monitor_check() {
             alerts=$((alerts + 1))
         fi
     done
+
+    # ─── up.<alan> sertifika süresi (K13: WEB_ROOT dizini olmayan fm-up host'ları yukarıdaki döngüde yok) ───
+    local uphost updays
+    while IFS= read -r uphost; do
+        [[ -n "$uphost" ]] || continue
+        updays=$(_monitor_up_cert_raw_days "$uphost")
+        if [[ -z "$updays" ]]; then
+            send_notification "🔴 up Sertifikası Yok" "${uphost} — sertifika bulunamadı" "critical" 2>/dev/null || true
+            alerts=$((alerts + 1))
+        elif [[ "$updays" -lt 7 ]]; then
+            send_notification "⚠️ SSL Süresi Doluyor" "${uphost} — ${updays} gün kaldı!" "warning" 2>/dev/null || true
+            alerts=$((alerts + 1))
+        fi
+    done < <(_monitor_up_hosts)
+
+    # ─── up.<alan> 403/429 yoğunluğu (K13): fm-up erişim günlüğünün son 300 satırında ──
+    # Günlük root'a ait dizinde (kiracının logs/ dizini DEĞİL: root olarak kiracı yolundan okumak sembolik-bağ riskidir).
+    local upl upd upn
+    while IFS= read -r uphost; do
+        [[ -n "$uphost" ]] || continue
+        upd="${uphost#*.}"
+        upl=$(_edge_fmup_log_file "$(safe_name "$upd")" access)
+        [[ -L "$upl" ]] && continue
+        [[ -f "$upl" ]] || continue
+        upn=$(_monitor_up_abuse_count "$upl")
+        if [[ "${upn:-0}" -ge 100 ]]; then
+            send_notification "⚠️ up Yoğun 403/429" "${uphost}: son 300 istekte ${upn} adet 403/429 (kötüye kullanım/limit)" "warning" 2>/dev/null || true
+            alerts=$((alerts + 1))
+        fi
+    done < <(_monitor_up_hosts)
+
+    # ─── Cloudflare IP listesi yaşı (K1/K13): köken kilidi geo dosyası bu listeden üretilir; 7 günden eski liste ──
+    # Cloudflare yeni aralık yayınladıysa o aralıktan gelen meşru trafik 444 yer. Yalnız geo dosyası varsa (kilit kullanılabilir) anlamlı.
+    local cflist="${TRUSTED_STATE_DIR:-/etc/srvctl/trusted}/cloudflare.conf" geofile="${NGINX_CF_GEO_CONF:-/etc/nginx/conf.d/srvctl-cf-origin-geo.conf}"
+    if [[ -f "$geofile" && -f "$cflist" && -n "$(find "$cflist" -mtime +7 2>/dev/null)" ]]; then
+        send_notification "⚠️ Cloudflare IP Listesi Eski" "Liste 7 günden eski (köken kilidi eski aralıklarla çalışıyor): srvctl trusted sync" "warning" 2>/dev/null || true
+        alerts=$((alerts + 1))
+    fi
 
     # ─── Fail2Ban anomali ───
     if command -v fail2ban-client &>/dev/null; then

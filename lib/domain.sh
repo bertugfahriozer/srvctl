@@ -19,9 +19,16 @@ _domain_aa_profile_loaded() {
 # _load_and_run yalnız TEK modül source ettiği için, guard'sız bir çağrı
 # çalışma zamanında 'command not found' (exit 127) verirdi.
 _domain_load_conf_lib() {
-    declare -F _domconf_reload >/dev/null 2>&1 && return 0
-    # shellcheck disable=SC1091
-    source "${SRVCTL_ROOT}/lib/domconf.sh" || return 1
+    if ! declare -F _domconf_reload >/dev/null 2>&1; then
+        # shellcheck disable=SC1091
+        source "${SRVCTL_ROOT}/lib/domconf.sh" || return 1
+    fi
+    # edge.sh (origin-lock / fm-up / tls-default): domconf'a bağlı; yoksa/yüklenemezse yalnız ilgili komutlar çalışmaz.
+    if ! declare -F _edge_fmup_cmd >/dev/null 2>&1 && [[ -f "${SRVCTL_ROOT}/lib/edge.sh" ]]; then
+        # shellcheck disable=SC1091
+        source "${SRVCTL_ROOT}/lib/edge.sh" || return 1
+    fi
+    return 0
 }
 
 # FM destekli sürüme İLK self-update geçişi. Çalışan süreç FM ÖNCESİ selfupdate.sh'in BELLEKTEKİ gövdesini
@@ -72,6 +79,8 @@ cmd_domain() {
         fm-auth)   _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_fm_auth "${@:2}" ;;
         fm-root)   _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_fm_root_cmd "${@:2}" ;;
         nginx-audit) _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_nginx_audit "${@:2}" ;;
+        origin-lock) _domain_load_conf_lib || error "domconf/edge modülü yüklenemedi"; _edge_origin_lock_cmd "${@:2}" ;;
+        fm-up)     _domain_load_conf_lib || error "domconf/edge modülü yüklenemedi"; _edge_fmup_cmd "${@:2}" ;;
         open-basedir) _domain_load_conf_lib || error "domconf modülü yüklenemedi"; _domconf_open_basedir "${@:2}" ;;
         staging)   _domain_staging "${@:2}" ;;
         migrate)    _domain_migrate "${@:2}" ;;
@@ -173,6 +182,14 @@ cmd_domain() {
             echo "                                     provision REDDEDER ('kayıt dizini güvenilmez', çıkış 1; mod"
             echo "                                     sessizce onarılmaz, 'off' yine kapatır). Yetenek:"
             echo "                                     fm-auth --capabilities -> f9e-on-rc4=1 f9e-state-untrusted=1"
+            echo "    origin-lock <domain> <on|off|status> [--dry]"
+            echo "                                     KÖKEN KİLİDİ: Cloudflare/yerel/kendi IP dışından doğrudan gelen bağlantı 444"
+            echo "                                     (edge.d/<safe>/05-srvctl-origin-lock.conf; kiracı custom.d'den ÖNCE; yalnız 443; önce: srvctl trusted sync)"
+            echo "                                     origin-lock --capabilities -> srvctl-origin-lock-caps v1 ..."
+            echo "    fm-up <domain> <on|off|status> [--host=up.<domain>] [--origin=https://<domain>] [--adopt-cert] [--dry] [--purge-cert]"
+            echo "                                     Cloudflare'siz YÜKLEME ADRESİ (DNS-only up.<domain>): ayrı nginx sunucu bloğu,"
+            echo "                                     Let's Encrypt (webroot), CORS tam köken; 20/90 kapıları TEK KAYNAK."
+            echo "                                     on: önce dig A = sunucunun IPv4'ü ve CF dışı (aksi DUR). fm-up --capabilities"
             echo "    fm-root <domain>|--all [--apply]"
             echo "                                     YALNIZ /_fm 403 kökü + FM dosyaları (repair'in FPM/AppArmor/"
             echo "                                     DB/Redis yan etkileri YOK). Varsayılan KURU: yapılacak işi"
@@ -1976,6 +1993,8 @@ _domain_purge_conf_files() {
     # '|| true': remove/geri alma zinciri 'set -e' altında burada kesilmesin.
     if _domain_load_conf_lib; then
         _domconf_fm_auth_forget "$sname" || true
+        # fm-up: conf.d/srvctl-fmup-<safe>.conf + köken kaydı + up sertifikası ('domain remove' temizler).
+        if declare -F _edge_purge_domain >/dev/null 2>&1; then _edge_purge_domain "$domain" || true; fi
     fi
 }
 

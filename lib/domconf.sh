@@ -107,6 +107,15 @@ _domconf_load_domain_lib() {
     source "${SRVCTL_ROOT}/lib/domain.sh" || return 1
 }
 
+# edge.sh (köken kilidi / fm-up) talep üzerine yüklenir: nginx-audit ve kullanıcı-dosyası taramaları srvctl üretimi
+# 05-srvctl-origin-lock.conf'u tanımak için buna ihtiyaç duyar. edge.sh yoksa/yüklenemezse rc 1 (tarama eskisi gibi sürer).
+_domconf_load_edge_lib() {
+    declare -F _edge_is_generated >/dev/null 2>&1 && return 0
+    [[ -f "${SRVCTL_ROOT}/lib/edge.sh" ]] || return 1
+    # shellcheck disable=SC1091
+    source "${SRVCTL_ROOT}/lib/edge.sh" 2>/dev/null || return 1
+}
+
 # Bildirim gönderir (kanal yapılandırılmamışsa sessizce geçer).
 #
 # İKİ TUZAK BURADA KAPATILIYOR:
@@ -2478,7 +2487,7 @@ _domconf_fm_probe_sweep() {
 
 # rc 0: _DOMCONF_MODSEC = 0|1 | rc 2: tespit yapılamadı (_DOMCONF_MODSEC_PROBE_OUT). Kilit altında çağrılır.
 _domconf_fm_modsec_probe() {
-    local v main pd tok line lm="" lmu="" out="" prc=0 nouwsgi=0 noscgi=0
+    local v main pd pbase tok line lm="" lmu="" out="" prc=0 nouwsgi=0 noscgi=0
     local -a toks=()
     _DOMCONF_MODSEC=""; _DOMCONF_MODSEC_PROBE_OUT=""
     v=$(nginx -V 2>&1) || true
@@ -2500,8 +2509,12 @@ _domconf_fm_modsec_probe() {
         warn "nginx ana yapılandırmasının load_module satırları doğrulanamadı (${_DOMCONF_LM_WHY}) — ModSecurity sondası load_module'süz koşuyor (yanılma yönü güvenli: modül 'yok' sayılırsa FM konumunda WAF açık kalır)"
         lm=""; lmu=""
     fi
-    _domconf_fm_probe_sweep
-    pd=$(mktemp -d "$(_fmprov_dir)/.probe.XXXXXX") || { _DOMCONF_MODSEC_PROBE_OUT="sonda dizini oluşturulamadı"; return 2; }
+    [[ "${_DOMCONF_PROBE_DRY:-0}" == "1" ]] || _domconf_fm_probe_sweep
+    # --dry (_DOMCONF_PROBE_DRY=1): kayıt dizinine HİÇ dokunulmaz (kilit de yok → eşzamanlı yazıcının süpürmesiyle yarışmasın);
+    # sonda 0700 mktemp dizininde koşar ve silinir.
+    pbase="$(_fmprov_dir)"
+    if [[ "${_DOMCONF_PROBE_DRY:-0}" == "1" ]]; then pbase="${TMPDIR:-/tmp}"; pbase="${pbase%/}"; fi
+    pd=$(mktemp -d "${pbase}/.probe.XXXXXX") || { _DOMCONF_MODSEC_PROBE_OUT="sonda dizini oluşturulamadı"; return 2; }
     _DOMCONF_PROBE_DIR="$pd"
     trap '_domconf_fm_probe_abort 130' INT
     trap '_domconf_fm_probe_abort 143' TERM
@@ -2595,6 +2608,10 @@ _domconf_scan_user_files() {
             *" ${base} "*) continue ;;
         esac
         if _fmprov_is_generated "$sname" "$f"; then
+            continue
+        fi
+        # edge.sh: srvctl üretimi köken kilidi (05-srvctl-origin-lock.conf; kayıtla eşleşen) kullanıcı dosyası SAYILMAZ.
+        if _domconf_load_edge_lib && _edge_is_generated "$sname" "$f"; then
             continue
         fi
         this=0
@@ -2787,7 +2804,7 @@ _domconf_nginx_audit() {
         domains=("$target")
     fi
 
-    local worst=0 sname dir rc line f untrusted dir_untrusted root_ok legacy note orph
+    local worst=0 sname dir rc line f untrusted dir_untrusted root_ok legacy note orph edge_bad=0
     _Q_DOM=(); _Q_SRC=(); _Q_DST=()
     legacy=$(_fmprov_bk_legacy_list)
     if [[ -n "$legacy" ]]; then
@@ -2845,11 +2862,22 @@ _domconf_nginx_audit() {
             root_ok=0
             echo "  ${_FMRA_LINE}"
         fi
+        # edge.sh: köken kilidi / fm-up kayıtları (kayıtlı ama yok/kurcalanmış → bulgu; tanınan dosya BİLGİ).
+        if _domconf_load_edge_lib; then
+            local edge_out edge_rc=0
+            edge_bad=0
+            edge_out=$(_edge_audit_domain "$d" "$sname" "$dir") || edge_rc=$?
+            if [[ -n "$edge_out" ]]; then
+                while IFS= read -r line; do if [[ -n "$line" ]]; then echo "  ${line}"; fi; done <<< "$edge_out"
+            fi
+            if (( edge_rc != 0 )); then edge_bad=1; fi
+        fi
         case "$rc" in
             0) if (( root_ok )) && [[ -z "$orph" ]]; then echo "  temiz"; elif (( root_ok )); then echo "  kullanıcı dosyaları temiz — YETİM kenara alma artığı var"; else echo "  kullanıcı dosyaları temiz — 403 KÖKÜ SAĞLAM DEĞİL"; fi ;;
             1) echo "  İHLAL VAR" ;;
             *) echo "  DOĞRULANAMADI" ;;
         esac
+        if (( edge_bad && rc == 0 )); then echo "  kenar kayıtları (köken kilidi / fm-up) SAĞLAM DEĞİL — yukarıdaki satırlara bakın"; rc=1; fi
         if (( root_ok == 0 && rc == 0 )); then rc=1; fi
         if [[ -n "$orph" && rc -eq 0 ]]; then rc=1; fi
         if (( rc == 2 )); then worst=2; elif (( rc == 1 && worst == 0 )); then worst=1; fi
@@ -2974,6 +3002,9 @@ _domconf_dump_check_run() {
             return 2
         fi
         if _fmprov_is_generated "$sname" "$path"; then
+            continue
+        fi
+        if _domconf_load_edge_lib && _edge_is_generated "$sname" "$path"; then
             continue
         fi
         frc=0

@@ -57,6 +57,7 @@ case "${1:-help}" in
     self-update) _load_and_run selfupdate cmd_selfupdate "${@:2}" ;;
     ip)         _load_and_run ip cmd_ip "${@:2}" ;;
     trusted)    _load_and_run trusted cmd_trusted "${@:2}" ;;
+    tls-default) _load_and_run edge cmd_tls_default "${@:2}" ;;
     user)       _load_and_run user cmd_user "${@:2}" ;;
     plugin)     _load_and_run plugin cmd_plugin "${@:2}" ;;
     webhook)    _load_and_run webhook cmd_webhook "${@:2}" ;;
@@ -126,6 +127,10 @@ case "${1:-help}" in
         echo -e "    ${CYAN}security audit${NC}                    Güvenlik denetimi (skor/100)"
         echo -e "    ${CYAN}ssl renew${NC}                         SSL yenileme"
         echo -e "    ${CYAN}ssl status${NC}                        SSL durumları"
+        echo -e "    ${CYAN}tls-default${NC} <on|off|status> [--dry]  443 varsayılan sunucu: bilinmeyen SNI/çıplak IP el sıkışması reddedilir"
+        echo -e "    ${CYAN}trusted sync${NC}                      Cloudflare/UptimeRobot IP'leri + köken kilidi geo dosyası"
+        echo -e "    ${CYAN}domain origin-lock${NC} <alan> <on|off|status>  Köken kilidi (CF dışı doğrudan bağlantı 444)"
+        echo -e "    ${CYAN}domain fm-up${NC} <alan> <on|off|status>  Cloudflare'siz yükleme adresi (up.<alan>)"
         echo -e "    ${CYAN}ip ban${NC} <ip>                       IP engelle"
         echo -e "    ${CYAN}ip whitelist${NC} add <ip>             Beyaz listeye ekle"
         echo -e "    ${CYAN}ip geoblock${NC} add <ülke>            Ülke engelle"

@@ -1088,11 +1088,76 @@ cron kurar (`30 2 * * *`, default açık). Fetch başarısızsa son-iyi liste ko
 | Komut | Açıklama |
 |-------|----------|
 | `srvctl trusted sync` | IP'leri şimdi çek + uygula |
-| `srvctl trusted list` | Yönetilen IP'leri ve son senkronu göster |
+| `srvctl trusted list` | Yönetilen IP'leri, köken-kilidi geo dosyasını ve son senkronu göster |
 
 Yapılandırma (conf/srvctl.conf, varsayılanlar load_config'te):
 `TRUSTED_SYNC_ENABLED`, `TRUSTED_SOURCES`, `CLOUDFLARE_IPS_V4_URL`,
 `CLOUDFLARE_IPS_V6_URL`, `UPTIMEROBOT_IPS_URL`.
+
+#### Köken kilidi geo dosyası (`srvctl trusted sync` → `srvctl-cf-origin-geo.conf`)
+
+Aynı eşitleme adımı, AYNI Cloudflare listesinden `conf.d/srvctl-cf-origin-geo.conf` üretir:
+`geo $realip_remote_addr $srvctl_via_cf { default 0; <CF v4/v6> 1; 127.0.0.1 1; ::1 1; <sunucunun kendi IP'leri> 1; }`.
+Anahtar `$realip_remote_addr`'dır (ORİJİNAL TCP eşi): `allow/deny` kullanılamaz çünkü realip `$remote_addr`'ı istemci IP'siyle değiştirir.
+**Liste yok/boş/8 satırdan kısa/okunamazsa dosya YAZILMAZ** — boş liste + `default 0` TÜM Cloudflare trafiğini 444'e çevirirdi; yazılmayan dosya
+mevcut kilitleri eski listeyle çalışır halde bırakır ve yeni kilit açılmasını engeller (`origin-lock on` dosya yoksa reddeder). **Eşik aile başına:** IPv4 >= `TRUSTED_GEO_MIN_V4`
+(10) VE IPv6 >= `TRUSTED_GEO_MIN_V6` (5) (Cloudflare ~15/~7); toplam satır sayısı tek başına yetmez (IPv4=0 iken yazılsaydı, köken IPv6 dinlemediği için tüm CF trafiği 444 olurdu). Yazım fm-auth
+kilidi (`_fmprov_with_lock`) altındadır. `nginx -t` düşerse önceki hâl geri yüklenir; önceki hâl YOKSA (ilk yazım) geo silinir VE `$srvctl_via_cf`'ye başvuran açık köken kilitleri de geri alınır
+(tanımsız değişkene başvuran kilit dosyası kalmaz). Kendi IP'ler `ip -o addr show scope global`'dan; NAT/test için `SRVCTL_SELF_IPS="ip ip …"`.
+
+### Köken kilidi — `srvctl domain origin-lock <alan> on|off|status [--dry]`
+
+`edge.d/<safe>/05-srvctl-origin-lock.conf` (`/etc/nginx/edge.d`, root:755; `SRVCTL_NGINX_EDGE_DIR`) → `if ($srvctl_via_cf = 0) { return 444; }`. Cloudflare dışından, köken IP'sine doğrudan gelen
+istek (kendi/yerel IP ve CF aralıkları hariç) kesilir. **Kilit kiracı dosyalarından ÖNCE değerlendirilir:** `vhost-ssl.conf.tpl` 443 bloğunda `include /etc/nginx/edge.d/<safe>/*.conf;` satırı
+`include /etc/nginx/custom.d/<safe>/*.conf;` satırının ÜSTÜNDE durur (nginx sunucu-düzeyi `rewrite/if/return`'ü yazılış sırasıyla çalıştırır; custom.d'deki bir `rewrite … last` aksi hâlde kilidi delerdi — lab: `/blog/x` 200).
+**Yalnız 443 bloğuna girer**: `on`, vhost'un HER 443 bloğunda edge.d include'unun custom.d include'undan ÖNCE olduğunu ve 443 dışı bir blokta edge/custom include'u bulunmadığını ölçer (SSL'siz vhost, eski şablonla
+üretilmiş vhost [edge.d include'u yok], sıra bozuk, vhost yok ⇒ reddeder ve çareyi söyler). **Mevcut (eski şablonlu) vhost'a yayılma:** `srvctl domain rate-limit <alan> <mevcut-profil>` vhost'u şablondan yeniden üretir
+(elle düzenleme kaybolur; nginx -t + reload) ya da 443 bloğuna o tek satır elle eklenir (RUNBOOK-up.md); yalnız kilit AÇILACAK alanlar için gerekir. Yeni vhost'lar şablondan zaten edge.d include'lu gelir (boş glob = etkisiz). Önce `srvctl trusted sync` ile geo dosyası bulunmalı. Dosya srvctl üretimidir:
+köken kaydı `${SRVCTL_STATE_DIR}/_edge/<safe>.edge` (sha256 + yol); `nginx-audit` kayıtla eşleşen dosyayı tanır ("köken kilidi (tanındı)"); custom.d'deki ESKİ konumlu 05 dosyası
+`KENAR-KİLİT-ESKİ-YER`, vhost sırası bozuksa `KENAR-VHOST-SIRASI` bulgusu verir. Kayıtsız/değiştirilmiş dosyanın üzerine `on` yazmaz, `off` silmez (`--dry` de AYNI reddi verir ve kayıt/edge dizini YARATMAZ).
+Her yazım fm-auth kilidi altında; `nginx -t` düşerse geri alınır. `domain remove` edge.d kilidini de kaldırır.
+**Cloudflare'siz (DNS-only) up alt alanı bu kilitten MUAFTIR** (up bloğu 05 dosyasını içermez). `dev.designwestgate.art` gibi silinecek alanlara UYGULANMAZ.
+
+### `srvctl tls-default on|off|status [--dry]`
+
+`conf.d/00-srvctl-tls-default.conf` → `server { listen 443 ssl default_server; server_name _; ssl_reject_handshake on; client_header_timeout 10s; return 444; }`. Bilinmeyen SNI / çıplak IP
+el sıkışması reddedilir (sertifika da içerik de verilmez). `client_header_timeout 10s` bağlantının İLK isteğindeki başlık zaman aşımını belirleyen tek yerdir (SNI seçimi zamanlayıcıyı sıfırlamaz; bunsuz 60 sn, lab ölçümü). nginx >= 1.19.4 şartı denetlenir (sürüm okunamazsa AÇILMAZ). **SNI göndermeyen yerel sondalar kırılır** —
+bu yüzden `lib/deploy.sh` sağlık sondası `curl --resolve <alan>:443:127.0.0.1 https://<alan>/` biçimindedir (http düşüşü de `--resolve <alan>:80:127.0.0.1`); fm sondası
+zaten `--resolve` kullanır; `monitor`/`ssl status` hostname ile gider. Başka bir betiğiniz `https://127.0.0.1/ -H "Host:"` kullanıyorsa AÇMADAN önce çevirin.
+IPv6 dinleyicisi eklenmez (canlıda IPv6 yok; vhost'lar da IPv4 dinler).
+
+### `srvctl domain fm-up <alan> on|off|status [--host=up.<alan>] [--origin=https://<alan>] [--adopt-cert] [--dry] [--purge-cert]` — Cloudflare'siz yükleme adresi
+
+Tarayıcı yükleme parçaları (`PUT /_fm/up/<id>/<ofs>`) Cloudflare yerine DNS-only `up.<alan>` adresine gider (ayrı nginx sunucu bloğu, tasarım A).
+`conf.d/srvctl-fmup-<safe>.conf` (`templates/nginx/fm-up-server.conf.tpl`, root:644, köken kaydı `_edge/<safe>.edge`).
+
+* **`on` kapısı (K18):** önce `dig A <host>` — HEPSİ sunucunun kendi IPv4'ü olmalı ve Cloudflare aralığında OLMAMALI; CNAME/çöp, AAAA, kayıt yok ⇒ **DUR**
+  (turuncu bulut unutulmuş). NAT ise `SRVCTL_PUBLIC_IPV4`. `dig` yoksa DUR.
+* **İki faz:** (1) yalnız port 80 (`/.well-known/acme-challenge/` `root /var/lib/srvctl/acme` + kalanı 301; sunucu düzeyinde `return` YOK) → `nginx -t` → reload →
+  `certbot certonly --webroot -w /var/lib/srvctl/acme -d <host>`; (2) TAM dosya (80 + 443) → `nginx -t` → reload. Sertifika zaten varsa faz 1 atlanır. Hata/sinyalde BAŞLANGIÇ hâli
+  geri yüklenir (yarım faz değil). Mevcut `certbot renew` cron'u up sertifikasını da yeniler (webroot, port 80 bloğu).
+* **443 bloğu:** tam `server_name`; alanın `custom.d/<safe>/20-srvctl-fm-upload.con[f]` ve `90-srvctl-fm-auth.con[f]` dosyalarını glob ile İÇERİR (kapılar TEK KAYNAK:
+  `fm-auth off` / acil kapanış up'ı kendiliğinden kapatır; 21 ve 00-custom.conf girmez); kalan her yol 404. **K5** bilet biçimi (`^[0-9a-f]{64}$`) YALNIZ up bloğunda, sunucu-rewrite'ta
+  map ile (20'ye konmadı: ana alan sondası biletsiz 411 + imza bekler). OPTIONS ön uçuşu map ile karar verilir (tam Origin + `Access-Control-Request-Method: PUT` + biçimli yol → 204; diğer
+  OPTIONS → 403; yüzey dışı yol → 404; biçimsiz bilet → 403) ve HEPSİ `/__fmup_gate` iç yönlendirmesi + `try_files` ile `@fmup_gate`'te karara bağlanır: sunucu-rewrite aşamasındaki `return` limit_req/limit_conn'dan ÖNCE
+  biter ve sayılmaz (lab: 10 ön uçuşta 0×429), `try_files` ise PREACCESS'ten sonradır — ön uçuş ve ucuz 403/404 yanıtları da limitlere SAYILIR (sınır aşılınca 429). CORS başlıkları `always`: ACAO yalnız tam kökene, Methods `PUT`, Headers `X-Fm-Ticket, Content-Type`,
+  Max-Age 600, `Vary: Origin`, **ACAC YOK**; 403/411/413/429/502 yanıtlarında da ACAO vardır. K6 `client_max_body_size 1k` (20/90 kendi 33m'lerini koyar), K7 `client_header_timeout 10s`,
+  `client_body_timeout 30s` (20'nin `@fm_up` location'ı da 30s: ana alan + up için TEK değer; canlı 256 MiB e2e'de meşru 408 görülürse 60s'e çıkarılır), `send_timeout 30s`, `keepalive_timeout 15s`, `lingering_time 10s`, `large_client_header_buffers 4 4k`; K8 alana özgü `fmup_ip_<safe>`/`fmup_all_<safe>`/`fmup_cip_<safe>`/`fmup_call_<safe>`
+  bölgeleri (`FMUP_RATE_IP=5 FMUP_BURST_IP=20 FMUP_CONN_IP=12 FMUP_RATE_ALL=60 FMUP_BURST_ALL=120 FMUP_CONN_ALL=100`; conf/srvctl.conf), 429; HSTS `max-age=63072000; includeSubDomains`, nosniff, no-store;
+  `modsecurity off` (modül yoksa yorum); ayrı `log_format fmup_<safe>` (başlık/bilet/`$fm_auth` YOK) → **root'a ait** `/var/log/nginx/srvctl-fmup-<safe>.{access,error,http}.log` (`SRVCTL_FMUP_LOG_DIR`; error=warn).
+  Günlükler kiracıya ait `<site>/logs/` dizinine YAZILMAZ (kök nginx'in sembolik bağ izleyip kiracı yoluna yazması: CVE-2016-1247 sınıfı); dizin root'a ait değilse/sembolik bağsa `on` REDDEDER. Dağıtım logrotate'i (`/var/log/nginx/*.log`) bunları kapsar
+  (`on` kapsam yoksa UYARIR). fail2ban jail'i gerekirse YALNIZ bu root dosyalarına bağlanır (kiracı dizinindeki günlüğe ASLA: kiracı sahte satırla istediği IP'yi banlatabilir).
+* **Sahiplik:** `--host` yalnız `<tek-etiket>.<alan>` olabilir; başka bir srvctl alanı, `sites-available/<host>.conf` var olan host ya da başka alanın köken kaydındaki host REDDEDİLİR. `live/<host>` sertifikası zaten varsa ve srvctl
+  kaydında (`fm-up-cert`) YOKSA `on` reddeder; bilerek sahiplenmek için `--adopt-cert` (kayıt `issued=0`). `certbot delete` YALNIZ srvctl'in kendi aldığı (`issued=1`) sertifikaya uygulanır (`off --purge-cert`, `domain remove`).
+* **`off`:** up bloğunu ve `fm-up` kaydını kaldırır; sertifika KALIR ve sahiplik kaydı (`fm-up-cert`) KORUNUR → `off --purge-cert` sonradan da sertifikayı manifestten bulur (kayıt yoksa rc 1 + açık ileti, hiçbir şey yapılmaz).
+  `domain remove` up dosyasını (yalnız kayıtla eşleşiyorsa), edge.d kilidini, kayıtları ve (issued=1 ise, nginx -t temizse) sertifikayı fm-auth kilidi altında temizler. `--dry` GERÇEK komutla aynı doğrulama yolunu izler.
+* **`status`:** AÇIK/KAPALI/BOZUK (kayıtla eşleşme), host/köken, fm-auth durumu, sertifika bitişi, DNS kapısı sonucu. `nginx-audit`: kayıtlı ama kurcalanmış/silinmiş up dosyası `FM-UP-SAĞLAM-DEĞİL` (rc 1).
+  `ssl status` ve `monitor uptime|check` up sertifikasını kapsar (WEB_ROOT dizini olmayan host'lar; K13).
+* `--capabilities`: `srvctl domain fm-up --capabilities`, `srvctl domain origin-lock --capabilities`, `srvctl tls-default --capabilities` makinece okunur tek satır basar.
+
+**Canlıda sıra:** ayrıntılı, kuru→onay→uygulama→doğrulama→geri alma sırası `RUNBOOK-up.md`'dedir (vhost'a edge.d include'u, `fm-root --apply`, dig önkoşulu, dış doğrulama). Özet (DNS'ten ÖNCE köken kilidi): `srvctl trusted sync` → vhost'a edge.d include'u → `srvctl domain origin-lock designwestgate.art on` (önce `--dry`) → `srvctl tls-default on` (önce `--dry`; deploy.sh güncel olmalı) →
+`srvctl domain nginx-audit --all` → (kullanıcı Cloudflare panelinden `A up → köken IPv4`, DNS-only) → `srvctl domain fm-up designwestgate.art on --dry` → `… on` → `… status`.
+Geri alma: `fm-up <alan> off [--purge-cert]`, `origin-lock <alan> off`, `tls-default off`; geo dosyası zararsızdır (yalnız kilit dosyası kullanır).
 
 ### Kullanıcı Yönetimi (RBAC + 2FA)
 ```bash

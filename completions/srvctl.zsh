@@ -19,7 +19,8 @@ _srvctl() {
         'notify:Bildirim yapılandırması'
         'cloudflare:Cloudflare API'
         'ip:IP engelleme/izin listesi'
-        'trusted:Güvenilir edge IP senkronizasyonu'
+        'trusted:Güvenilir edge IP senkronizasyonu (+ köken kilidi geo dosyası)'
+        'tls-default:443 varsayılan sunucu: bilinmeyen SNI/çıplak IP el sıkışması reddedilir'
         'user:Kullanıcı yönetimi (RBAC)'
         'plugin:Plugin sistemi'
         'webhook:Auto-deploy webhook'
@@ -56,6 +57,8 @@ _srvctl() {
                         'nginx-audit:custom.d izin listesi denetimi (salt-okur; --all, --quarantine)'
                         'open-basedir:open_basedir aç/kapat (kapalı = sınır chroot)'
                         'fm-auth:FileManager nginx dosyaları + köken kaydı (opt-in)'
+                        'origin-lock:KÖKEN KİLİDİ: Cloudflare/yerel/kendi IP dışı doğrudan bağlantı 444 (on|off|status)'
+                        'fm-up:Cloudflare olmadan YÜKLEME ADRESİ up.<alan> (on|off|status)'
                         'fm-root:YALNIZ /_fm 403 kökü (kuru varsayılan; --apply: yazım gerekirse tek nginx -t + tek reload)'
                         'staging:Staging ortamı oluştur'
                         'migrate:Sunucular arası taşı'
@@ -96,6 +99,28 @@ _srvctl() {
                             '--emergency:ACİL kapat (yalnız off): kayıt/kilit/nginx -t geri almasından bağımsız, FM HÂLÂ AÇIK ise rc 3'
                         )
                         _describe 'domain fm-auth seçeneği' fm_flags
+                    elif [[ "${words[2]:-}" == "fm-up" && ${#words} -ge 4 ]]; then
+                        local -a fmup_flags
+                        fmup_flags=(
+                            'on:Önce dig A = sunucunun IPv4/CF dışı (aksi DUR); iki faz: port 80 → certbot → 443'
+                            'off:up sunucu bloğunu kaldır (sertifika kalır; --purge-cert siler)'
+                            'status:Durum + sertifika + DNS'
+                            '--host=:up.<alan> (tek etiketli alt alan; varsayılan up.<alan>)'
+                            '--origin=:https://<alan> (CORS tam köken; varsayılan)'
+                            '--adopt-cert:Var olan (srvctl kaydı olmayan) sertifikayı bilerek sahiplen (silinmez)'
+                            '--dry:Doğrula, HİÇBİR şey yazma'
+                            '--purge-cert:off ile up sertifikasını da sil (yalnız srvctl tarafından alınmışı)'
+                        )
+                        _describe 'domain fm-up seçeneği' fmup_flags
+                    elif [[ "${words[2]:-}" == "origin-lock" && ${#words} -ge 4 ]]; then
+                        local -a ol_flags
+                        ol_flags=(
+                            'on:Kilidi aç (önce: srvctl trusted sync; yalnız 443 bloğu)'
+                            'off:Kilidi kaldır'
+                            'status:Durum'
+                            '--dry:Doğrula, HİÇBİR dosya yazma'
+                        )
+                        _describe 'domain origin-lock seçeneği' ol_flags
                     elif [[ "${words[2]:-}" == "open-basedir" && ${#words} -ge 4 ]]; then
                         local -a ob_flags
                         ob_flags=(
@@ -245,6 +270,11 @@ _srvctl() {
                     local -a trusted_cmds
                     trusted_cmds=('sync:Senkronize et' 'list:Güvenilir IPleri listele')
                     _describe 'trusted işlemi' trusted_cmds
+                    ;;
+                tls-default)
+                    local -a tls_cmds
+                    tls_cmds=('on:Aç (nginx >= 1.19.4)' 'off:Kapat' 'status:Durum' '--dry:Doğrula, yazma')
+                    _describe 'tls-default işlemi' tls_cmds
                     ;;
                 user)
                     local -a user_cmds
