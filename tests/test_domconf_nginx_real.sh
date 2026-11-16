@@ -31,6 +31,7 @@ for c in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem; do [[ -f "$c" ]] 
 if [[ -z "$CA" ]]; then echo "── CA paketi yok — ATLANDI ──"; test_summary; exit 0; fi
 
 T="$(mktemp -d)"; mkdir -p "$T/logs" "$T/c" "$T/tmp"
+_domconf_fm_sess_conf_ensure || echo "  (E66: oturum kotası bölge dosyası yazılamadı)"   # bu lab 20'yi kendisi render eder (stage değil): bölgeyi srvctl'in yazıcısıyla kur
 P1=0; P2=0
 lab_down() { if [[ -f "$T/n.pid" ]]; then hs_kill_pidfile TERM "$T/n.pid" 'nginx'; sleep 0.3; rm -f "$T/n.pid"; fi; }   # F9b/b: ham kill yok; pid dosyası bayat/yeniden kullanılmışsa REDDEDİLİR (harness_safe.sh)
 trap 'lab_down; rm -rf "$T"; _fm_env_cleanup' EXIT   # rev-L9: fm_env temizliği zincirde
@@ -44,7 +45,7 @@ lab_up() {
     for f in "$@"; do inc+="   include $f;"$'\n'; done
     if [[ "$LAB_CI4_404" == 1 ]]; then ci4_404='   location = /__fm_auth { return 404 "CI4-404"; }'$'\n'; fi
     while (( tries < 8 )); do
-        P1=$((19450 + 2 * (RANDOM % 25))); P2=$((P1 + 1))   # yalnız 127.0.0.1:19450-19499
+        P1=$((${SRVCTL_REAL_PORT_BASE:-19450} + 2 * (RANDOM % ${SRVCTL_REAL_PORT_SPAN:-25}))); P2=$((P1 + 1))   # yalnız 127.0.0.1:19450-19499
         if ! lab_port_free "$P1" || ! lab_port_free "$P2"; then tries=$((tries + 1)); continue; fi
         [[ -f "$T/c/90.tpl" ]] && sed "s/@P2@/${P2}/" "$T/c/90.tpl" > "$T/c/90.conf"
         cat > "$T/nginx.conf" <<EOT
@@ -56,6 +57,7 @@ http {
  access_log $T/logs/a.log l;
  resolver 127.0.0.1:9; resolver_timeout 1s;
  client_body_temp_path $T/tmp/b; proxy_temp_path $T/tmp/p; fastcgi_temp_path $T/tmp/f; uwsgi_temp_path $T/tmp/u; scgi_temp_path $T/tmp/s;
+ include ${SRVCTL_NGINX_CONF_D:-/nonexistent-srvctl-conf-d}/*.conf;   # E66: srvctl-fmsess.conf (20 buna başvurur)
  server { listen 127.0.0.1:$P2;
    access_log $T/logs/backend.log l;
    location = /auth     { add_header X-Fm-Auth "Bearer tok123"; return 204; }

@@ -43,8 +43,22 @@
 # location'a (@fm_up) iç yönlendirir; orada rewrite aşaması yeniden çalışır ve
 # $fm_auth doludur.
 
+# E66 — OTURUM KAPISI: aynı oturuma (uploadid + bilet) AYNI ANDA tek PUT. SUNUCU düzeyindeki limit_conn (bu dosya sunucu bağlamında include edilir) vhost'un
+# 'limit_conn conn_per_ip N' satırına EKLENİR (iki satır birlikte değerlendirilir); conn_per_ip bu yolda da geçerliliğini korur. Bölge
+# ve anahtar haritası http düzeyindedir: conf.d/srvctl-fmsess.conf (templates/nginx/fm-sess.conf.tpl; 'fm-auth on' / 'fm-root --apply'
+# bu dosyadan ÖNCE yazar). Anahtar yalnız biçimi geçen PUT /_fm/up/<id>/<ofs> + biçimce geçerli (64 küçük hex) X-Fm-Ticket için dolu ('<id>:<bilet[0..32)>'); başka isteklerde (bilet yok/geçersiz dahil) boştur ve SAYILMAZ ⇒ yetkisiz istek meşru oturumun yuvasını tutamaz. Sunucu adı anahtarda yok: up.<alan> sunucusu aynı kotayı paylaşır.
+#   * limit_conn nginx'te istek başına YALNIZ BİR KEZ, ilk eşleşen location'ın PREACCESS aşamasında değerlendirilir (r->main->limit_conn_status);
+#     bu yüzden sınır @fm_up'a (try_files iç yönlendirmesi) DEĞİL, sunucu düzeyine konur — orada geç kalırdı ve hiç koşmazdı.
+#   * 503 (429 DEĞİL): yükleme istemcisi (upload-core.js putError) PUT'ta 5xx'i yeniden dener (backoff + /resume), 429'u ise
+#     ölümcül put_failed sayar. Kopuk bağlantının eski isteği sunucuda ≤30 sn (client_body_timeout) yuvayı tutabilir; yeniden deneme
+#     bu sürede 503 alır ve beklerse sürer. Aynı durum bu location'daki conn_per_ip reddine de uygulanır (429 yerine 503).
+limit_conn srvctl_fmsess 1;
+
 location ^~ /_fm/up/ {
     {{MODSEC_LINE}}
+
+    limit_conn_status 503;
+    limit_conn_log_level warn;
 
     # Biçim kapısı: tam olarak rakam/rakam. Başka her şey 403.
     if ($request_uri !~ "^/_fm/up/[0-9]{1,20}/[0-9]{1,20}$") { return 403; }
@@ -114,8 +128,10 @@ location @fm_up {
     # http2_body_preread_size) boyutunda açar ve istemciye verilen akış alma penceresi BU tamponun boşluğudur; WINDOW_UPDATE
     # ancak üst akışa (pCloud) yazıldıkça gelir. Varsayılanlar 16k/64k ⇒ pencere 64 KiB ⇒ tavan = 64 KiB / RTT: 240 ms RTT'de
     # ≈0.26 MiB/sn (8 MiB ≈ 30 sn; HTTP/1.1'de bu sınır yok, TCP penceresi ölçeklenir). 4m ⇒ 240 ms'de ≈16 MiB/sn tavan.
-    # Bellek: yalnız auth geçidinden geçmiş istek başına ≤4 MiB (tampon, Content-Length'e göre küçülür; 8 MiB'lık parçada 4 MiB);
-    # CONN_ALL varsayılanı 100 ⇒ en kötü ≈400 MiB. Tamponsuz olduğu için geçici DOSYA YAZILMAZ (proxy_max_temp_file_size 0).
+    # Bellek: yalnız auth geçidinden geçmiş istek başına ≤4 MiB (tampon, Content-Length'e göre küçülür; 8 MiB'lık parçada 4 MiB).
+    # E66: bir yükleme OTURUMUNDA aynı anda tek PUT (sunucu düzeyi 'limit_conn srvctl_fmsess 1') ⇒ oturum başına ≤4 MiB; kullanıcı başına
+    # açık oturum tavanı uygulamada 3 ⇒ kullanıcı başına ≤12 MiB (eskiden IP başına conn_per_ip x 4 MiB = 80-800 MiB). Tamponsuz olduğu için
+    # geçici DOSYA YAZILMAZ (proxy_max_temp_file_size 0).
     # 'http2_body_preread_size' http/server bağlamındadır, location'a konamaz ve tüm vhost'ları etkiler; bu yüzden burada kullanılmaz.
     client_body_buffer_size 4m;
 

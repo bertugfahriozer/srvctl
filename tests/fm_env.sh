@@ -25,6 +25,10 @@ export SRVCTL_STATE_DIR="${WEB_ROOT}/.state"
 # F7-H3: acil kapatma işaretinin İKİNCİ güvenilir konumu (kayıt dizininden bağımsız); dizin ilk ihtiyaçta oluşturulur.
 export SRVCTL_FM_EMERGENCY_DIR="${WEB_ROOT}/.fm-emergency"
 export SRVCTL_PHP_INI_DIR="${WEB_ROOT}/.php.d"
+# E66: açma yönündeki her yazıcı (stage) 20'den ÖNCE http düzeyi bölge dosyasını (srvctl-fmsess.conf) conf.d'ye yazar; test dizini WEB_ROOT altında.
+# Testi kendi SRVCTL_NGINX_CONF_D'siyle çalışan dosyalar (edge_up_real vb.) bunu ezer.
+export SRVCTL_NGINX_CONF_D="${SRVCTL_NGINX_CONF_D:-${WEB_ROOT}/.conf.d}"
+mkdir -p "$SRVCTL_NGINX_CONF_D"
 mkdir -p "$SRVCTL_NGINX_CUSTOM_DIR" "$SITES_AVAILABLE" "$SRVCTL_STATE_DIR" "$SRVCTL_PHP_INI_DIR"
 FM_STUBS="$(mktemp -d)"
 FLOCK_LOG="${FM_STUBS}/flock.log"; : > "$FLOCK_LOG"

@@ -50,6 +50,8 @@ export SRVCTL_RESOURCE_PROFILES="${REPO_ROOT}/conf/resource-profiles.conf"
 # çalışır ve macOS'ta (root olmayan) BAŞARISIZ olup repair'i haksız yere
 # 'KISMEN onarıldı' yapardı.
 export SRVCTL_LOCK_DIR="$(mktemp -d)"
+# E66: açma yönündeki yazıcı (fm-auth on / repair) 20'den önce conf.d'ye oturum kotası bölge dosyasını yazar; gerçek /etc/nginx/conf.d'ye DOKUNMASIN.
+export SRVCTL_NGINX_CONF_D="$(mktemp -d)"
 source "${REPO_ROOT}/tests/lib.sh"
 source "${REPO_ROOT}/lib/core.sh"
 SRVCTL_TEMPLATES="${REPO_ROOT}/templates"

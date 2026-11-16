@@ -72,7 +72,7 @@ SHIMEOF
     SHIM_REAL="$(command -v curl)"; export SHIM_REAL
     export PATH="$G13_T/shim:$PATH"
     while (( tries < 12 )); do
-        G13_P=$((19300 + RANDOM % 97)); G13_P2=$((G13_P + 1)); G13_P3=$((G13_P + 2))
+        G13_P=$((${SRVCTL_REAL_PORT_BASE:-19300} + RANDOM % ${SRVCTL_REAL_PORT_SPAN:-97})); G13_P2=$((G13_P + 1)); G13_P3=$((G13_P + 2))
         if ! g13_port_free "$G13_P" || ! g13_port_free "$G13_P2" || ! g13_port_free "$G13_P3"; then tries=$((tries + 1)); continue; fi
         # ek yapılandırmadaki yer tutucular: @P2@ @P3@ @T@
         extra="${extra//@P2@/$G13_P2}"; extra="${extra//@P3@/$G13_P3}"; extra="${extra//@T@/$G13_T}"
@@ -86,6 +86,7 @@ http {
  default_type text/plain;
  resolver 127.0.0.1:9; resolver_timeout 1s;
  client_body_temp_path $G13_T/tmp/b; proxy_temp_path $G13_T/tmp/p; fastcgi_temp_path $G13_T/tmp/f; uwsgi_temp_path $G13_T/tmp/u; scgi_temp_path $G13_T/tmp/s;
+ include ${SRVCTL_NGINX_CONF_D:-/nonexistent-srvctl-conf-d}/*.conf;   # E66: srvctl-fmsess.conf (20 buna başvurur)
  server { listen 127.0.0.1:$G13_P; server_name example.com;
    location / { access_log $G13_T/logs/app.log; return 200 "APP-FALLBACK"; }
    ${extra}

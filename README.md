@@ -483,6 +483,33 @@ yazımlar atomiktir; `custom.d`'de **hiç `include` yoktur**):
 | `21-srvctl-fm-download.conf` | `fm-download.conf.tpl` | `location = /__fm_dl { internal; … }` — `$arg_u` deseni (yalnız `https://*.pcloud.com/…`), `X-Accel-*` yok sayma, başlık izin listesi, `X-Fm-Ticket ""`, ayrı `crit` hata günlüğü |
 | `20-srvctl-fm-upload.conf` | `fm-upload.conf.tpl` | `location ^~ /_fm/up/` (+ `location = /_fm { return 403; }` + `location ^~ /_fm/ { return 403; }` + adlı `@fm_deny` (auth hata eşlemesi) + adlı `@fm_up`): biçim kapısı, `limit_except PUT`, `auth_request`, **KAPI 2**, akıtma `proxy_pass` |
 
+**Oturum kapısı (E66):** `20-srvctl-fm-upload.conf` sunucu düzeyinde `limit_conn srvctl_fmsess 1;` taşır: aynı **oturuma** (uploadid + bilet)
+AYNI ANDA tek `PUT /_fm/up/<uploadid>/<ofset>` (HTTP/1.1 ve HTTP/2 — nginx h2'de her eşzamanlı isteği ayrı sayar); ikinci eşzamanlı istek üst akışa (pCloud)
+ULAŞMAZ ve **503** alır (429 değil: yükleme istemcisi PUT'ta 5xx'i backoff + `/resume` ile yeniden dener, 429'u ölümcül sayar). Böylece değiştirilmiş bir
+istemcinin paralel ofsetleriyle nginx'te biriken ≤4 MiB tamponlar oturum başına tek isteğe iner. Bölge ve anahtar haritası **http düzeyindedir**; HOST BAŞINA TEK
+dosya olan `/etc/nginx/conf.d/srvctl-fmsess.conf` (`templates/nginx/fm-sess.conf.tpl`) `fm-auth on` / `fm-root --apply` tarafından 20'DEN ÖNCE yazılır;
+`fm-auth off` ve `domain remove` bu dosyaya dokunmaz (kullanılmayan bölge zararsız).
+`limit_conn` nginx'te istek başına yalnız ilk location'ın PREACCESS aşamasında değerlendirilir: bu yüzden sınır `@fm_up`'a değil sunucu düzeyine konur.
+
+- **Anahtar = `<uploadid>:<biletin ilk 32 hanesi>`** (`$request_method|$request_uri|$http_x_fm_ticket` haritası). Yalnız `PUT` + 20'nin biçim kapısıyla aynı yol
+  + uygulamanın kabul ettiği biçimde bilet (`X-Fm-Ticket`: tam 64 küçük hex) için DOLUDUR; başka her istekte (bilet yok / biçimce geçersiz dahil) anahtar BOŞTUR ve
+  nginx boş anahtarı SAYMAZ. Sebep: `limit_conn` auth'tan ÖNCE (PREACCESS) koşar ve auth sonucunu bilmez; anahtar yalnız uploadid olsaydı uploadid'i bilen
+  yetkisiz biri (biletsiz, 403 alan ama gövdeyi damla damla göndererek ~30 sn yaşayan istek) meşru oturumun yuvasını tutardı. Bileti bilmeyen bir istek meşru
+  oturumun anahtarına ULAŞAMAZ; aynı biletle (aynı biçimce geçerli sahte bilet dahil) ikinci eşzamanlı istek ise 503 alır. Bilet oturum boyunca sabittir
+  (init'te verilir, her parçada ve `/resume`'dan sonra aynı gönderilir) ⇒ yanlış red yok.
+- **İki sunucu tek kota:** anahtarda sunucu adı YOKTUR. Ana alan ve `up.<alan>` (fm-up; canlıda kapalı) sunucuları aynı 20 dosyasını include eder ve AYNI bölgeyi/anahtarı
+  paylaşır: oturum başına tek PUT iki sunucunun toplamında geçerlidir. Farklı alanların (farklı pCloud hesabı) aynı sayısal uploadid'i, biletleri farklı olduğundan çakışmaz.
+- **Bilet günlüğe sızmaz:** `limit_conn` hata günlüğü satırı yalnız bölge adı + istek satırı yazar, anahtarı yazmaz (nginx 1.28 ölçümü: `tests/test_edge_up_sess_real.sh` bölüm 9, günlükte
+  bilet/32 haneli öneki 0 eşleşme; yanıt başlıklarında da yok). Anahtar yalnız paylaşılan bellektedir ve biletin yalnız ilk 32 hanesini (128 bit) içerir; uzunluk ≤ 53 bayt
+  (`limit_conn` anahtar sınırı 255).
+- **Kalan sınır (gerçek):** kopuk bağlantının eski isteği sunucuda ≤30 sn (`client_body_timeout`) yuvayı tutabilir; bu yalnız BİLET SAHİBİNİN kendi oturumudur (yeniden deneme 503 alır ve beklerse sürer).
+  Bölge 10 MiB'tır; dolarsa nginx yeni anahtara `limit_conn_status` (503) verir ve günlüğe "could not allocate node" yazar (tükenme eşiği BU çalışmada ÖLÇÜLMEDİ). Her farklı sahte
+  64-hex bir anahtar açar ve istek bitince serbest bırakılır; bölgeyi doldurmak çok sayıda EŞZAMANLI bağlantı gerektirir (IP başına `conn_per_ip` sınırı geçerlidir) —
+  genel bağlantı seli sınıfındandır, bu kapıya özgü yeni bir yüzey değildir.
+- **Bozuk bölge dosyası:** `nginx -t` sözdizimsel geçerli ama anlamsal bozuk dosyayı (ör. harita yalnız `default "";`) KABUL EDER ve sınır sessizce kalkar. Bunu `fm-root` kuru planı,
+  `fm-auth <alan> status` ("fm-auth STALE … oturum kotası bölge dosyası eksik/eski/bozuk", rc 1) ve `nginx-audit` ("KÖK-DOĞRULANAMADI", rc 1) görür; onarım `fm-root <alan> --apply`.
+  Kayıt KAPALIyken dosya kullanılmadığından uyarı/ret sebebi değildir.
+
 Sabit parametreler: pCloud ana makinesi **yalnız tablodan** (`--region=eu` → `eapi.pcloud.com`
 (varsayılan), `us` → `api.pcloud.com`; başka değer reddedilir, host dosyadan/ortamdan okunmaz),
 parça gövde sınırı `33m`, auth sınırı `33m`, betik yolu `--script` allowlist'i + gerçek yol denetimi.
