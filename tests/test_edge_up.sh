@@ -126,6 +126,8 @@ assert_contains "$LF" "log_format fmup_{{SAFE_NAME}}" "ayrı log_format"
 for bad in http_x_fm_ticket http_authorization upstream_http sent_http fm_auth http_origin http_cookie 'http_'; do
     assert_not_contains "$LF" "$bad" "log_format '${bad}' İÇERMEZ"
 done
+# yavaşlık ayrımı: kullanıcı hattı mı pCloud bacağı mı — mevcut alanlar SIRASIYLA korunur, dört alan SONA eklenir
+assert_contains "$LF" "\$status \$body_bytes_sent \$request_time \$server_protocol \$request_length \$upstream_response_time \$upstream_status';" "log_format: eski alanlar sırayla + sona \$server_protocol \$request_length \$upstream_response_time \$upstream_status"
 assert_contains "$T" "access_log {{LOG_DIR}}/srvctl-fmup-{{SAFE_NAME}}.access.log fmup_{{SAFE_NAME}};" "root'a ait günlük dizininde srvctl-fmup-<safe>.access.log"
 assert_contains "$T" "error_log  {{LOG_DIR}}/srvctl-fmup-{{SAFE_NAME}}.error.log warn;" "hata günlüğü warn"
 assert_not_contains "$(grep -E '^[[:space:]]*error_log' "$TPL")" "debug" "debug/info yok"
@@ -155,7 +157,7 @@ out=$(_edge_fmup_render example.com up.example.com https://example.com 1 2); rc=
 assert_eq "$rc" "0" "faz 2 render rc 0"
 assert_not_contains "$out" "{{" "kalan jeton yok"
 assert_contains "$out" 'map $http_origin $fmup_acao_example_com {' "değişken adları alana özgü"
-assert_contains "$out" '"https://example.com" "https://example.com";' "ACAO yalnız tam kök"
+assert_contains "$out" '"~^https://example\.com$" "https://example.com";' "ACAO yalnız tam kök"
 assert_contains "$out" '"~^OPTIONS\|https://example\.com\|PUT\|' "Origin regex'i noktaları kaçırır"
 assert_contains "$out" "zone=fmup_ip_example_com:10m rate=5r/s;" "K8 oran (varsayılan 5r/s)"
 assert_contains "$out" "limit_conn fmup_cip_example_com  12;" "K8 IP başına 12"
@@ -350,7 +352,7 @@ assert_eq "$(_exists "$UPC")" "yok" "hiçbiri yazmadı"
 ( _edge_fmup_cmd example.com on --bogus ) >/dev/null 2>&1; assert_eq "$?" "1" "bilinmeyen seçenek"
 ( _edge_fmup_cmd nonexistent.test on ) >/dev/null 2>&1; assert_eq "$?" "1" "olmayan alan"
 ( _edge_fmup_cmd example.com on --origin=https://www.example.com --host=cdn.example.com ) >/dev/null 2>&1; assert_eq "$?" "0" "www kökeni + başka tek etiketli host kabul"
-assert_contains "$(cat "$UPC")" '"https://www.example.com" "https://www.example.com";' "www kökeni yazıldı"
+assert_contains "$(cat "$UPC")" '"~^https://www\.example\.com$" "https://www.example.com";' "www kökeni yazıldı"
 
 echo "══ G: fm-up — iki faz ══"
 reset_edge
@@ -468,6 +470,9 @@ for i in $(seq 1 120); do echo "203.0.113.5 [15/Nov/2026:05:00:00 +0300] \"PUT /
 for i in $(seq 1 30); do echo "203.0.113.5 [15/Nov/2026:05:00:00 +0300] \"PUT /_fm/up/1/$i\" 200 0 0.100" >> "$UL"; done
 for i in $(seq 1 10); do echo "203.0.113.6 [15/Nov/2026:05:00:00 +0300] \"PUT /_fm/up/1/$i\" 403 12 0.001" >> "$UL"; done
 assert_eq "$(_monitor_up_abuse_count "$UL")" "130" "403+429 sayımı (200'ler hariç)"
+for i in $(seq 1 5); do echo "203.0.113.7 [15/Nov/2026:05:00:00 +0300] \"PUT /_fm/up/1/$i\" 429 0 0.000 HTTP/2.0 812 - -" >> "$UL"; done
+for i in $(seq 1 5); do echo "203.0.113.7 [15/Nov/2026:05:00:00 +0300] \"PUT /_fm/up/1/$i\" 200 0 1.200 HTTP/2.0 8388900 0.004, 1.100 200, 200" >> "$UL"; done
+assert_eq "$(_monitor_up_abuse_count "$UL")" "135" "yeni 4 alanlı satırlar da okunur (eski sayım + 5 yeni 429)"
 assert_eq "$(_monitor_up_abuse_count "${FM_STUBS}/yok.log")" "0" "günlük yoksa 0"
 echo "══ ACAO şablon düzeyinde yansıtmaz (gerçek nginx gerektirmez) ══"
 acao_blk=$(printf '%s\n' "$T" | awk '/^map \$http_origin \$fmup_acao_/ { on = 1 } on { print } on && /^}/ { exit }')
@@ -476,8 +481,8 @@ acao_body=$(printf '%s\n' "$acao_blk" | sed '1d;$d')
 assert_eq "$(printf '%s\n' "$acao_body" | grep -c .)" "2" "ACAO map'inde yalnız 2 satır: default + tek tam köken"
 assert_eq "$(printf '%s\n' "$acao_body" | grep -cE '^[[:space:]]*default[[:space:]]+"";[[:space:]]*$')" "1" "default BOŞ ('\"\"') — gelen Origin'e düşmez"
 assert_eq "$(printf '%s\n' "$acao_body" | grep -c 'http_origin')" "0" "map gövdesinde \$http_origin DEĞER olarak yok (yansıtma yok)"
-assert_eq "$(printf '%s\n' "$acao_body" | grep -cE '~|\*|null|\$')" "0" "map gövdesinde regex/joker/null/değişken yok"
-assert_eq "$(printf '%s\n' "$acao_body" | grep -cE '^[[:space:]]*"\{\{FM_UP_ORIGIN\}\}"[[:space:]]+"\{\{FM_UP_ORIGIN\}\}";[[:space:]]*$')" "1" "tek girdi: sabit yapılandırma kökeni → aynı sabit"
+assert_eq "$(printf '%s\n' "$acao_body" | grep -vE '^[[:space:]]*"~\^\{\{FM_UP_ORIGIN_RE\}\}\$"' | grep -cE '~|\*|null|\$')" "0" "map gövdesinde joker/null/değişken yok (anahtar çapalı regex)"
+assert_eq "$(printf '%s\n' "$acao_body" | grep -cE '^[[:space:]]*"~\^\{\{FM_UP_ORIGIN_RE\}\}\$"[[:space:]]+"\{\{FM_UP_ORIGIN\}\}";[[:space:]]*$')" "1" "tek girdi: çapalı köken regex'i → sabit yapılandırma kökeni"
 assert_eq "$(printf '%s\n' "$T" | grep -c 'add_header Access-Control-Allow-Origin  *\$http_origin')" "0" "ACAO başlığı doğrudan \$http_origin yazmaz"
 assert_eq "$(printf '%s\n' "$T" | grep -E 'add_header Access-Control-Allow-Origin' | grep -vc 'fmup_acao_{{SAFE_NAME}} always')" "0" "her ACAO başlığı yalnız map çıktısını kullanır"
 test_summary
