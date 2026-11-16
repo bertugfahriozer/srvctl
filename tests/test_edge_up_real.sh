@@ -88,6 +88,7 @@ error_log $LAB/logs/e.log info;
 events { worker_connections 256; }
 http {
  access_log off;
+${SRVCTL_LAB_MAP_BUCKET:+ map_hash_bucket_size ${SRVCTL_LAB_MAP_BUCKET};}
  default_type text/plain;
  resolver 127.0.0.1:9; resolver_timeout 1s;
  client_body_temp_path $LAB/tmp/b; proxy_temp_path $LAB/tmp/p; fastcgi_temp_path $LAB/tmp/f; uwsgi_temp_path $LAB/tmp/u; scgi_temp_path $LAB/tmp/s;
@@ -552,6 +553,16 @@ assert_ne "$(cu -o /dev/null -w '%{http_code}' "${UPU}/_fm/up/1/0")" "404" "off 
 ( _edge_fmup_cmd example.com on ) >"$OUTF" 2>&1
 assert_eq "$?" "0" "yeniden on (sertifika silindi → iki faz tekrar) rc 0"
 assert_eq "$(put -H "X-Fm-Ticket: $GOOD" --data-binary @"$LAB/body.bin" "${UPU}/_fm/up/12/41")" "200|1" "yeniden on sonrası PUT 200"
+# günlük: yavaşlık ayrımı alanları (HTTP/1.1 ve HTTP/2.0 PUT) — gerçek nginx satırı; bilet (64 hex) satırda YOK
+curl -sS -q --http2 -k --noproxy '*' --max-time 10 --resolve "${UPH}:${LP_TLS}:127.0.0.1" -X PUT -H 'Expect:' -H "Origin: https://example.com" -H "X-Fm-Ticket: $GOOD" --data-binary @"$LAB/body.bin" -o /dev/null "${UPU}/_fm/up/12/42" 2>/dev/null
+sleep 1
+L1=$(grep -F '"PUT /_fm/up/12/41"' "$UPLOG" | tail -n 1); L2=$(grep -F '"PUT /_fm/up/12/42"' "$UPLOG" | tail -n 1)
+RE='^127\.0\.0\.1 \[[^]]+\] "PUT /_fm/up/12/4[12]" 200 [0-9]+ [0-9.]+ HTTP/(1\.1|2\.0) [0-9]+ [0-9.]+( [,:] [0-9.]+)* 200( [,:] 200)*$'
+assert_eq "$(grep -cE "$RE" <<< "$L1"$'\n'"$L2")" "2" "günlük satırı: ...request_time \$server_protocol \$request_length \$upstream_response_time \$upstream_status"
+assert_contains "$L1" " HTTP/1.1 " "HTTP/1.1 PUT günlükte HTTP/1.1"
+assert_contains "$L2" " HTTP/2.0 " "HTTP/2 PUT günlükte HTTP/2.0"
+assert_eq "$(grep -cE '[0-9a-f]{64}' <<< "$L1"$'\n'"$L2")" "0" "günlük satırında bilet (64 hex) YOK"
+echo "KANIT-GUNLUK-1: $L1" >> "$LAB/logs/uplog-evidence.txt"; echo "KANIT-GUNLUK-2: $L2" >> "$LAB/logs/uplog-evidence.txt"
 : > "$LAB/logs/certbot.log"
 _edge_purge_domain example.com
 assert_eq "$(_exists "$UPC")" "yok" "domain remove: up dosyası temizlendi"

@@ -15,7 +15,8 @@
 #    denetimi HAM istek satırı ($request_uri) üzerindedir: sorgu dizesi, '%'
 #    kodlaması, '..', '//' ve uzantı içeren her yol 403 alır.
 #  - Yalnız PUT + Content-Length (chunked pCloud'a ham veri olarak yazılırdı).
-#  - Gövde nginx'te tamponlanmaz (proxy_request_buffering off).
+#  - Gövde nginx'te tamponlanmaz (proxy_request_buffering off); @fm_up'ta client_body_buffer_size 4m HTTP/2 akış penceresi
+#    içindir (tests/test_edge_up_h2win_real.sh: 240 ms RTT'de 8 MiB, h2 ≈ h1.1; yapısal kilit: >=1m VE tamponsuz).
 #  - OAuth belirteci YALNIZ başlıkta: auth alt isteği X-Fm-Auth döner,
 #    Authorization olarak pCloud'a verilir. Sorgu dizesinde ASLA.
 #  - pCloud'a giden başlıklar İZİN LİSTESİdir (proxy_pass_request_headers off).
@@ -108,6 +109,15 @@ location @fm_up {
     if ($fm_auth !~ "^Bearer [A-Za-z0-9._~+/=-]+$") { return 403; }
 
     client_max_body_size 33m;
+
+    # HTTP/2 + TAMPONSUZ gövde: nginx 1.24 ngx_http_v2_read_request_body gövde tamponunu max(client_body_buffer_size,
+    # http2_body_preread_size) boyutunda açar ve istemciye verilen akış alma penceresi BU tamponun boşluğudur; WINDOW_UPDATE
+    # ancak üst akışa (pCloud) yazıldıkça gelir. Varsayılanlar 16k/64k ⇒ pencere 64 KiB ⇒ tavan = 64 KiB / RTT: 240 ms RTT'de
+    # ≈0.26 MiB/sn (8 MiB ≈ 30 sn; HTTP/1.1'de bu sınır yok, TCP penceresi ölçeklenir). 4m ⇒ 240 ms'de ≈16 MiB/sn tavan.
+    # Bellek: yalnız auth geçidinden geçmiş istek başına ≤4 MiB (tampon, Content-Length'e göre küçülür; 8 MiB'lık parçada 4 MiB);
+    # CONN_ALL varsayılanı 100 ⇒ en kötü ≈400 MiB. Tamponsuz olduğu için geçici DOSYA YAZILMAZ (proxy_max_temp_file_size 0).
+    # 'http2_body_preread_size' http/server bağlamındadır, location'a konamaz ve tüm vhost'ları etkiler; bu yüzden burada kullanılmaz.
+    client_body_buffer_size 4m;
 
     # uploadid/offset: kapıdan geçen HAM yoldan düz değişkenlere. DİKKAT (nginx 1.28
     # ile ölçüldü): içinden dönmeyen ('set' yapan) bir 'if' eşleşince istek if-bloğunun

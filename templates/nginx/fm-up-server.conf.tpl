@@ -39,7 +39,11 @@
 
 # @@PHASE1
 # K11: ayrı log_format (faz 1'de de gerekir: 80 bloğu kullanır). Başlık/bilet/$fm_auth/$upstream_http_*/$sent_http_* YOK.
-log_format fmup_{{SAFE_NAME}} '$remote_addr [$time_local] "$request_method $request_uri" $status $body_bytes_sent $request_time';
+# İlk 6 alan SIRASI DEĞİŞMEZ (lib/monitor.sh _monitor_up_abuse_count 3. tırnak sonrası ilk sözcüğü okur); yavaşlık ayrımı için SONA eklenenler:
+#   $server_protocol (HTTP/2.0|HTTP/1.1), $request_length (istek satırı+başlık+gövde bayt), $upstream_response_time ve $upstream_status
+#   (auth alt isteği + @fm_up iç yönlendirmesi ⇒ ', ' ya da ' : ' ile birden çok değer; iç yönlendirmede ' : ' önce gelen grubu ayırır).
+#   $request_time ≫ $upstream_response_time ⇒ yavaşlık kullanıcı hattında; ikisi de büyükse pCloud bacağında. Bunlar sayı/durum: sır taşımaz.
+log_format fmup_{{SAFE_NAME}} '$remote_addr [$time_local] "$request_method $request_uri" $status $body_bytes_sent $request_time $server_protocol $request_length $upstream_response_time $upstream_status';
 
 server {
     listen 80;
@@ -57,10 +61,11 @@ server {
     }
 }
 # @@PHASE2
-# K9: tam köken. Yansıtma, regex, null ya da * YOK; ACAO sabit yapılandırma değeridir.
+# K9: tam köken. Yansıtma, joker, null ya da * YOK; ACAO sabit yapılandırma değeridir. Anahtar çapalı düzenli ifadedir
+# (tam metin anahtar map hash kovasına girer; uzun köken varsayılan map_hash_bucket_size ile nginx -t'yi düşürür).
 map $http_origin $fmup_acao_{{SAFE_NAME}} {
     default "";
-    "{{FM_UP_ORIGIN}}" "{{FM_UP_ORIGIN}}";
+    "~^{{FM_UP_ORIGIN_RE}}$" "{{FM_UP_ORIGIN}}";
 }
 map $fmup_acao_{{SAFE_NAME}} $fmup_acam_{{SAFE_NAME}} { default ""; "~." "PUT"; }
 map $fmup_acao_{{SAFE_NAME}} $fmup_acah_{{SAFE_NAME}} { default ""; "~." "X-Fm-Ticket, Content-Type"; }
