@@ -76,7 +76,7 @@ lab_up() {
     lab_down
     local tries=0 i
     while (( tries < 12 )); do
-        P=$((19450 + RANDOM % 48)); P2=$((P + 1))
+        P=$((${SRVCTL_REAL_PORT_BASE:-19450} + RANDOM % ${SRVCTL_REAL_PORT_SPAN:-48})); P2=$((P + 1))
         if ! lab_port_free "$P" || ! lab_port_free "$P2"; then tries=$((tries + 1)); continue; fi
         cat > "$T/nginx.conf" <<EOT
 pid $T/n.pid;
@@ -87,6 +87,7 @@ http {
  default_type text/plain;
  resolver 127.0.0.1:9; resolver_timeout 1s;
  client_body_temp_path $T/tmp/b; proxy_temp_path $T/tmp/p; fastcgi_temp_path $T/tmp/f; uwsgi_temp_path $T/tmp/u; scgi_temp_path $T/tmp/s;
+ include ${SRVCTL_NGINX_CONF_D:-/nonexistent-srvctl-conf-d}/*.conf;   # E66: srvctl-fmsess.conf (20 buna başvurur)
  server { listen 127.0.0.1:$P; server_name example.com;
    location / { return 200 "APP"; }
    include $T/live/*.conf;

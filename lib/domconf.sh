@@ -1730,6 +1730,55 @@ _domconf_fm_render_download() {
     printf '%s' "$rendered"
 }
 
+# E66 — yükleme oturumu başına tek eşzamanlı PUT: 20'nin 'limit_conn srvctl_fmsess 1' satırının başvurduğu http düzeyi bölge.
+# HOST BAŞINA TEK dosya (conf.d/srvctl-fmsess.conf; alan başına değil) — içerik alana bağlı değil, ad çakışması olmaz.
+_domconf_fm_sess_conf_path() { printf '%s/srvctl-fmsess.conf' "${SRVCTL_NGINX_CONF_D:-/etc/nginx/conf.d}"; }
+
+_domconf_fm_render_sess() {
+    local rendered
+    rendered=$(render_template "$(_domconf_fm_tpl_dir)/fm-sess.conf.tpl") || return 1
+    [[ "$rendered" != *'{{'* ]] || return 2
+    printf '%s' "$rendered"
+}
+
+# PREDİKAT: bölge dosyası var, düz dosya (sembolik bağ değil) ve şablonun render'ı ile AYNI. 20 yazılı bir alanda bu dosya silinirse
+# bir sonraki 'nginx -t'/reload TÜM host'ta "zero size shared memory zone / unknown limit_conn zone" ile düşer; fm-root planı bunu görür.
+_domconf_fm_sess_conf_current() {
+    local dest want have
+    dest=$(_domconf_fm_sess_conf_path)
+    [[ -f "$dest" && ! -L "$dest" ]] || return 1
+    want=$(_domconf_fm_render_sess) || return 1
+    have=$(cat -- "$dest" 2>/dev/null) || return 1
+    [[ "$have" == "$want" ]]
+}
+
+# K4 — AÇIK alanın bölge dosyası denetimi (status / nginx-audit). nginx -t sözdizimsel olarak geçerli ama anlamsal bozuk bir dosyayı
+# (ör. anahtar haritası yalnız 'default ""') KABUL EDER ve oturum sınırı SESSİZCE kalkar; yalnız şablon render'ıyla bayt karşılaştırması görür.
+# Çıktı (_FSA_LINE): kullanıcıya tek satır. rc 0 = sağlam; 1 = eksik/eski/bozuk (çağıran kayıt 'on' iken sorar: kapalı alanda dosya kullanılmaz).
+_domconf_fm_sess_conf_audit() {
+    local domain="$1"
+    _FSA_LINE=""
+    if _domconf_fm_sess_conf_current; then return 0; fi
+    _FSA_LINE="oturum kotası bölge dosyası eksik/eski/bozuk ($(_domconf_fm_sess_conf_path)) — 20 ona başvurur; nginx -t anlamsal bozukluğu YAKALAMAZ ve oturum sınırı sessizce kalkabilir. Onarım: srvctl domain fm-root ${domain} --apply"
+    return 1
+}
+
+# Bölge dosyası yoksa ya da şablondan farklıysa yazar (atomik). 20 yazılmadan ÖNCE çağrılır: 20 var olup bölge dosyası olmayan
+# durum oluşmaz (nginx -t "zone not found" ile reddederdi ve işlem geri alınırdı). Geri alma bu dosyayı KALDIRMAZ (kullanılmayan bölge zararsız).
+# rc 0 = dosya şablonla aynı | 1 = yazılamadı
+_domconf_fm_sess_conf_ensure() {
+    local dest want have
+    dest=$(_domconf_fm_sess_conf_path)
+    want=$(_domconf_fm_render_sess) || return 1
+    [[ -d "$(dirname "$dest")" && ! -L "$(dirname "$dest")" ]] || { warn "oturum kotası bölgesi yazılamadı: $(dirname "$dest") yok ya da sembolik bağ"; return 1; }
+    if [[ -f "$dest" && ! -L "$dest" ]]; then
+        have=$(cat -- "$dest" 2>/dev/null) || have=""
+        [[ "$have" == "$want" ]] && return 0
+    fi
+    _domconf_atomic_write "$dest" "$want" || { warn "oturum kotası bölgesi yazılamadı: ${dest}"; return 1; }
+    return 0
+}
+
 # 'off' kökü: yükleme yolunu FAIL-CLOSED 403 yapar (kullanıcı dosyası olamaz: köken kayıtlı).
 # $1=sname: gövde BU alana özgü imzayı taşır (`srvctl-fm-closed <sig>`; sonda yalnız bunu KAPALI sayar).
 # sname güvensizse rc 1 ve çıktı YOK (çağıran boş dosya yazmamalı).
@@ -2239,6 +2288,11 @@ _domconf_fm_stage() {
 
     # 2b) kapı A — yedek ve herhangi bir yazımdan ÖNCE işareti yeniden oku (bkz. _domconf_fm_stage_gate).
     _domconf_fm_stage_gate "$domain" "$sname" "$state" || return 4
+
+    # 2c) E66: 20'nin başvurduğu http düzeyi bölge dosyası, 20 yazılmadan ÖNCE (yalnız açma yönü; hiçbir şey henüz yedeklenmedi/yazılmadı).
+    if [[ "$state" == "on" ]]; then
+        _domconf_fm_sess_conf_ensure || return 4
+    fi
 
     # 3) yedek (adı alanı taşır: .bk.<sname>.XXXXXX)
     mkdir -p "$dir" || return 4
@@ -2861,6 +2915,10 @@ _domconf_nginx_audit() {
         elif ! _domconf_fm_root_audit "$d" "$sname" "$dir"; then
             root_ok=0
             echo "  ${_FMRA_LINE}"
+        elif _fmprov_state_ok "$sname" && _fmprov_load "$sname" && [[ "$_FMP_STATE" == "on" ]] && ! _domconf_fm_sess_conf_audit "$d"; then
+            # K4: kayıt 'on' + dosyalar sağlam ama http düzeyi bölge dosyası eksik/eski/bozuk (kapalı alanda dosya kullanılmaz ⇒ sorulmaz).
+            root_ok=0
+            echo "  KÖK-DOĞRULANAMADI: ${_FSA_LINE}"
         fi
         # edge.sh: köken kilidi / fm-up kayıtları (kayıtlı ama yok/kurcalanmış → bulgu; tanınan dosya BİLGİ).
         if _domconf_load_edge_lib; then
@@ -3329,6 +3387,12 @@ _domconf_fm_auth_status_core() {
     s21=$(_fmprov_file_state "$sname" "$_DOMCONF_FM_DL_FILE" "${dir}/${_DOMCONF_FM_DL_FILE}")
     exp_ver=$( _derive_php "$domain" "${DEFAULT_PHP_VERSION}" 2>/dev/null ) || exp_ver=""
     if [[ -n "$exp_ver" && "$exp_ver" != "$_FMP_PHP" ]]; then drift=1; fi
+    local zbad=0
+    if ! _domconf_fm_sess_conf_audit "$domain"; then zbad=1; fi
+    if [[ "$s90" == "OK" && "$s21" == "OK" && "$s20" == "OK" && $drift -eq 0 && $zbad -eq 1 ]]; then
+        warn "fm-auth STALE: ${domain} — ${_DOMCONF_FM_AUTH_FILE}=OK ${_DOMCONF_FM_DL_FILE}=OK ${_DOMCONF_FM_UP_FILE}=OK ama ${_FSA_LINE}"
+        return 1
+    fi
     if [[ "$s90" == "OK" && "$s21" == "OK" && "$s20" == "OK" && $drift -eq 0 ]]; then
         info "fm-auth AÇIK: ${domain} → ${_FMP_SCRIPT} (bölge: ${_FMP_REGION}, php${_FMP_PHP})"
         info "  ${_DOMCONF_FM_AUTH_FILE}: OK  ${_DOMCONF_FM_DL_FILE}: OK  ${_DOMCONF_FM_UP_FILE}: OK"
@@ -4410,7 +4474,7 @@ _domconf_fm_auth_on_locked() {
 
     if [[ "$dry" == "1" ]]; then
         info "DRY-OK (yazım yok): fm-auth on uygulanabilir — ${domain} → ${script} (bölge: ${region})"
-        info "  yazılacak (sırayla): ${dir}/${_DOMCONF_FM_AUTH_FILE}, ${dir}/${_DOMCONF_FM_DL_FILE}, ${dir}/${_DOMCONF_FM_UP_FILE}"
+        info "  yazılacak (sırayla): $(_domconf_fm_sess_conf_path) (http düzeyi oturum kotası bölgesi), ${dir}/${_DOMCONF_FM_AUTH_FILE}, ${dir}/${_DOMCONF_FM_DL_FILE}, ${dir}/${_DOMCONF_FM_UP_FILE}"
         return 0
     fi
     # açık 'fm-auth on' kaydı (tüm kapılardan geçtikten sonra) acil kapatma işaretini kaldırabilir.
@@ -5083,6 +5147,10 @@ _domconf_fm_root_plan() {
             else
                 _FRP_ACT="regen"; _FRP_WHY="acil kapatma işareti var: dosyalar KAPALI (403 kökü) ama kayıt 'on' yazıyor — kayıt 'off'a eşitlenecek ve işaret kaldırılacak (alan AÇILMAZ)"
             fi
+            return 0
+        fi
+        if [[ "$_FRP_ST" == "on" ]] && ! _domconf_fm_sess_conf_current; then
+            _FRP_ACT="regen"; _FRP_WHY="90/21/20 sağlam ama http düzeyi oturum kotası bölge dosyası eksik/eski ($(_domconf_fm_sess_conf_path)) — 20 ona başvurur; yeniden yazılacak (alan kayıtlı parametrelerle yeniden üretilir)"
             return 0
         fi
         _FRP_ACT="none"

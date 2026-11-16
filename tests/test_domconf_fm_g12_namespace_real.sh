@@ -31,6 +31,7 @@ for c in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem; do [[ -f "$c" ]] 
 if [[ -z "$CA" ]]; then echo "── CA paketi yok — ATLANDI ──"; test_summary; exit 0; fi
 
 T="$(mktemp -d)"; mkdir -p "$T/logs" "$T/tmp" "$T/live" "$T/shim"
+_domconf_fm_sess_conf_ensure || echo "  (E66: oturum kotası bölge dosyası yazılamadı)"   # bu lab 20'yi kendisi render eder (stage değil): bölgeyi srvctl'in yazıcısıyla kur
 P=0; P2=0
 REAL_CURL=$(command -v curl)
 cat > "$T/shim/curl" <<'SHIMEOF'
@@ -92,7 +93,7 @@ lab_wait_reload() {
 lab_up() {
     local tries=0 i
     while (( tries < 12 )); do
-        P=$((19380 + RANDOM % 18)); P2=$((P + 1))
+        P=$((${SRVCTL_REAL_PORT_BASE:-19380} + RANDOM % ${SRVCTL_REAL_PORT_SPAN:-18})); P2=$((P + 1))
         if ! lab_port_free "$P" || ! lab_port_free "$P2"; then tries=$((tries + 1)); continue; fi
         cat > "$T/nginx.conf" <<EOT
 pid $T/n.pid;
@@ -103,6 +104,7 @@ http {
  default_type text/plain;
  resolver 127.0.0.1:9; resolver_timeout 1s;
  client_body_temp_path $T/tmp/b; proxy_temp_path $T/tmp/p; fastcgi_temp_path $T/tmp/f; uwsgi_temp_path $T/tmp/u; scgi_temp_path $T/tmp/s;
+ include ${SRVCTL_NGINX_CONF_D:-/nonexistent-srvctl-conf-d}/*.conf;   # E66: srvctl-fmsess.conf (20 buna başvurur)
  server { listen 127.0.0.1:$P; server_name example.com;
    location / { proxy_pass http://127.0.0.1:$P2/app/; }
    location = /dl { proxy_pass http://127.0.0.1:$P2/xdl; }

@@ -914,7 +914,7 @@ _edge_fmup_off_locked() {
             warn "${conf} srvctl üretimi DEĞİL (kayıtsız/değiştirilmiş) — SİLİNMEDİ"; return 1
         fi
         if (( dry )); then
-            info "DRY-OK (yazım yok): ${conf} silinir, nginx -t, reload${purge:+; certbot delete --cert-name ${phost} (yalnız srvctl tarafından alınan sertifika: issued=${pissued})}"
+            info "DRY-OK (yazım yok): ${conf} silinir, nginx -t, reload$([[ "$purge" == "1" ]] && printf '; certbot delete --cert-name %s (yalnız srvctl tarafından alınan sertifika: issued=%s)' "$phost" "$pissued")"
             return 0
         fi
         _edge_remove_file "$conf" "$sname" fm-up || rc=$?

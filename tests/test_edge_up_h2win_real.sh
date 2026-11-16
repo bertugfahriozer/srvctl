@@ -78,6 +78,8 @@ GOOD=$(printf 'a%.0s' $(seq 1 64))
 # ── GERÇEK 20 şablonu (srvctl render eder) → lab uyarlaması: yalnız CA yolu/günlük yolu/pCloud TLS doğrulaması ──
 RENDERED=$(_domconf_fm_render_upload eu 0 example_com) || { echo "  FAIL 20 şablonu render edilemedi"; TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAIL=$((TESTS_FAIL + 1)); test_summary; exit 1; }
 printf '%s\n' "$RENDERED" | sed -e "s#/etc/ssl/certs/ca-certificates\.crt#${LAB}/pki/c.pem#g" -e "s#proxy_ssl_verify on;#proxy_ssl_verify off;#" > "$LAB/20.conf"
+# E66: 20 sunucu düzeyinde 'limit_conn srvctl_fmsess' taşır; bölge/harita http düzeyindedir (srvctl'in kendi şablonu). Eski şablon kökünde (H2WIN_TPL_ROOT) dosya yoksa boş bırakılır.
+_domconf_fm_render_sess > "$LAB/sess.conf" 2>/dev/null || : > "$LAB/sess.conf"
 cat > "$LAB/90.conf" <<EOT
 location = /__fm_auth {
     internal;
@@ -97,6 +99,7 @@ http {
  default_type text/plain;
  resolver 127.0.0.1:9; resolver_timeout 1s;
  client_body_temp_path $LAB/tmp/b; proxy_temp_path $LAB/tmp/p; fastcgi_temp_path $LAB/tmp/f; uwsgi_temp_path $LAB/tmp/u; scgi_temp_path $LAB/tmp/s;
+ include $LAB/sess.conf;
  upstream eapi.pcloud.com { server 127.0.0.1:${LP_PC}; }
  server { listen 127.0.0.1:${LP_AUTH};
    location = /auth {
